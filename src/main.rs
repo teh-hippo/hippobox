@@ -1,4 +1,5 @@
 mod image;
+mod container;
 mod registry;
 
 use anyhow::Result;
@@ -58,6 +59,13 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
+    // Handle re-exec for container init
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "--container-init" {
+        let fd: i32 = args[2].parse().expect("invalid fd for container-init");
+        return container::process::container_init(fd);
+    }
+
     let cli = Cli::parse();
     ensure_storage_dirs()?;
 
@@ -69,9 +77,38 @@ fn main() -> Result<()> {
             let config = client.pull(&image_ref, &hippobox_dir())?;
             eprintln!("pulled {} layers", config.rootfs.map(|r| r.diff_ids.len()).unwrap_or(0));
         }
-        Commands::Run { image, cmd: _ } => {
+        Commands::Run { image, cmd } => {
             let image_ref = ImageRef::parse(&image)?;
-            eprintln!("running {image_ref} (not yet implemented)");
+            let base_dir = hippobox_dir();
+
+            // Auto-pull if not cached
+            let image_path = base_dir
+                .join("images")
+                .join(&image_ref.repository)
+                .join(format!("{}.json", image_ref.tag));
+            if !image_path.exists() {
+                eprintln!("image not found locally, pulling...");
+                let mut client = RegistryClient::new();
+                client.pull(&image_ref, &base_dir)?;
+            }
+
+            let (manifest, config) = container::load_image(&image_ref, &base_dir)?;
+            let container_id = format!("{:x}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos());
+
+            let spec = container::ContainerSpec {
+                id: container_id,
+                image_ref,
+                manifest,
+                config,
+                base_dir,
+                user_cmd: cmd,
+            };
+
+            let exit_code = container::run(spec)?;
+            std::process::exit(exit_code);
         }
         Commands::Images => {
             list_images(&hippobox_dir())?;
