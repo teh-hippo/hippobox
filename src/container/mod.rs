@@ -190,9 +190,6 @@ impl Drop for CleanupGuard {
             let _ = cgroups::cleanup(&self.id);
         }
         if self.overlay_mounted {
-            let _ = mounts::cleanup_host_device_sources(&self.merged);
-        }
-        if self.overlay_mounted {
             let _ = rootfs::unmount_overlay(&self.merged);
             let _ = mounts::cleanup_host_device_sources(&self.merged);
         }
