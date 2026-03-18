@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use std::fs::{self, File};
+use std::io;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 
@@ -40,9 +41,6 @@ pub fn prepare_host_device_sources(rootfs: &Path) -> Result<()> {
         })?;
 
         let host_device = format!("/dev/{name}");
-        if !Path::new(&host_device).exists() {
-            anyhow::bail!("missing host device for bind mount: {host_device}");
-        }
         mount(
             Some(host_device.as_str()),
             source.as_path(),
@@ -125,9 +123,6 @@ fn mount_dev() -> Result<()> {
 fn bind_host_device(name: &str) -> Result<()> {
     let source = format!("/.hippobox-dev/{name}");
     let target = format!("/dev/{name}");
-    if let Some(parent) = Path::new(&target).parent() {
-        fs::create_dir_all(parent)?;
-    }
     File::create(&target)
         .with_context(|| format!("failed to create device placeholder at {target}"))?;
 
@@ -176,37 +171,39 @@ fn mask_sensitive_paths() -> Result<()> {
         "/proc/timer_list",
         "/proc/sched_debug",
     ] {
-        if Path::new(path).exists() {
-            mount(
-                Some("/dev/null"),
-                path,
-                None::<&str>,
-                MsFlags::MS_BIND,
-                None::<&str>,
-            )
-            .with_context(|| format!("failed to mask {path}"))?;
+        match mount(
+            Some("/dev/null"),
+            path,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        ) {
+            Ok(()) => {}
+            Err(nix::errno::Errno::ENOENT) => {}
+            Err(err) => return Err(err).with_context(|| format!("failed to mask {path}")),
         }
     }
 
     for path in ["/proc/sys", "/proc/bus"] {
-        if Path::new(path).exists() {
-            mount(
-                Some(path),
-                path,
-                None::<&str>,
-                MsFlags::MS_BIND | MsFlags::MS_REC,
-                None::<&str>,
-            )
-            .with_context(|| format!("failed to bind remount {path}"))?;
-            mount(
-                Some(path),
-                path,
-                None::<&str>,
-                MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_RDONLY | MsFlags::MS_REMOUNT,
-                None::<&str>,
-            )
-            .with_context(|| format!("failed to remount {path} read-only"))?;
+        match mount(
+            Some(path),
+            path,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        ) {
+            Ok(()) => {}
+            Err(nix::errno::Errno::ENOENT) => continue,
+            Err(err) => return Err(err).with_context(|| format!("failed to bind remount {path}")),
         }
+        mount(
+            Some(path),
+            path,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_RDONLY | MsFlags::MS_REMOUNT,
+            None::<&str>,
+        )
+        .with_context(|| format!("failed to remount {path} read-only"))?;
     }
 
     Ok(())
@@ -215,25 +212,25 @@ fn mask_sensitive_paths() -> Result<()> {
 pub fn copy_host_files_to_rootfs(merged: &Path) -> Result<()> {
     for src in ["/etc/resolv.conf", "/etc/hostname"] {
         let src_path = Path::new(src);
-        if !src_path.exists() {
-            continue;
-        }
-
         let dest = merged.join(src.trim_start_matches('/'));
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(src_path, &dest)
-            .with_context(|| format!("failed to copy {} into rootfs", src_path.display()))?;
+        match fs::copy(src_path, &dest) {
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to copy {} into rootfs", src_path.display()));
+            }
+        }
     }
     Ok(())
 }
 
 fn ensure_symlink(target: &str, link_path: &str) -> Result<()> {
     let link = Path::new(link_path);
-    if fs::symlink_metadata(link).is_ok() {
-        let _ = fs::remove_file(link);
-    }
+    let _ = fs::remove_file(link);
     symlink(target, link)
         .with_context(|| format!("failed to create symlink {link_path} -> {target}"))?;
     Ok(())
