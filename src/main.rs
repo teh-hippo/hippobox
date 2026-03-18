@@ -1,8 +1,10 @@
 mod image;
+mod registry;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use image::ref_parser::ImageRef;
+use registry::RegistryClient;
 use std::fs;
 use std::path::PathBuf;
 
@@ -62,11 +64,14 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Pull { image } => {
             let image_ref = ImageRef::parse(&image)?;
-            println!("pulling {image_ref}");
+            eprintln!("pulling {image_ref}");
+            let mut client = RegistryClient::new();
+            let config = client.pull(&image_ref, &hippobox_dir())?;
+            eprintln!("pulled {} layers", config.rootfs.map(|r| r.diff_ids.len()).unwrap_or(0));
         }
-        Commands::Run { image, cmd } => {
+        Commands::Run { image, cmd: _ } => {
             let image_ref = ImageRef::parse(&image)?;
-            println!("running {image_ref} {:?}", cmd);
+            eprintln!("running {image_ref} (not yet implemented)");
         }
         Commands::Images => {
             println!("no images cached");
