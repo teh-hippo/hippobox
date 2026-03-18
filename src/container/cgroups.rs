@@ -51,12 +51,12 @@ pub fn cleanup(container_id: &str) -> Result<()> {
     }
 
     let mut removed = false;
-    for _ in 0..20 {
+    for _ in 0..10 {
         if std::fs::remove_dir(&cgroup_path).is_ok() {
             removed = true;
             break;
         }
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(Duration::from_millis(10));
     }
 
     if !removed {

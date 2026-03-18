@@ -5,11 +5,15 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, Read};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::image::ref_parser::ImageRef;
 use auth::TokenCache;
 use manifest::{Descriptor, ImageConfig, Manifest, ManifestResponse, StoredImage};
+
+static TMP_EXTRACT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct RegistryClient {
     agent: ureq::Agent,
@@ -156,11 +160,7 @@ impl RegistryClient {
             resp
         };
 
-        let tmp_dir = target_dir.with_extension("tmp");
-        if tmp_dir.exists() {
-            fs::remove_dir_all(&tmp_dir)?;
-        }
-        fs::create_dir_all(&tmp_dir)?;
+        let tmp_dir = create_extract_temp_dir(target_dir)?;
 
         let reader = HashingReader::new(resp.into_body().into_reader());
         let reader = if layer.is_gzip_layer() {
@@ -228,6 +228,7 @@ fn extract_with_whiteouts(archive: &mut tar::Archive<impl Read>, target: &Path) 
         }
 
         if let Some(deleted_name) = file_name.strip_prefix(".wh.") {
+            validate_whiteout_name(deleted_name)?;
             let parent_rel = path.parent().unwrap_or(Path::new(""));
             let parent = ensure_safe_dir(target, parent_rel)?;
             let whiteout_path = parent.join(deleted_name);
@@ -259,6 +260,43 @@ fn validate_relative_path(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_whiteout_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("empty whiteout name is not allowed");
+    }
+
+    if Path::new(name).components().count() != 1 {
+        bail!("unsafe whiteout name: {name}");
+    }
+
+    if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        bail!("unsafe whiteout name: {name}");
+    }
+
+    Ok(())
+}
+
+fn create_extract_temp_dir(target_dir: &Path) -> Result<PathBuf> {
+    let pid = std::process::id();
+
+    for _ in 0..64 {
+        let nonce = TMP_EXTRACT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_dir = target_dir.with_extension(format!("tmp-{pid}-{nonce}"));
+        match fs::create_dir(&tmp_dir) {
+            Ok(()) => {
+                let mut perms = fs::metadata(&tmp_dir)?.permissions();
+                perms.set_mode(0o700);
+                fs::set_permissions(&tmp_dir, perms)?;
+                return Ok(tmp_dir);
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    bail!("failed to create a unique extraction temp dir for {}", target_dir.display());
 }
 
 fn ensure_safe_dir(base: &Path, relative: &Path) -> Result<PathBuf> {

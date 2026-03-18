@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 
 /// A parsed container image reference.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ImageRef {
     /// Registry host (e.g. "registry-1.docker.io", "ghcr.io", "myregistry:5000")
     pub registry: String,

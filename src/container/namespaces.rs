@@ -2,11 +2,12 @@ use anyhow::{Context, Result};
 use nix::mount::{mount, MsFlags};
 use nix::sched::{unshare, CloneFlags};
 use nix::unistd::{chdir, pivot_root};
+use std::fs;
 use std::path::Path;
 
 /// Set up mount/UTS/IPC isolation and pivot into the container root.
 /// PID isolation is not enabled yet; the runtime keeps the host PID namespace for now.
-pub fn setup_namespaces_and_pivot(new_root: &Path) -> Result<()> {
+pub fn setup_namespaces_and_pivot(new_root: &Path, rootless: bool) -> Result<()> {
     unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWIPC)
         .context("failed to unshare namespaces")?;
 
@@ -29,14 +30,25 @@ pub fn setup_namespaces_and_pivot(new_root: &Path) -> Result<()> {
     .context("failed to bind-mount new root")?;
 
     let old_root = new_root.join("old_root");
-    std::fs::create_dir_all(&old_root)?;
+    fs::create_dir_all(&old_root)?;
 
     pivot_root(new_root, &old_root).context("pivot_root failed")?;
     chdir("/").context("chdir to / failed")?;
 
+    if rootless {
+        mount(
+            Some("/old_root/proc"),
+            "/proc",
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .context("failed to bind inherited /proc into rootfs")?;
+    }
+
     nix::mount::umount2("/old_root", nix::mount::MntFlags::MNT_DETACH)
         .context("failed to unmount old root")?;
 
-    let _ = std::fs::remove_dir("/old_root");
+    let _ = fs::remove_dir("/old_root");
     Ok(())
 }

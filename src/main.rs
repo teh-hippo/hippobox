@@ -2,7 +2,7 @@ mod container;
 mod image;
 mod registry;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use image::ref_parser::ImageRef;
 use registry::manifest::StoredImage;
@@ -44,6 +44,9 @@ enum Commands {
     Pull { image: String },
     /// Run a container from an image
     Run {
+        /// Environment overrides in KEY=VALUE form
+        #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
         image: String,
         #[arg(trailing_var_arg = true)]
         cmd: Vec<String>,
@@ -59,6 +62,24 @@ fn main() -> Result<()> {
     if args.len() >= 3 && args[1] == "--container-init" {
         let fd: i32 = args[2].parse().expect("invalid fd for container-init");
         return container::process::container_init(fd);
+    }
+    if args.len() >= 2 && args[1] == "--rootless-bootstrap" {
+        let prctl_ret = unsafe {
+            nix::libc::prctl(
+                nix::libc::PR_SET_PDEATHSIG,
+                nix::libc::SIGTERM as nix::libc::c_ulong,
+                0,
+                0,
+                0,
+            )
+        };
+        if prctl_ret != 0 {
+            return Err(std::io::Error::last_os_error()).context("failed to set rootless PDEATHSIG");
+        }
+        let spec: container::ContainerSpec = serde_json::from_reader(std::io::stdin())
+            .context("failed to read rootless bootstrap spec from stdin")?;
+        let exit_code = container::run_prepared(spec)?;
+        std::process::exit(exit_code);
     }
 
     let cli = Cli::parse();
@@ -78,9 +99,10 @@ fn main() -> Result<()> {
                 .unwrap_or(stored.manifest.layers.len());
             eprintln!("pulled {layer_count} layers");
         }
-        Commands::Run { image, cmd } => {
+        Commands::Run { image, cmd, env } => {
             let image_ref = ImageRef::parse(&image)?;
             let base_dir = hippobox_dir();
+            let rootless = unsafe { nix::libc::geteuid() } != 0;
 
             if !image_ref.image_metadata_path(&base_dir).exists() {
                 eprintln!("image not found locally, pulling...");
@@ -96,6 +118,8 @@ fn main() -> Result<()> {
                 config,
                 base_dir,
                 user_cmd: cmd,
+                user_env: env,
+                rootless,
             };
 
             let exit_code = container::run(spec)?;
@@ -148,9 +172,14 @@ fn walk_image_repos_inner(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
             walk_image_repos_inner(base, &path, results)?;
-        } else if let Some(tag) = path.file_name().and_then(|f| f.to_str()).and_then(|f| f.strip_suffix(".json")) {
+        } else {
+            let file_name = entry.file_name();
+            let Some(tag) = file_name.as_os_str().to_str().and_then(|f| f.strip_suffix(".json")) else {
+                continue;
+            };
             let tag = tag.to_string();
             let repo_name = path
                 .parent()
@@ -194,7 +223,12 @@ fn dir_size(path: &Path) -> Result<u64> {
     let mut total = 0;
     if path.is_dir() {
         for entry in fs::read_dir(path)? {
-            total += dir_size(&entry?.path())?;
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                total += dir_size(&entry.path())?;
+            } else {
+                total += entry.metadata()?.len();
+            }
         }
     }
     Ok(total)

@@ -1,17 +1,81 @@
 use anyhow::{Context, Result};
-use nix::mount::{mount, MsFlags};
-use nix::sys::stat;
-use std::fs;
+use nix::mount::{mount, umount2, MntFlags, MsFlags};
+use std::fs::{self, OpenOptions};
 use std::os::unix::fs::symlink;
 use std::path::Path;
 
-pub fn setup_container_mounts() -> Result<()> {
-    mount_proc()?;
-    mount_sys()?;
+const REQUIRED_DEVICES: &[&str] = &["null", "zero", "full", "random", "urandom", "tty"];
+
+pub fn setup_container_mounts(rootless: bool) -> Result<()> {
+    if rootless {
+        fs::create_dir_all("/proc")?;
+    } else {
+        mount_proc()?;
+    }
     mount_dev()?;
     mount_dev_shm()?;
     mount_dev_pts()?;
-    mask_sensitive_paths()?;
+
+    if rootless {
+        fs::create_dir_all("/sys")?;
+    } else {
+        mount_sys()?;
+        mask_sensitive_paths()?;
+    }
+
+    Ok(())
+}
+
+pub fn prepare_host_device_sources(rootfs: &Path) -> Result<()> {
+    let source_dir = rootfs.join(".hippobox-dev");
+    fs::create_dir_all(&source_dir)?;
+
+    for &name in REQUIRED_DEVICES {
+        let source = source_dir.join(name);
+        if let Some(parent) = source.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&source)
+            .with_context(|| format!("failed to create host device placeholder at {}", source.display()))?;
+
+        let host_device = format!("/dev/{name}");
+        if !Path::new(&host_device).exists() {
+            anyhow::bail!("missing host device for bind mount: {host_device}");
+        }
+        mount(
+            Some(host_device.as_str()),
+            source.as_path(),
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .with_context(|| format!("failed to bind-mount {host_device} onto {}", source.display()))?;
+    }
+
+    Ok(())
+}
+
+pub fn cleanup_host_device_sources(rootfs: &Path) -> Result<()> {
+    let source_dir = rootfs.join(".hippobox-dev");
+    if !source_dir.exists() {
+        return Ok(());
+    }
+
+    for &name in REQUIRED_DEVICES.iter().rev() {
+        let source = source_dir.join(name);
+        if source.exists() {
+            let _ = umount2(&source, MntFlags::MNT_DETACH);
+        }
+    }
+
+    if source_dir.exists() {
+        fs::remove_dir_all(&source_dir)?;
+    }
+
     Ok(())
 }
 
@@ -52,28 +116,8 @@ fn mount_dev() -> Result<()> {
     )
     .context("failed to mount tmpfs on /dev")?;
 
-    for (name, major, minor) in [
-        ("null", 1, 3),
-        ("zero", 1, 5),
-        ("full", 1, 7),
-        ("random", 1, 8),
-        ("urandom", 1, 9),
-        ("tty", 5, 0),
-    ] {
-        let path = format!("/dev/{name}");
-        let dev = stat::makedev(major, minor);
-        stat::mknod(
-            path.as_str(),
-            stat::SFlag::S_IFCHR,
-            stat::Mode::S_IRUSR
-                | stat::Mode::S_IWUSR
-                | stat::Mode::S_IRGRP
-                | stat::Mode::S_IWGRP
-                | stat::Mode::S_IROTH
-                | stat::Mode::S_IWOTH,
-            dev,
-        )
-        .with_context(|| format!("failed to create /dev/{name}"))?;
+    for &name in REQUIRED_DEVICES {
+        bind_host_device(name)?;
     }
 
     ensure_symlink("/proc/self/fd/0", "/dev/stdin")?;
@@ -81,6 +125,35 @@ fn mount_dev() -> Result<()> {
     ensure_symlink("/proc/self/fd/2", "/dev/stderr")?;
     ensure_symlink("/proc/self/fd", "/dev/fd")?;
 
+    Ok(())
+}
+
+fn bind_host_device(name: &str) -> Result<()> {
+    let source = format!("/.hippobox-dev/{name}");
+    let target = format!("/dev/{name}");
+    let source_path = Path::new(&source);
+    if !source_path.exists() {
+        anyhow::bail!("missing host device for bind mount: {}", source_path.display());
+    }
+
+    if let Some(parent) = Path::new(&target).parent() {
+        fs::create_dir_all(parent)?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&target)
+        .with_context(|| format!("failed to create device placeholder at {target}"))?;
+
+    mount(
+        Some(source.as_str()),
+        target.as_str(),
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .with_context(|| format!("failed to bind-mount {source} onto {target}"))?;
     Ok(())
 }
 

@@ -1,27 +1,28 @@
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 use serde::Deserialize;
 use crate::image::ref_parser::ImageRef;
 
 /// Cached bearer tokens, keyed by registry+repo.
 pub struct TokenCache {
-    entries: Vec<(String, String)>, // (key, token)
+    entries: HashMap<String, String>,
 }
 
 impl TokenCache {
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: HashMap::new(),
         }
     }
 
     pub fn get_token(&mut self, agent: &ureq::Agent, image_ref: &ImageRef) -> Result<String> {
         let key = format!("{}/{}", image_ref.registry, image_ref.repository);
-        if let Some((_k, token)) = self.entries.iter().find(|(k, _)| k == &key) {
+        if let Some(token) = self.entries.get(&key) {
             return Ok(token.clone());
         }
 
         let token = fetch_anonymous_token(agent, image_ref)?;
-        self.entries.push((key, token.clone()));
+        self.entries.insert(key, token.clone());
         Ok(token)
     }
 }
