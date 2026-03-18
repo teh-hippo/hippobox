@@ -1,5 +1,8 @@
+mod image;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use image::ref_parser::ImageRef;
 use std::fs;
 use std::path::PathBuf;
 
@@ -58,10 +61,12 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Pull { image } => {
-            println!("pulling {image}");
+            let image_ref = ImageRef::parse(&image)?;
+            println!("pulling {image_ref}");
         }
         Commands::Run { image, cmd } => {
-            println!("running {image} {:?}", cmd);
+            let image_ref = ImageRef::parse(&image)?;
+            println!("running {image_ref} {:?}", cmd);
         }
         Commands::Images => {
             println!("no images cached");
