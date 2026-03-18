@@ -3,32 +3,22 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::HashMap;
 
-/// Cached bearer tokens, keyed by registry+repo.
-pub struct TokenCache {
-    entries: HashMap<String, String>,
-}
-
-impl TokenCache {
-    pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-        }
+pub fn get_anonymous_token(
+    cache: &mut HashMap<String, String>,
+    agent: &ureq::Agent,
+    image_ref: &ImageRef,
+) -> Result<String> {
+    let key = format!("{}/{}", image_ref.registry, image_ref.repository);
+    if let Some(token) = cache.get(&key) {
+        return Ok(token.clone());
     }
 
-    pub fn get_token(&mut self, agent: &ureq::Agent, image_ref: &ImageRef) -> Result<String> {
-        let key = format!("{}/{}", image_ref.registry, image_ref.repository);
-        if let Some(token) = self.entries.get(&key) {
-            return Ok(token.clone());
-        }
-
-        let token = fetch_anonymous_token(agent, image_ref)?;
-        self.entries.insert(key, token.clone());
-        Ok(token)
-    }
+    let token = fetch_anonymous_token(agent, image_ref)?;
+    cache.insert(key, token.clone());
+    Ok(token)
 }
 
 fn fetch_anonymous_token(agent: &ureq::Agent, image_ref: &ImageRef) -> Result<String> {
-    // Step 1: Hit /v2/ to get the Www-Authenticate challenge
     let v2_url = format!("https://{}/v2/", image_ref.registry);
     let resp = agent
         .get(&v2_url)
@@ -40,7 +30,6 @@ fn fetch_anonymous_token(agent: &ureq::Agent, image_ref: &ImageRef) -> Result<St
         .map_err(|e| anyhow::anyhow!("v2 ping failed: {e}"))?;
 
     if resp.status() == 200 {
-        // No auth needed (rare, but some registries allow it)
         return Ok(String::new());
     }
 
@@ -53,8 +42,18 @@ fn fetch_anonymous_token(agent: &ureq::Agent, image_ref: &ImageRef) -> Result<St
         .context("invalid Www-Authenticate header encoding")?
         .to_string();
 
-    // Step 2: Parse Bearer realm="...",service="...",scope="..."
-    let params = parse_www_authenticate(&www_auth)?;
+    let mut params = Vec::new();
+    let rest = www_auth
+        .trim()
+        .strip_prefix("Bearer ")
+        .or_else(|| www_auth.trim().strip_prefix("bearer "))
+        .context("Www-Authenticate is not Bearer type")?;
+    for part in rest.split(',') {
+        let part = part.trim();
+        if let Some((key, value)) = part.split_once('=') {
+            params.push((key.trim().to_string(), value.trim_matches('"').to_string()));
+        }
+    }
     let realm = params
         .iter()
         .find(|(k, _)| k == "realm")
@@ -67,7 +66,6 @@ fn fetch_anonymous_token(agent: &ureq::Agent, image_ref: &ImageRef) -> Result<St
         .map(|(_, v)| v.as_str())
         .unwrap_or("");
 
-    // Step 3: Fetch token
     let scope = format!("repository:{}:pull", image_ref.repository);
     let token_url = if realm.contains('?') {
         format!("{realm}&service={service}&scope={scope}")
@@ -92,39 +90,14 @@ fn fetch_anonymous_token(agent: &ureq::Agent, image_ref: &ImageRef) -> Result<St
     let token_data: TokenResponse =
         serde_json::from_str(&body).context("failed to parse token response")?;
 
-    Ok(token_data.token())
-}
-
-/// Parse a Www-Authenticate header like: Bearer realm="...",service="...",scope="..."
-fn parse_www_authenticate(header: &str) -> Result<Vec<(String, String)>> {
-    let header = header.trim();
-    let rest = header
-        .strip_prefix("Bearer ")
-        .or_else(|| header.strip_prefix("bearer "))
-        .context("Www-Authenticate is not Bearer type")?;
-
-    let mut params = Vec::new();
-    for part in rest.split(',') {
-        let part = part.trim();
-        if let Some((key, value)) = part.split_once('=') {
-            let value = value.trim_matches('"');
-            params.push((key.trim().to_string(), value.to_string()));
-        }
-    }
-    Ok(params)
+    Ok(token_data
+        .token
+        .or(token_data.access_token)
+        .unwrap_or_default())
 }
 
 #[derive(Deserialize)]
 struct TokenResponse {
     token: Option<String>,
     access_token: Option<String>,
-}
-
-impl TokenResponse {
-    fn token(&self) -> String {
-        self.token
-            .clone()
-            .or_else(|| self.access_token.clone())
-            .unwrap_or_default()
-    }
 }

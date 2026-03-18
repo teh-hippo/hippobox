@@ -29,22 +29,24 @@ pub fn setup_namespaces_and_pivot(new_root: &Path, rootless: bool) -> Result<()>
     )
     .context("failed to bind-mount new root")?;
 
+    if rootless {
+        let root_proc = new_root.join("proc");
+        fs::create_dir_all(&root_proc)?;
+        mount(
+            Some("/proc"),
+            &root_proc,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .context("failed to stage proc for rootless rootfs")?;
+    }
+
     let old_root = new_root.join("old_root");
     fs::create_dir_all(&old_root)?;
 
     pivot_root(new_root, &old_root).context("pivot_root failed")?;
     chdir("/").context("chdir to / failed")?;
-
-    if rootless {
-        mount(
-            Some("/old_root/proc"),
-            "/proc",
-            None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_REC,
-            None::<&str>,
-        )
-        .context("failed to bind inherited /proc into rootfs")?;
-    }
 
     nix::mount::umount2("/old_root", nix::mount::MntFlags::MNT_DETACH)
         .context("failed to unmount old root")?;

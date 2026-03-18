@@ -8,21 +8,33 @@ use std::path::Path;
 const REQUIRED_DEVICES: &[&str] = &["null", "zero", "full", "random", "urandom", "tty"];
 
 pub fn setup_container_mounts(rootless: bool) -> Result<()> {
-    if rootless {
-        fs::create_dir_all("/proc")?;
-    } else {
-        mount_proc()?;
+    if !rootless {
+        mount_fs(
+            "/proc",
+            "proc",
+            "proc",
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+            None::<&str>,
+            "failed to mount /proc",
+        )?;
     }
     mount_dev()?;
-    mount_dev_shm()?;
-    mount_dev_pts()?;
-
-    if rootless {
-        fs::create_dir_all("/sys")?;
-    } else {
-        mount_sys()?;
-        mask_sensitive_paths()?;
-    }
+    mount_fs(
+        "/dev/shm",
+        "shm",
+        "tmpfs",
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some("mode=1777,size=65536k"),
+        "failed to mount /dev/shm",
+    )?;
+    mount_fs(
+        "/dev/pts",
+        "devpts",
+        "devpts",
+        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+        Some("newinstance,ptmxmode=0666"),
+        "failed to mount /dev/pts",
+    )?;
 
     Ok(())
 }
@@ -71,42 +83,15 @@ pub fn cleanup_host_device_sources(rootfs: &Path) -> Result<()> {
     Ok(())
 }
 
-fn mount_proc() -> Result<()> {
-    fs::create_dir_all("/proc")?;
-    mount(
-        Some("proc"),
-        "/proc",
-        Some("proc"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
-        None::<&str>,
-    )
-    .context("failed to mount /proc")?;
-    Ok(())
-}
-
-fn mount_sys() -> Result<()> {
-    fs::create_dir_all("/sys")?;
-    mount(
-        Some("sysfs"),
-        "/sys",
-        Some("sysfs"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC | MsFlags::MS_RDONLY,
-        None::<&str>,
-    )
-    .context("failed to mount /sys")?;
-    Ok(())
-}
-
 fn mount_dev() -> Result<()> {
-    fs::create_dir_all("/dev")?;
-    mount(
-        Some("tmpfs"),
+    mount_fs(
         "/dev",
-        Some("tmpfs"),
+        "tmpfs",
+        "tmpfs",
         MsFlags::MS_NOSUID,
         Some("mode=755"),
-    )
-    .context("failed to mount tmpfs on /dev")?;
+        "failed to mount tmpfs on /dev",
+    )?;
 
     for &name in REQUIRED_DEVICES {
         bind_host_device(name)?;
@@ -117,6 +102,19 @@ fn mount_dev() -> Result<()> {
     ensure_symlink("/proc/self/fd/2", "/dev/stderr")?;
     ensure_symlink("/proc/self/fd", "/dev/fd")?;
 
+    Ok(())
+}
+
+fn mount_fs(
+    target: &str,
+    source: &str,
+    fstype: &str,
+    flags: MsFlags,
+    options: Option<&str>,
+    context: &'static str,
+) -> Result<()> {
+    fs::create_dir_all(target)?;
+    mount(Some(source), target, Some(fstype), flags, options).context(context)?;
     Ok(())
 }
 
@@ -137,75 +135,11 @@ fn bind_host_device(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn mount_dev_shm() -> Result<()> {
-    fs::create_dir_all("/dev/shm")?;
-    mount(
-        Some("shm"),
-        "/dev/shm",
-        Some("tmpfs"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
-        Some("mode=1777,size=65536k"),
-    )
-    .context("failed to mount /dev/shm")?;
-    Ok(())
-}
-
-fn mount_dev_pts() -> Result<()> {
-    fs::create_dir_all("/dev/pts")?;
-    mount(
-        Some("devpts"),
-        "/dev/pts",
-        Some("devpts"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
-        Some("newinstance,ptmxmode=0666"),
-    )
-    .context("failed to mount /dev/pts")?;
-    ensure_symlink("/dev/pts/ptmx", "/dev/ptmx")?;
-    Ok(())
-}
-
-fn mask_sensitive_paths() -> Result<()> {
-    for path in [
-        "/proc/kcore",
-        "/proc/keys",
-        "/proc/timer_list",
-        "/proc/sched_debug",
-    ] {
-        match mount(
-            Some("/dev/null"),
-            path,
-            None::<&str>,
-            MsFlags::MS_BIND,
-            None::<&str>,
-        ) {
-            Ok(()) => {}
-            Err(nix::errno::Errno::ENOENT) => {}
-            Err(err) => return Err(err).with_context(|| format!("failed to mask {path}")),
-        }
-    }
-
-    for path in ["/proc/sys", "/proc/bus"] {
-        match mount(
-            Some(path),
-            path,
-            None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_REC,
-            None::<&str>,
-        ) {
-            Ok(()) => {}
-            Err(nix::errno::Errno::ENOENT) => continue,
-            Err(err) => return Err(err).with_context(|| format!("failed to bind remount {path}")),
-        }
-        mount(
-            Some(path),
-            path,
-            None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_RDONLY | MsFlags::MS_REMOUNT,
-            None::<&str>,
-        )
-        .with_context(|| format!("failed to remount {path} read-only"))?;
-    }
-
+fn ensure_symlink(target: &str, link_path: &str) -> Result<()> {
+    let link = Path::new(link_path);
+    let _ = fs::remove_file(link);
+    symlink(target, link)
+        .with_context(|| format!("failed to create symlink {link_path} -> {target}"))?;
     Ok(())
 }
 
@@ -225,13 +159,5 @@ pub fn copy_host_files_to_rootfs(merged: &Path) -> Result<()> {
             }
         }
     }
-    Ok(())
-}
-
-fn ensure_symlink(target: &str, link_path: &str) -> Result<()> {
-    let link = Path::new(link_path);
-    let _ = fs::remove_file(link);
-    symlink(target, link)
-        .with_context(|| format!("failed to create symlink {link_path} -> {target}"))?;
     Ok(())
 }

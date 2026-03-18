@@ -4,7 +4,7 @@ mod namespaces;
 mod process;
 mod rootfs;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use nix::sys::signal::{self, Signal};
 use std::io;
 use std::os::unix::process::CommandExt;
@@ -41,14 +41,65 @@ pub fn run(spec: ContainerSpec) -> Result<i32> {
 
 pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
     let container_config = spec.config.config.as_ref();
-    let (argv, env_vars) =
-        process::build_command(container_config, &spec.user_cmd, &spec.user_env)?;
     let workdir = container_config
         .and_then(|c| c.working_dir.as_deref())
         .unwrap_or("/");
     let stop_signal = container_config
         .and_then(|c| c.stop_signal.as_deref())
         .unwrap_or("SIGTERM");
+
+    let entrypoint = container_config.and_then(|c| c.entrypoint.as_deref());
+    let cmd = container_config.and_then(|c| c.cmd.as_deref());
+    let argv = if spec.user_cmd.is_empty() {
+        match (entrypoint, cmd) {
+            (Some(ep), Some(cmd)) => ep.iter().cloned().chain(cmd.iter().cloned()).collect(),
+            (Some(ep), None) => ep.to_vec(),
+            (None, Some(cmd)) => cmd.to_vec(),
+            (None, None) => bail!("no CMD or ENTRYPOINT in image config and no command provided"),
+        }
+    } else {
+        entrypoint.map_or_else(
+            || spec.user_cmd.clone(),
+            |ep| {
+                ep.iter()
+                    .cloned()
+                    .chain(spec.user_cmd.iter().cloned())
+                    .collect()
+            },
+        )
+    };
+    if argv.is_empty() {
+        bail!("resolved command is empty");
+    }
+
+    let env_vars = container_config
+        .and_then(|c| c.env.as_deref())
+        .filter(|vars| !vars.is_empty())
+        .map(|vars| vars.to_vec())
+        .unwrap_or_else(|| {
+            vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()]
+        });
+    let env_vars = spec
+        .user_env
+        .iter()
+        .try_fold(env_vars, |mut env_vars, override_var| {
+            let Some((key, _)) = override_var.split_once('=') else {
+                bail!("invalid environment override {override_var:?}, expected KEY=VALUE");
+            };
+            if key.is_empty() {
+                bail!("invalid environment override {override_var:?}, empty key");
+            }
+            if let Some(existing) = env_vars.iter_mut().find(|value| {
+                value
+                    .split_once('=')
+                    .is_some_and(|(existing, _)| existing == key)
+            }) {
+                *existing = override_var.clone();
+            } else {
+                env_vars.push(override_var.clone());
+            }
+            Ok(env_vars)
+        })?;
 
     let container_dir = spec.base_dir.join("containers").join(&spec.id);
     let upper = container_dir.join("upper");
@@ -59,19 +110,27 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
         std::fs::create_dir_all(dir)?;
     }
 
-    let mut cleanup = CleanupGuard::new(
-        spec.id.clone(),
+    let mut cleanup = CleanupGuard {
+        id: spec.id.clone(),
         container_dir,
-        merged.clone(),
-        spec.rootless,
-    );
+        merged: merged.clone(),
+        overlay_mounted: false,
+        rootless: spec.rootless,
+    };
 
     let layer_dirs: Vec<PathBuf> = spec
         .manifest
         .layers
         .iter()
         .rev()
-        .map(|layer| spec.base_dir.join("layers/sha256").join(layer.digest_hex()))
+        .map(|layer| {
+            spec.base_dir.join("layers/sha256").join(
+                layer
+                    .digest
+                    .strip_prefix("sha256:")
+                    .unwrap_or(&layer.digest),
+            )
+        })
         .collect();
 
     if spec.rootless {
@@ -85,7 +144,14 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
 
     mounts::prepare_host_device_sources(&merged)?;
 
-    eprintln!("starting container {} ({})", &spec.id[..12], spec.image_ref);
+    let image = &spec.image_ref;
+    eprintln!(
+        "starting container {} ({}/{}/{})",
+        &spec.id[..12],
+        &image.registry,
+        &image.repository,
+        &image.tag
+    );
     eprintln!("  cmd: {:?}", argv);
 
     process::run_container(
@@ -183,8 +249,12 @@ extern "C" fn note_rootless_signal(_: nix::libc::c_int) {
 
 pub fn load_image(image_ref: &ImageRef, base_dir: &Path) -> Result<(Manifest, ImageConfig)> {
     let config_path = image_ref.image_metadata_path(base_dir);
-    let data = std::fs::read(&config_path)
-        .with_context(|| format!("image not found locally: {image_ref}"))?;
+    let data = std::fs::read(&config_path).with_context(|| {
+        format!(
+            "image not found locally: {}/{}/{}",
+            image_ref.registry, image_ref.repository, image_ref.tag
+        )
+    })?;
     let stored: StoredImage = serde_json::from_slice(&data).with_context(|| {
         format!(
             "failed to parse stored image metadata: {}",
@@ -200,18 +270,6 @@ struct CleanupGuard {
     merged: PathBuf,
     overlay_mounted: bool,
     rootless: bool,
-}
-
-impl CleanupGuard {
-    fn new(id: String, container_dir: PathBuf, merged: PathBuf, rootless: bool) -> Self {
-        Self {
-            id,
-            container_dir,
-            merged,
-            overlay_mounted: false,
-            rootless,
-        }
-    }
 }
 
 impl Drop for CleanupGuard {

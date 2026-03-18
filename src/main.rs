@@ -6,10 +6,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use image::ref_parser::ImageRef;
 use registry::RegistryClient;
-use registry::manifest::StoredImage;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn hippobox_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into())).join(".hippobox")
@@ -32,20 +30,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Pull an image from a registry
-    Pull { image: String },
-    /// Run a container from an image
+    Pull {
+        image: String,
+    },
     Run {
-        /// Environment overrides in KEY=VALUE form
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
         image: String,
         #[arg(trailing_var_arg = true)]
         cmd: Vec<String>,
     },
-    /// List cached images
     Images,
-    /// Remove all cached images and layers
     Clean,
 }
 
@@ -81,31 +76,32 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Pull { image } => {
             let image_ref = ImageRef::parse(&image)?;
-            eprintln!("pulling {image_ref}");
             let mut client = RegistryClient::new();
-            let stored = client.pull(&image_ref, &hippobox_dir())?;
-            let layer_count = stored
-                .config
-                .rootfs
-                .as_ref()
-                .map(|rootfs| rootfs.diff_ids.len())
-                .unwrap_or(stored.manifest.layers.len());
-            eprintln!("pulled {layer_count} layers");
+            let _ = client.pull(&image_ref, &hippobox_dir())?;
+            eprintln!("pulled {image}");
         }
         Commands::Run { image, cmd, env } => {
             let image_ref = ImageRef::parse(&image)?;
             let base_dir = hippobox_dir();
             let rootless = unsafe { nix::libc::geteuid() } != 0;
+            let image_path = image_ref.image_metadata_path(&base_dir);
 
-            if !image_ref.image_metadata_path(&base_dir).exists() {
+            if !image_path.exists() {
                 eprintln!("image not found locally, pulling...");
                 let mut client = RegistryClient::new();
                 client.pull(&image_ref, &base_dir)?;
             }
 
             let (manifest, config) = container::load_image(&image_ref, &base_dir)?;
+            let id = format!(
+                "{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or(std::time::Duration::from_secs(0))
+                    .as_nanos()
+            );
             let spec = container::ContainerSpec {
-                id: next_container_id(),
+                id,
                 image_ref,
                 manifest,
                 config,
@@ -133,119 +129,57 @@ fn list_images(base_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<60} {:<15} {:>10}", "REPOSITORY", "TAG", "LAYERS");
-    for (repo_name, tag_path, tag) in repos {
-        let data = fs::read(tag_path)?;
-        let stored: StoredImage = serde_json::from_slice(&data)?;
-        println!(
-            "{:<60} {:<15} {:>10}",
-            repo_name,
-            tag,
-            stored.manifest.layers.len()
-        );
+    println!("{:<60} {:<15}", "REPOSITORY", "TAG");
+    for (repo_name, _tag_path, tag) in repos {
+        println!("{:<60} {:<15}", repo_name, tag);
     }
     Ok(())
 }
 
 fn walk_image_repos(images_dir: &Path) -> Result<Vec<(String, PathBuf, String)>> {
     let mut results = Vec::new();
-    walk_image_repos_inner(images_dir, images_dir, &mut results)?;
-    Ok(results)
-}
-
-fn walk_image_repos_inner(
-    base: &Path,
-    dir: &Path,
-    results: &mut Vec<(String, PathBuf, String)>,
-) -> Result<()> {
-    if !dir.exists() {
-        return Ok(());
+    if !images_dir.exists() {
+        return Ok(results);
     }
 
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            walk_image_repos_inner(base, &path, results)?;
-        } else {
+    let mut stack = vec![images_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                stack.push(path);
+                continue;
+            }
+
             let file_name = entry.file_name();
             let Some(tag) = file_name
                 .as_os_str()
                 .to_str()
-                .and_then(|f| f.strip_suffix(".json"))
+                .and_then(|name| name.strip_suffix(".json"))
             else {
                 continue;
             };
-            let tag = tag.to_string();
+
             let repo_name = path
                 .parent()
-                .unwrap_or(dir)
-                .strip_prefix(base)
-                .unwrap_or(dir)
-                .to_string_lossy()
-                .to_string();
-            results.push((repo_name, path, tag));
+                .unwrap_or(&dir)
+                .strip_prefix(images_dir)
+                .map_or_else(|_| String::new(), |repo| repo.to_string_lossy().to_string());
+            results.push((repo_name, path, tag.to_string()));
         }
     }
-    Ok(())
+    Ok(results)
 }
 
 fn clean_all(base_dir: &Path) -> Result<()> {
-    let mut freed = 0;
     for sub in ["layers", "images", "containers"] {
         let dir = base_dir.join(sub);
         if dir.exists() {
-            freed += dir_size(&dir)?;
             fs::remove_dir_all(&dir)?;
-            fs::create_dir_all(&dir)?;
         }
     }
-    fs::create_dir_all(base_dir.join("layers/sha256"))?;
-
-    if freed == 0 {
-        println!("nothing to clean");
-    } else {
-        let (size, unit) = human_size(freed);
-        println!("removed all images, freed {size:.1} {unit}");
-    }
+    ensure_storage_dirs()?;
+    println!("removed all cached images");
     Ok(())
-}
-
-fn dir_size(path: &Path) -> Result<u64> {
-    if path.is_file() {
-        return Ok(fs::metadata(path)?.len());
-    }
-
-    let mut total = 0;
-    if path.is_dir() {
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                total += dir_size(&entry.path())?;
-            } else {
-                total += entry.metadata()?.len();
-            }
-        }
-    }
-    Ok(total)
-}
-
-fn human_size(bytes: u64) -> (f64, &'static str) {
-    if bytes >= 1_073_741_824 {
-        (bytes as f64 / 1_073_741_824.0, "GB")
-    } else if bytes >= 1_048_576 {
-        (bytes as f64 / 1_048_576.0, "MB")
-    } else if bytes >= 1024 {
-        (bytes as f64 / 1024.0, "KB")
-    } else {
-        (bytes as f64, "B")
-    }
-}
-
-fn next_container_id() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0));
-    format!("{:x}", now.as_nanos())
 }

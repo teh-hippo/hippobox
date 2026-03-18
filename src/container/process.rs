@@ -6,87 +6,6 @@ use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::Path;
 
-use crate::registry::manifest::ContainerConfig;
-
-pub fn build_command(
-    config: Option<&ContainerConfig>,
-    user_cmd: &[String],
-    user_env: &[String],
-) -> Result<(Vec<String>, Vec<String>)> {
-    let entrypoint = non_empty(config.and_then(|c| c.entrypoint.as_ref()));
-    let cmd = non_empty(config.and_then(|c| c.cmd.as_ref()));
-
-    let argv = if !user_cmd.is_empty() {
-        match entrypoint {
-            Some(ep) => {
-                let mut argv = ep.to_vec();
-                argv.extend(user_cmd.iter().cloned());
-                argv
-            }
-            None => user_cmd.to_vec(),
-        }
-    } else {
-        match (entrypoint, cmd) {
-            (Some(ep), Some(cmd)) => {
-                let mut argv = ep.to_vec();
-                argv.extend(cmd.iter().cloned());
-                argv
-            }
-            (Some(ep), None) => ep.to_vec(),
-            (None, Some(cmd)) => cmd.to_vec(),
-            (None, None) => bail!("no CMD or ENTRYPOINT in image config and no command provided"),
-        }
-    };
-
-    if argv.is_empty() {
-        bail!("resolved command is empty");
-    }
-
-    let env_vars = config
-        .and_then(|c| c.env.as_ref())
-        .filter(|vars| !vars.is_empty())
-        .cloned()
-        .unwrap_or_else(|| {
-            vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()]
-        });
-    let env_vars = merge_env_vars(env_vars, user_env)?;
-
-    Ok((argv, env_vars))
-}
-
-fn merge_env_vars(mut env_vars: Vec<String>, overrides: &[String]) -> Result<Vec<String>> {
-    for override_var in overrides {
-        let key = env_key(override_var)?;
-        if let Some(existing) = env_vars
-            .iter_mut()
-            .find(|value| env_key_matches(value, key))
-        {
-            *existing = override_var.clone();
-        } else {
-            env_vars.push(override_var.clone());
-        }
-    }
-
-    Ok(env_vars)
-}
-
-fn env_key_matches(value: &str, key: &str) -> bool {
-    value
-        .split_once('=')
-        .map(|(existing, _)| existing == key)
-        .unwrap_or(false)
-}
-
-fn env_key(value: &str) -> Result<&str> {
-    let Some((key, _)) = value.split_once('=') else {
-        bail!("invalid environment override {value:?}, expected KEY=VALUE");
-    };
-    if key.is_empty() {
-        bail!("invalid environment override {value:?}, empty key");
-    }
-    Ok(key)
-}
-
 pub fn run_container(
     container_id: &str,
     rootfs: &Path,
@@ -125,7 +44,16 @@ pub fn run_container(
             if !rootless {
                 super::cgroups::add_pid(container_id, child.as_raw() as u32)?;
             }
-            parent_wait(child, parse_signal(stop_signal))
+            let stop_signal = match stop_signal.trim_start_matches("SIG") {
+                "QUIT" => Signal::SIGQUIT,
+                "INT" => Signal::SIGINT,
+                "HUP" => Signal::SIGHUP,
+                "USR1" => Signal::SIGUSR1,
+                "USR2" => Signal::SIGUSR2,
+                "KILL" => Signal::SIGKILL,
+                _ => Signal::SIGTERM,
+            };
+            parent_wait(child, stop_signal)
         }
         ForkResult::Child => {
             nix::unistd::close(write_raw).context("failed to close config pipe write end")?;
@@ -215,22 +143,6 @@ pub fn container_init(config_fd: i32) -> Result<()> {
     bail!("execvpe failed for {:?}: {err}", config.argv[0])
 }
 
-pub(crate) fn parse_signal(name: &str) -> Signal {
-    match name.trim_start_matches("SIG") {
-        "QUIT" => Signal::SIGQUIT,
-        "INT" => Signal::SIGINT,
-        "HUP" => Signal::SIGHUP,
-        "USR1" => Signal::SIGUSR1,
-        "USR2" => Signal::SIGUSR2,
-        "KILL" => Signal::SIGKILL,
-        _ => Signal::SIGTERM,
-    }
-}
-
-fn non_empty(value: Option<&Vec<String>>) -> Option<&[String]> {
-    value.filter(|items| !items.is_empty()).map(Vec::as_slice)
-}
-
 fn to_cstrings(values: &[String], label: &str) -> Result<Vec<CString>> {
     values
         .iter()
@@ -239,55 +151,6 @@ fn to_cstrings(values: &[String], label: &str) -> Result<Vec<CString>> {
                 .with_context(|| format!("{label} contains NUL byte: {value:?}"))
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn config(env: Option<Vec<String>>) -> ContainerConfig {
-        ContainerConfig {
-            cmd: Some(vec!["redis-server".to_string()]),
-            entrypoint: None,
-            env,
-            working_dir: None,
-            stop_signal: None,
-        }
-    }
-
-    #[test]
-    fn env_overrides_replace_image_values() {
-        let cfg = config(Some(vec![
-            "PATH=/usr/local/bin".to_string(),
-            "FOO=bar".to_string(),
-        ]));
-
-        let (_, env_vars) = build_command(
-            Some(&cfg),
-            &[],
-            &[
-                "FOO=baz".to_string(),
-                "POSTGRES_HOST_AUTH_METHOD=trust".to_string(),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(
-            env_vars,
-            vec![
-                "PATH=/usr/local/bin".to_string(),
-                "FOO=baz".to_string(),
-                "POSTGRES_HOST_AUTH_METHOD=trust".to_string(),
-            ],
-        );
-    }
-
-    #[test]
-    fn invalid_env_overrides_fail_fast() {
-        let cfg = config(None);
-        let err = build_command(Some(&cfg), &[], &["INVALID".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("expected KEY=VALUE"));
-    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
