@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use std::path::{Path, PathBuf};
 
 /// A parsed container image reference.
 #[derive(Debug, Clone, PartialEq)]
@@ -19,52 +20,42 @@ impl ImageRef {
             bail!("empty image reference");
         }
 
-        // Split off tag from the last component
-        // We need to find the registry/repo boundary first, then the tag
         let (name, tag) = split_tag(input);
-
-        // Split name into registry and repository
         let (registry, repository) = split_registry(name)?;
 
-        // Rewrite docker.io to the actual API endpoint
         let registry = if registry == "docker.io" {
             "registry-1.docker.io".to_string()
         } else {
             registry
         };
 
-        // Prepend library/ for Docker Hub bare names (single-component repos)
         let repository = if registry == "registry-1.docker.io" && !repository.contains('/') {
             format!("library/{repository}")
         } else {
             repository
         };
 
-        Ok(ImageRef {
+        Ok(Self {
             registry,
             repository,
             tag: tag.to_string(),
         })
     }
 
-    /// The full reference string for display.
-    pub fn display_name(&self) -> String {
-        format!("{}/{}:{}", self.registry, self.repository, self.tag)
+    pub fn image_metadata_dir(&self, base_dir: &Path) -> PathBuf {
+        base_dir.join("images").join(&self.registry).join(&self.repository)
     }
 
-    /// Path used for local storage under ~/.hippobox/images/
-    pub fn storage_path(&self) -> String {
-        format!("{}/{}", self.repository, self.tag)
+    pub fn image_metadata_path(&self, base_dir: &Path) -> PathBuf {
+        self.image_metadata_dir(base_dir)
+            .join(format!("{}.json", self.tag))
     }
 }
 
-/// Split the tag from the reference. Tag defaults to "latest".
 fn split_tag(input: &str) -> (&str, &str) {
-    // Find the last '/' to isolate the final component
     let last_slash = input.rfind('/').unwrap_or(0);
     let after_last_slash = &input[last_slash..];
 
-    // Look for ':' in the part after the last '/' (this is the tag separator)
     if let Some(colon_offset) = after_last_slash.rfind(':') {
         let colon_pos = last_slash + colon_offset;
         (&input[..colon_pos], &input[colon_pos + 1..])
@@ -73,34 +64,24 @@ fn split_tag(input: &str) -> (&str, &str) {
     }
 }
 
-/// Split the name into registry and repository.
-/// A component is a registry if it contains a '.', ':', or is "localhost".
 fn split_registry(name: &str) -> Result<(String, String)> {
-    let first_slash = name.find('/');
-
-    match first_slash {
+    match name.find('/') {
         Some(pos) => {
             let first_component = &name[..pos];
             let rest = &name[pos + 1..];
-
             if looks_like_registry(first_component) {
                 if rest.is_empty() {
                     bail!("missing repository name in image reference");
                 }
                 Ok((first_component.to_string(), rest.to_string()))
             } else {
-                // No registry prefix — treat the whole thing as a repo on docker.io
                 Ok(("docker.io".to_string(), name.to_string()))
             }
         }
-        None => {
-            // Bare name like "nginx" — docker.io default
-            Ok(("docker.io".to_string(), name.to_string()))
-        }
+        None => Ok(("docker.io".to_string(), name.to_string())),
     }
 }
 
-/// Heuristic: a component is a registry hostname if it contains '.', ':', or is "localhost".
 fn looks_like_registry(component: &str) -> bool {
     component.contains('.') || component.contains(':') || component == "localhost"
 }

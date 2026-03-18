@@ -8,9 +8,8 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 use crate::image::ref_parser::ImageRef;
-use crate::registry::manifest::{ImageConfig, Manifest};
+use crate::registry::manifest::{ImageConfig, Manifest, StoredImage};
 
-/// Everything needed to run a container.
 pub struct ContainerSpec {
     pub id: String,
     pub image_ref: ImageRef,
@@ -20,31 +19,7 @@ pub struct ContainerSpec {
     pub user_cmd: Vec<String>,
 }
 
-/// Run a container from a pulled image.
 pub fn run(spec: ContainerSpec) -> Result<i32> {
-    let container_dir = spec.base_dir.join("containers").join(&spec.id);
-    let upper = container_dir.join("upper");
-    let work = container_dir.join("work");
-    let merged = container_dir.join("merged");
-
-    // Create container directories
-    for dir in [&upper, &work, &merged] {
-        std::fs::create_dir_all(dir)?;
-    }
-
-    // Build layer paths (reversed for overlayfs: manifest is bottom-to-top, overlayfs wants top-to-bottom)
-    let layer_dirs: Vec<PathBuf> = spec
-        .manifest
-        .layers
-        .iter()
-        .rev()
-        .map(|l| spec.base_dir.join("layers/sha256").join(l.digest_hex()))
-        .collect();
-
-    // Mount overlayfs
-    rootfs::mount_overlay(&layer_dirs, &upper, &work, &merged)?;
-
-    // Build the command to execute
     let container_config = spec.config.config.as_ref();
     let (argv, env_vars) = process::build_command(container_config, &spec.user_cmd)?;
     let workdir = container_config
@@ -54,52 +29,70 @@ pub fn run(spec: ContainerSpec) -> Result<i32> {
         .and_then(|c| c.stop_signal.as_deref())
         .unwrap_or("SIGTERM");
 
+    let container_dir = spec.base_dir.join("containers").join(&spec.id);
+    let upper = container_dir.join("upper");
+    let work = container_dir.join("work");
+    let merged = container_dir.join("merged");
+
+    for dir in [&upper, &work, &merged] {
+        std::fs::create_dir_all(dir)?;
+    }
+
+    let mut cleanup = CleanupGuard::new(spec.id.clone(), container_dir, merged.clone());
+
+    let layer_dirs: Vec<PathBuf> = spec
+        .manifest
+        .layers
+        .iter()
+        .rev()
+        .map(|layer| spec.base_dir.join("layers/sha256").join(layer.digest_hex()))
+        .collect();
+
+    rootfs::mount_overlay(&layer_dirs, &upper, &work, &merged)?;
+    cleanup.overlay_mounted = true;
+
     eprintln!("starting container {} ({})", &spec.id[..12], spec.image_ref);
     eprintln!("  cmd: {:?}", argv);
 
-    // Fork and run in namespaces via re-exec
-    let exit_code = process::run_container(
-        &spec.id,
-        &merged,
-        &argv,
-        &env_vars,
-        workdir,
-        stop_signal,
-        &spec.base_dir,
-    )
-    .context("container execution failed")?;
-
-    // Cleanup
-    rootfs::unmount_overlay(&merged)?;
-    if container_dir.exists() {
-        std::fs::remove_dir_all(&container_dir)?;
-    }
-    cgroups::cleanup(&spec.id)?;
-
-    Ok(exit_code)
+    process::run_container(&spec.id, &merged, &argv, &env_vars, workdir, stop_signal)
+        .context("container execution failed")
 }
 
-/// Load a previously pulled image's manifest and config.
 pub fn load_image(image_ref: &ImageRef, base_dir: &Path) -> Result<(Manifest, ImageConfig)> {
-    let config_path = base_dir
-        .join("images")
-        .join(&image_ref.repository)
-        .join(format!("{}.json", image_ref.tag));
-
-    let data = std::fs::read_to_string(&config_path)
+    let config_path = image_ref.image_metadata_path(base_dir);
+    let data = std::fs::read(&config_path)
         .with_context(|| format!("image not found locally: {image_ref}"))?;
+    let stored: StoredImage = serde_json::from_slice(&data)
+        .with_context(|| format!("failed to parse stored image metadata: {}", config_path.display()))?;
+    Ok((stored.manifest, stored.config))
+}
 
-    let val: serde_json::Value = serde_json::from_str(&data)?;
-    let manifest: Manifest = serde_json::from_value(
-        val.get("manifest")
-            .context("missing manifest in stored image")?
-            .clone(),
-    )?;
-    let config: ImageConfig = serde_json::from_value(
-        val.get("config")
-            .context("missing config in stored image")?
-            .clone(),
-    )?;
+struct CleanupGuard {
+    id: String,
+    container_dir: PathBuf,
+    merged: PathBuf,
+    overlay_mounted: bool,
+}
 
-    Ok((manifest, config))
+impl CleanupGuard {
+    fn new(id: String, container_dir: PathBuf, merged: PathBuf) -> Self {
+        Self {
+            id,
+            container_dir,
+            merged,
+            overlay_mounted: false,
+        }
+    }
+}
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        let _ = cgroups::cleanup(&self.id);
+        if self.overlay_mounted {
+            let _ = rootfs::unmount_overlay(&self.merged);
+        }
+        if self.container_dir.exists() {
+            let _ = std::fs::remove_dir_all(&self.container_dir);
+        }
+    }
 }

@@ -1,37 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-/// Response that could be either a manifest index (fat manifest) or a direct platform manifest.
-/// We distinguish by checking for the "manifests" field (index) vs "layers" field (direct).
-#[derive(Debug)]
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
 pub enum ManifestResponse {
     Index(ManifestIndex),
     Direct(Manifest),
 }
 
-impl<'de> Deserialize<'de> for ManifestResponse {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value: serde_json::Value = Deserialize::deserialize(deserializer)?;
-
-        if value.get("manifests").is_some() {
-            let index: ManifestIndex =
-                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
-            Ok(ManifestResponse::Index(index))
-        } else if value.get("layers").is_some() {
-            let manifest: Manifest =
-                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
-            Ok(ManifestResponse::Direct(manifest))
-        } else {
-            Err(serde::de::Error::custom(
-                "response is neither a manifest index nor a manifest",
-            ))
-        }
-    }
-}
-
-/// OCI Image Index / Docker Manifest List
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManifestIndex {
@@ -41,7 +16,6 @@ pub struct ManifestIndex {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManifestEntry {
-    pub media_type: Option<String>,
     pub digest: String,
     pub platform: Option<Platform>,
 }
@@ -52,7 +26,6 @@ pub struct Platform {
     pub os: String,
 }
 
-/// OCI Image Manifest / Docker Distribution Manifest v2
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Manifest {
@@ -69,16 +42,28 @@ pub struct Descriptor {
 }
 
 impl Descriptor {
-    /// Extract the hex portion after "sha256:"
-    pub fn digest_hex(&self) -> String {
-        self.digest
-            .strip_prefix("sha256:")
-            .unwrap_or(&self.digest)
-            .to_string()
+    pub fn digest_hex(&self) -> &str {
+        self.digest.strip_prefix("sha256:").unwrap_or(&self.digest)
+    }
+
+    pub fn is_gzip_layer(&self) -> bool {
+        match self.media_type.as_deref() {
+            None => true,
+            Some(media_type) => {
+                media_type.contains("tar+gzip") || media_type.ends_with("diff.tar.gzip")
+            }
+        }
+    }
+
+    pub fn is_plain_tar_layer(&self) -> bool {
+        matches!(
+            self.media_type.as_deref(),
+            Some("application/vnd.oci.image.layer.v1.tar")
+                | Some("application/vnd.docker.image.rootfs.diff.tar")
+        )
     }
 }
 
-/// OCI Image Configuration
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ImageConfig {
     pub config: Option<ContainerConfig>,
@@ -111,4 +96,10 @@ pub struct RootFs {
     #[serde(rename = "type")]
     pub fs_type: String,
     pub diff_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct StoredImage {
+    pub manifest: Manifest,
+    pub config: ImageConfig,
 }

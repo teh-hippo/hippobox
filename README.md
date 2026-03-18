@@ -34,9 +34,9 @@ Containers are always temporary — they're cleaned up on exit. No `--rm` flag n
 
 - **OCI registry client** — anonymous token auth, fat manifest resolution, streaming layer download with sha256 verification
 - **overlayfs** — image layers stacked read-only, per-container writable upper layer
-- **Linux namespaces** — PID, mount, UTS, IPC isolation (host networking)
+- **Linux namespaces** — mount, UTS, IPC isolation; host PID namespace for now
 - **pivot_root** — full filesystem isolation with proper mount propagation
-- **Init shim** — PID 1 with signal forwarding and zombie reaping via re-exec pattern
+- **Re-exec handoff** — lightweight startup, signal forwarding, and wait handling
 - **Security** — `PR_SET_NO_NEW_PRIVS`, sensitive `/proc` path masking, read-only `/sys`
 
 ## Building
@@ -51,6 +51,7 @@ Release binary is ~2MB with the optimized profile.
 
 - [ ] `hippobox ps` — list running containers (daemon/background mode)
 - [ ] `hippobox exec` — attach to running container
+- [ ] PID namespace + PID 1 init handling
 - [ ] `/etc/hosts` bind-mount
 - [ ] Configurable resource limits (`--memory`, `--cpus`, `--pids`)
 - [ ] Capability drops (Docker-standard allowlist)

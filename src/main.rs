@@ -1,17 +1,18 @@
-mod image;
 mod container;
+mod image;
 mod registry;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use image::ref_parser::ImageRef;
+use registry::manifest::StoredImage;
 use registry::RegistryClient;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn hippobox_dir() -> PathBuf {
-    let dir = dirs::home().join(".hippobox");
-    dir
+    dirs::home().join(".hippobox")
 }
 
 mod dirs {
@@ -40,15 +41,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Pull an image from a registry
-    Pull {
-        /// Image reference (e.g. docker.io/nginx:latest)
-        image: String,
-    },
+    Pull { image: String },
     /// Run a container from an image
     Run {
-        /// Image reference (e.g. docker.io/nginx:latest)
         image: String,
-        /// Command to run (overrides CMD)
         #[arg(trailing_var_arg = true)]
         cmd: Vec<String>,
     },
@@ -59,8 +55,7 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    // Handle re-exec for container init
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<_> = std::env::args().collect();
     if args.len() >= 3 && args[1] == "--container-init" {
         let fd: i32 = args[2].parse().expect("invalid fd for container-init");
         return container::process::container_init(fd);
@@ -74,32 +69,28 @@ fn main() -> Result<()> {
             let image_ref = ImageRef::parse(&image)?;
             eprintln!("pulling {image_ref}");
             let mut client = RegistryClient::new();
-            let config = client.pull(&image_ref, &hippobox_dir())?;
-            eprintln!("pulled {} layers", config.rootfs.map(|r| r.diff_ids.len()).unwrap_or(0));
+            let stored = client.pull(&image_ref, &hippobox_dir())?;
+            let layer_count = stored
+                .config
+                .rootfs
+                .as_ref()
+                .map(|rootfs| rootfs.diff_ids.len())
+                .unwrap_or(stored.manifest.layers.len());
+            eprintln!("pulled {layer_count} layers");
         }
         Commands::Run { image, cmd } => {
             let image_ref = ImageRef::parse(&image)?;
             let base_dir = hippobox_dir();
 
-            // Auto-pull if not cached
-            let image_path = base_dir
-                .join("images")
-                .join(&image_ref.repository)
-                .join(format!("{}.json", image_ref.tag));
-            if !image_path.exists() {
+            if !image_ref.image_metadata_path(&base_dir).exists() {
                 eprintln!("image not found locally, pulling...");
                 let mut client = RegistryClient::new();
                 client.pull(&image_ref, &base_dir)?;
             }
 
             let (manifest, config) = container::load_image(&image_ref, &base_dir)?;
-            let container_id = format!("{:x}", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos());
-
             let spec = container::ContainerSpec {
-                id: container_id,
+                id: next_container_id(),
                 image_ref,
                 manifest,
                 config,
@@ -110,82 +101,72 @@ fn main() -> Result<()> {
             let exit_code = container::run(spec)?;
             std::process::exit(exit_code);
         }
-        Commands::Images => {
-            list_images(&hippobox_dir())?;
-        }
-        Commands::Clean => {
-            clean_all(&hippobox_dir())?;
-        }
+        Commands::Images => list_images(&hippobox_dir())?,
+        Commands::Clean => clean_all(&hippobox_dir())?,
     }
 
     Ok(())
 }
 
-fn list_images(base_dir: &PathBuf) -> Result<()> {
+fn list_images(base_dir: &Path) -> Result<()> {
     let images_dir = base_dir.join("images");
-    let mut found = false;
-
     let repos = walk_image_repos(&images_dir)?;
-    for (repo_name, tag_path, tag) in &repos {
-        if !found {
-            println!("{:<40} {:<15} {:>10}", "REPOSITORY", "TAG", "LAYERS");
-            found = true;
-        }
-        let data = fs::read_to_string(tag_path)?;
-        let val: serde_json::Value = serde_json::from_str(&data)?;
-        let layer_count = val
-            .get("manifest")
-            .and_then(|m| m.get("layers"))
-            .and_then(|l| l.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0);
-        println!("{:<40} {:<15} {:>10}", repo_name, tag, layer_count);
+    if repos.is_empty() {
+        println!("no images cached");
+        return Ok(());
     }
 
-    if !found {
-        println!("no images cached");
+    println!("{:<60} {:<15} {:>10}", "REPOSITORY", "TAG", "LAYERS");
+    for (repo_name, tag_path, tag) in repos {
+        let data = fs::read(tag_path)?;
+        let stored: StoredImage = serde_json::from_slice(&data)?;
+        println!(
+            "{:<60} {:<15} {:>10}",
+            repo_name,
+            tag,
+            stored.manifest.layers.len()
+        );
     }
     Ok(())
 }
 
-fn walk_image_repos(images_dir: &std::path::Path) -> Result<Vec<(String, PathBuf, String)>> {
+fn walk_image_repos(images_dir: &Path) -> Result<Vec<(String, PathBuf, String)>> {
     let mut results = Vec::new();
     walk_image_repos_inner(images_dir, images_dir, &mut results)?;
     Ok(results)
 }
 
 fn walk_image_repos_inner(
-    base: &std::path::Path,
-    dir: &std::path::Path,
+    base: &Path,
+    dir: &Path,
     results: &mut Vec<(String, PathBuf, String)>,
 ) -> Result<()> {
     if !dir.exists() {
         return Ok(());
     }
+
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
             walk_image_repos_inner(base, &path, results)?;
-        } else if let Some(fname) = path.file_name().and_then(|f| f.to_str()) {
-            if let Some(tag) = fname.strip_suffix(".json") {
-                let repo_name = path
-                    .parent()
-                    .unwrap_or(dir)
-                    .strip_prefix(base)
-                    .unwrap_or(dir.as_ref())
-                    .to_string_lossy()
-                    .to_string();
-                results.push((repo_name, path.clone(), tag.to_string()));
-            }
+        } else if let Some(tag) = path.file_name().and_then(|f| f.to_str()).and_then(|f| f.strip_suffix(".json")) {
+            let tag = tag.to_string();
+            let repo_name = path
+                .parent()
+                .unwrap_or(dir)
+                .strip_prefix(base)
+                .unwrap_or(dir)
+                .to_string_lossy()
+                .to_string();
+            results.push((repo_name, path, tag));
         }
     }
     Ok(())
 }
 
-fn clean_all(base_dir: &PathBuf) -> Result<()> {
-    let mut freed: u64 = 0;
-
+fn clean_all(base_dir: &Path) -> Result<()> {
+    let mut freed = 0;
     for sub in ["layers", "images", "containers"] {
         let dir = base_dir.join(sub);
         if dir.exists() {
@@ -205,11 +186,12 @@ fn clean_all(base_dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn dir_size(path: &std::path::Path) -> Result<u64> {
-    let mut total = 0;
+fn dir_size(path: &Path) -> Result<u64> {
     if path.is_file() {
         return Ok(fs::metadata(path)?.len());
     }
+
+    let mut total = 0;
     if path.is_dir() {
         for entry in fs::read_dir(path)? {
             total += dir_size(&entry?.path())?;
@@ -228,4 +210,11 @@ fn human_size(bytes: u64) -> (f64, &'static str) {
     } else {
         (bytes as f64, "B")
     }
+}
+
+fn next_container_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0));
+    format!("{:x}", now.as_nanos())
 }
