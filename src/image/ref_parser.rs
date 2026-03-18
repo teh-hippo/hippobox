@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 
 /// A parsed container image reference.
@@ -43,7 +43,10 @@ impl ImageRef {
     }
 
     pub fn image_metadata_dir(&self, base_dir: &Path) -> PathBuf {
-        base_dir.join("images").join(&self.registry).join(&self.repository)
+        base_dir
+            .join("images")
+            .join(&self.registry)
+            .join(&self.repository)
     }
 
     pub fn image_metadata_path(&self, base_dir: &Path) -> PathBuf {

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use nix::mount::{mount, umount2, MntFlags, MsFlags};
-use std::fs::{self, OpenOptions};
+use nix::mount::{MntFlags, MsFlags, mount, umount2};
+use std::fs::{self, File};
 use std::os::unix::fs::symlink;
 use std::path::Path;
 
@@ -32,15 +32,12 @@ pub fn prepare_host_device_sources(rootfs: &Path) -> Result<()> {
 
     for &name in REQUIRED_DEVICES {
         let source = source_dir.join(name);
-        if let Some(parent) = source.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&source)
-            .with_context(|| format!("failed to create host device placeholder at {}", source.display()))?;
+        File::create(&source).with_context(|| {
+            format!(
+                "failed to create host device placeholder at {}",
+                source.display()
+            )
+        })?;
 
         let host_device = format!("/dev/{name}");
         if !Path::new(&host_device).exists() {
@@ -53,7 +50,12 @@ pub fn prepare_host_device_sources(rootfs: &Path) -> Result<()> {
             MsFlags::MS_BIND,
             None::<&str>,
         )
-        .with_context(|| format!("failed to bind-mount {host_device} onto {}", source.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to bind-mount {host_device} onto {}",
+                source.display()
+            )
+        })?;
     }
 
     Ok(())
@@ -61,20 +63,12 @@ pub fn prepare_host_device_sources(rootfs: &Path) -> Result<()> {
 
 pub fn cleanup_host_device_sources(rootfs: &Path) -> Result<()> {
     let source_dir = rootfs.join(".hippobox-dev");
-    if !source_dir.exists() {
-        return Ok(());
-    }
-
-    for &name in REQUIRED_DEVICES.iter().rev() {
+    for &name in REQUIRED_DEVICES {
         let source = source_dir.join(name);
-        if source.exists() {
-            let _ = umount2(&source, MntFlags::MNT_DETACH);
-        }
+        let _ = umount2(&source, MntFlags::MNT_DETACH);
     }
 
-    if source_dir.exists() {
-        fs::remove_dir_all(&source_dir)?;
-    }
+    let _ = fs::remove_dir_all(&source_dir);
 
     Ok(())
 }
@@ -131,19 +125,10 @@ fn mount_dev() -> Result<()> {
 fn bind_host_device(name: &str) -> Result<()> {
     let source = format!("/.hippobox-dev/{name}");
     let target = format!("/dev/{name}");
-    let source_path = Path::new(&source);
-    if !source_path.exists() {
-        anyhow::bail!("missing host device for bind mount: {}", source_path.display());
-    }
-
     if let Some(parent) = Path::new(&target).parent() {
         fs::create_dir_all(parent)?;
     }
-    OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&target)
+    File::create(&target)
         .with_context(|| format!("failed to create device placeholder at {target}"))?;
 
     mount(
@@ -246,9 +231,10 @@ pub fn copy_host_files_to_rootfs(merged: &Path) -> Result<()> {
 
 fn ensure_symlink(target: &str, link_path: &str) -> Result<()> {
     let link = Path::new(link_path);
-    if link.exists() || fs::symlink_metadata(link).is_ok() {
+    if fs::symlink_metadata(link).is_ok() {
         let _ = fs::remove_file(link);
     }
-    symlink(target, link).with_context(|| format!("failed to create symlink {link_path} -> {target}"))?;
+    symlink(target, link)
+        .with_context(|| format!("failed to create symlink {link_path} -> {target}"))?;
     Ok(())
 }

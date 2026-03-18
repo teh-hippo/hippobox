@@ -1,8 +1,8 @@
-pub mod cgroups;
-pub mod mounts;
-pub mod namespaces;
-pub mod process;
-pub mod rootfs;
+mod cgroups;
+mod mounts;
+mod namespaces;
+mod process;
+mod rootfs;
 
 use anyhow::{Context, Result};
 use nix::sys::signal::{self, Signal};
@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use crate::image::ref_parser::ImageRef;
 use crate::registry::manifest::{ImageConfig, Manifest, StoredImage};
+
+pub(crate) use process::container_init;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ContainerSpec {
@@ -39,7 +41,8 @@ pub fn run(spec: ContainerSpec) -> Result<i32> {
 
 pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
     let container_config = spec.config.config.as_ref();
-    let (argv, env_vars) = process::build_command(container_config, &spec.user_cmd, &spec.user_env)?;
+    let (argv, env_vars) =
+        process::build_command(container_config, &spec.user_cmd, &spec.user_env)?;
     let workdir = container_config
         .and_then(|c| c.working_dir.as_deref())
         .unwrap_or("/");
@@ -56,7 +59,12 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
         std::fs::create_dir_all(dir)?;
     }
 
-    let mut cleanup = CleanupGuard::new(spec.id.clone(), container_dir, merged.clone(), spec.rootless);
+    let mut cleanup = CleanupGuard::new(
+        spec.id.clone(),
+        container_dir,
+        merged.clone(),
+        spec.rootless,
+    );
 
     let layer_dirs: Vec<PathBuf> = spec
         .manifest
@@ -80,8 +88,16 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
     eprintln!("starting container {} ({})", &spec.id[..12], spec.image_ref);
     eprintln!("  cmd: {:?}", argv);
 
-    process::run_container(&spec.id, &merged, &argv, &env_vars, workdir, stop_signal, spec.rootless)
-        .context("container execution failed")
+    process::run_container(
+        &spec.id,
+        &merged,
+        &argv,
+        &env_vars,
+        workdir,
+        stop_signal,
+        spec.rootless,
+    )
+    .context("container execution failed")
 }
 
 fn run_rootless_unshare(spec: ContainerSpec) -> Result<i32> {
@@ -125,15 +141,25 @@ fn run_rootless_unshare(spec: ContainerSpec) -> Result<i32> {
         .spawn()
         .context("failed to execute unshare")?;
     {
-        let mut stdin = child.stdin.take().context("failed to open rootless bootstrap stdin")?;
-        serde_json::to_writer(&mut stdin, &spec).context("failed to send rootless bootstrap spec")?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("failed to open rootless bootstrap stdin")?;
+        serde_json::to_writer(&mut stdin, &spec)
+            .context("failed to send rootless bootstrap spec")?;
     }
 
     unsafe {
-        signal::signal(Signal::SIGINT, signal::SigHandler::Handler(note_rootless_signal))
-            .context("failed to install rootless SIGINT handler")?;
-        signal::signal(Signal::SIGTERM, signal::SigHandler::Handler(note_rootless_signal))
-            .context("failed to install rootless SIGTERM handler")?;
+        signal::signal(
+            Signal::SIGINT,
+            signal::SigHandler::Handler(note_rootless_signal),
+        )
+        .context("failed to install rootless SIGINT handler")?;
+        signal::signal(
+            Signal::SIGTERM,
+            signal::SigHandler::Handler(note_rootless_signal),
+        )
+        .context("failed to install rootless SIGTERM handler")?;
     }
 
     let child_pid = child.id() as i32;
@@ -159,8 +185,12 @@ pub fn load_image(image_ref: &ImageRef, base_dir: &Path) -> Result<(Manifest, Im
     let config_path = image_ref.image_metadata_path(base_dir);
     let data = std::fs::read(&config_path)
         .with_context(|| format!("image not found locally: {image_ref}"))?;
-    let stored: StoredImage = serde_json::from_slice(&data)
-        .with_context(|| format!("failed to parse stored image metadata: {}", config_path.display()))?;
+    let stored: StoredImage = serde_json::from_slice(&data).with_context(|| {
+        format!(
+            "failed to parse stored image metadata: {}",
+            config_path.display()
+        )
+    })?;
     Ok((stored.manifest, stored.config))
 }
 
@@ -193,8 +223,6 @@ impl Drop for CleanupGuard {
             let _ = rootfs::unmount_overlay(&self.merged);
             let _ = mounts::cleanup_host_device_sources(&self.merged);
         }
-        if self.container_dir.exists() {
-            let _ = std::fs::remove_dir_all(&self.container_dir);
-        }
+        let _ = std::fs::remove_dir_all(&self.container_dir);
     }
 }

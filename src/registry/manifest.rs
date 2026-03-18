@@ -82,13 +82,7 @@ pub struct ContainerConfig {
     #[serde(default)]
     pub working_dir: Option<String>,
     #[serde(default)]
-    pub user: Option<String>,
-    #[serde(default)]
     pub stop_signal: Option<String>,
-    #[serde(default)]
-    pub exposed_ports: Option<serde_json::Value>,
-    #[serde(default)]
-    pub volumes: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

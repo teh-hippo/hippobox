@@ -5,22 +5,14 @@ mod registry;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use image::ref_parser::ImageRef;
-use registry::manifest::StoredImage;
 use registry::RegistryClient;
+use registry::manifest::StoredImage;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn hippobox_dir() -> PathBuf {
-    dirs::home().join(".hippobox")
-}
-
-mod dirs {
-    use std::path::PathBuf;
-
-    pub fn home() -> PathBuf {
-        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
-    }
+    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into())).join(".hippobox")
 }
 
 fn ensure_storage_dirs() -> Result<()> {
@@ -61,7 +53,7 @@ fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     if args.len() >= 3 && args[1] == "--container-init" {
         let fd: i32 = args[2].parse().expect("invalid fd for container-init");
-        return container::process::container_init(fd);
+        return container::container_init(fd);
     }
     if args.len() >= 2 && args[1] == "--rootless-bootstrap" {
         let prctl_ret = unsafe {
@@ -74,7 +66,8 @@ fn main() -> Result<()> {
             )
         };
         if prctl_ret != 0 {
-            return Err(std::io::Error::last_os_error()).context("failed to set rootless PDEATHSIG");
+            return Err(std::io::Error::last_os_error())
+                .context("failed to set rootless PDEATHSIG");
         }
         let spec: container::ContainerSpec = serde_json::from_reader(std::io::stdin())
             .context("failed to read rootless bootstrap spec from stdin")?;
@@ -177,7 +170,11 @@ fn walk_image_repos_inner(
             walk_image_repos_inner(base, &path, results)?;
         } else {
             let file_name = entry.file_name();
-            let Some(tag) = file_name.as_os_str().to_str().and_then(|f| f.strip_suffix(".json")) else {
+            let Some(tag) = file_name
+                .as_os_str()
+                .to_str()
+                .and_then(|f| f.strip_suffix(".json"))
+            else {
                 continue;
             };
             let tag = tag.to_string();

@@ -1,7 +1,7 @@
-use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
-use serde::Deserialize;
 use crate::image::ref_parser::ImageRef;
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+use std::collections::HashMap;
 
 /// Cached bearer tokens, keyed by registry+repo.
 pub struct TokenCache {

@@ -1,6 +1,6 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use nix::sys::signal::{self, Signal};
-use nix::sys::wait::{waitpid, WaitStatus};
+use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{self, ForkResult, Pid};
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
@@ -57,7 +57,10 @@ pub fn build_command(
 fn merge_env_vars(mut env_vars: Vec<String>, overrides: &[String]) -> Result<Vec<String>> {
     for override_var in overrides {
         let key = env_key(override_var)?;
-        if let Some(existing) = env_vars.iter_mut().find(|value| env_key_matches(value, key)) {
+        if let Some(existing) = env_vars
+            .iter_mut()
+            .find(|value| env_key_matches(value, key))
+        {
             *existing = override_var.clone();
         } else {
             env_vars.push(override_var.clone());
@@ -68,7 +71,10 @@ fn merge_env_vars(mut env_vars: Vec<String>, overrides: &[String]) -> Result<Vec
 }
 
 fn env_key_matches(value: &str, key: &str) -> bool {
-    value.split_once('=').map(|(existing, _)| existing == key).unwrap_or(false)
+    value
+        .split_once('=')
+        .map(|(existing, _)| existing == key)
+        .unwrap_or(false)
 }
 
 fn env_key(value: &str) -> Result<&str> {
@@ -140,10 +146,16 @@ pub fn run_container(
 
 pub(crate) fn parent_wait(child: Pid, stop_signal: Signal) -> Result<i32> {
     unsafe {
-        signal::signal(Signal::SIGINT, signal::SigHandler::Handler(note_pending_signal))
-            .context("failed to install SIGINT handler")?;
-        signal::signal(Signal::SIGTERM, signal::SigHandler::Handler(note_pending_signal))
-            .context("failed to install SIGTERM handler")?;
+        signal::signal(
+            Signal::SIGINT,
+            signal::SigHandler::Handler(note_pending_signal),
+        )
+        .context("failed to install SIGINT handler")?;
+        signal::signal(
+            Signal::SIGTERM,
+            signal::SigHandler::Handler(note_pending_signal),
+        )
+        .context("failed to install SIGTERM handler")?;
     }
 
     loop {
@@ -187,8 +199,14 @@ pub fn container_init(config_fd: i32) -> Result<()> {
             .with_context(|| format!("failed to chdir to {}", config.workdir))?;
     }
 
-    let program = CString::new(config.argv.first().context("empty argv in child config")?.as_str())
-        .context("program contains NUL")?;
+    let program = CString::new(
+        config
+            .argv
+            .first()
+            .context("empty argv in child config")?
+            .as_str(),
+    )
+    .context("program contains NUL")?;
     let c_argv = to_cstrings(&config.argv, "argv")?;
     let c_env = to_cstrings(&config.env_vars, "env")?;
 
@@ -216,7 +234,10 @@ fn non_empty(value: Option<&Vec<String>>) -> Option<&[String]> {
 fn to_cstrings(values: &[String], label: &str) -> Result<Vec<CString>> {
     values
         .iter()
-        .map(|value| CString::new(value.as_str()).with_context(|| format!("{label} contains NUL byte: {value:?}")))
+        .map(|value| {
+            CString::new(value.as_str())
+                .with_context(|| format!("{label} contains NUL byte: {value:?}"))
+        })
         .collect()
 }
 
@@ -230,10 +251,7 @@ mod tests {
             entrypoint: None,
             env,
             working_dir: None,
-            user: None,
             stop_signal: None,
-            exposed_ports: None,
-            volumes: None,
         }
     }
 

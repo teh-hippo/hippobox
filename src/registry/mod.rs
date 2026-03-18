@@ -1,11 +1,11 @@
 pub mod auth;
 pub mod manifest;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
-use std::fs;
+use std::fs::{self, DirBuilder};
 use std::io::{self, Read};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -35,7 +35,10 @@ impl RegistryClient {
         for layer in &manifest.layers {
             let layer_dir = base_dir.join("layers/sha256").join(layer.digest_hex());
             if layer_dir.exists() {
-                eprintln!("  layer {} already exists, skipping", &layer.digest_hex()[..12]);
+                eprintln!(
+                    "  layer {} already exists, skipping",
+                    &layer.digest_hex()[..12]
+                );
                 continue;
             }
 
@@ -155,7 +158,11 @@ impl RegistryClient {
                 .call()
                 .map_err(|e| anyhow::anyhow!("redirect follow failed: {e}"))?
         } else if resp.status() != 200 {
-            bail!("unexpected status {} for blob {}", resp.status(), layer.digest);
+            bail!(
+                "unexpected status {} for blob {}",
+                resp.status(),
+                layer.digest
+            );
         } else {
             resp
         };
@@ -180,7 +187,11 @@ impl RegistryClient {
         let computed = format!("sha256:{}", reader.finalize_hex());
         if computed != layer.digest {
             let _ = fs::remove_dir_all(&tmp_dir);
-            bail!("layer digest mismatch: expected {}, got {}", layer.digest, computed);
+            bail!(
+                "layer digest mismatch: expected {}, got {}",
+                layer.digest,
+                computed
+            );
         }
 
         fs::rename(&tmp_dir, target_dir)?;
@@ -219,7 +230,10 @@ fn extract_with_whiteouts(archive: &mut tar::Archive<impl Read>, target: &Path) 
         let path = entry.path()?.into_owned();
         validate_relative_path(&path)?;
 
-        let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
         if file_name == ".wh..wh..opq" {
             let parent_rel = path.parent().unwrap_or(Path::new(""));
             let parent = ensure_safe_dir(target, parent_rel)?;
@@ -284,19 +298,17 @@ fn create_extract_temp_dir(target_dir: &Path) -> Result<PathBuf> {
     for _ in 0..64 {
         let nonce = TMP_EXTRACT_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_dir = target_dir.with_extension(format!("tmp-{pid}-{nonce}"));
-        match fs::create_dir(&tmp_dir) {
-            Ok(()) => {
-                let mut perms = fs::metadata(&tmp_dir)?.permissions();
-                perms.set_mode(0o700);
-                fs::set_permissions(&tmp_dir, perms)?;
-                return Ok(tmp_dir);
-            }
+        match DirBuilder::new().mode(0o700).create(&tmp_dir) {
+            Ok(()) => return Ok(tmp_dir),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err.into()),
         }
     }
 
-    bail!("failed to create a unique extraction temp dir for {}", target_dir.display());
+    bail!(
+        "failed to create a unique extraction temp dir for {}",
+        target_dir.display()
+    );
 }
 
 fn ensure_safe_dir(base: &Path, relative: &Path) -> Result<PathBuf> {
@@ -305,8 +317,16 @@ fn ensure_safe_dir(base: &Path, relative: &Path) -> Result<PathBuf> {
     for component in relative.components() {
         if let Component::Normal(part) = component {
             out.push(part);
-            if out.exists() && fs::symlink_metadata(&out)?.file_type().is_symlink() {
-                bail!("refusing to traverse symlink while extracting: {}", out.display());
+            match fs::symlink_metadata(&out) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    bail!(
+                        "refusing to traverse symlink while extracting: {}",
+                        out.display()
+                    );
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
             }
         }
     }

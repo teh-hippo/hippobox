@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use nix::mount::{mount, umount2, MntFlags, MsFlags};
+use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use std::path::{Path, PathBuf};
 
 /// Mount overlayfs with the given lower layers, upper dir, work dir, and merge point.
