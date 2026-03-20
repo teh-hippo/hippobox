@@ -7,14 +7,14 @@ mod rootfs;
 use anyhow::{Context, Result, bail};
 use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::{self, Signal};
+use nix::sys::wait::WaitStatus;
+use nix::unistd::Pid;
 use std::fs::File;
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::thread;
-use std::time::Duration;
 
 use crate::image::ref_parser::ImageRef;
 use crate::registry::manifest::{ImageConfig, Manifest, StoredImage};
@@ -230,15 +230,22 @@ fn run_rootless_unshare(spec: ContainerSpec) -> Result<i32> {
         .context("failed to install rootless SIGTERM handler")?;
     }
 
-    let child_pid = child.id() as i32;
+    // Use blocking waitpid instead of polling try_wait+sleep.
+    // waitpid returns EINTR when our signal handler fires, letting us
+    // forward signals immediately without a 50ms poll delay.
+    let child_pid = Pid::from_raw(child.id() as i32);
+    std::mem::forget(child); // prevent Child::drop from double-waiting
     loop {
-        if ROOTLESS_PENDING_SIGNAL.swap(0, Ordering::SeqCst) != 0 {
-            let _ = unsafe { nix::libc::kill(-child_pid, nix::libc::SIGTERM) };
-        }
-
-        match child.try_wait().context("failed to wait for unshare")? {
-            Some(status) => return Ok(status.code().unwrap_or(1)),
-            None => thread::sleep(Duration::from_millis(50)),
+        match nix::sys::wait::waitpid(child_pid, None) {
+            Ok(WaitStatus::Exited(_, code)) => return Ok(code),
+            Ok(WaitStatus::Signaled(_, sig, _)) => return Ok(128 + sig as i32),
+            Err(nix::errno::Errno::EINTR) => {
+                if ROOTLESS_PENDING_SIGNAL.swap(0, Ordering::SeqCst) != 0 {
+                    let _ = unsafe { nix::libc::kill(-child_pid.as_raw(), nix::libc::SIGTERM) };
+                }
+            }
+            Err(err) => return Err(err).context("failed to wait for unshare"),
+            _ => continue,
         }
     }
 }
