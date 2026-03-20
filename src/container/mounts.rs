@@ -215,10 +215,9 @@ pub fn mount_volumes(merged: &Path, volumes: &[VolumeMount]) -> Result<()> {
         if !target.starts_with(merged) {
             bail!("volume target escapes container rootfs: {}", vol.target);
         }
-        fs::create_dir_all(&target)?;
 
         if vol.source == "tmpfs" {
-            // Image VOLUME directive: mount tmpfs (anonymous volume).
+            fs::create_dir_all(&target)?;
             mount(
                 Some("tmpfs"),
                 &target,
@@ -232,11 +231,18 @@ pub fn mount_volumes(merged: &Path, volumes: &[VolumeMount]) -> Result<()> {
             continue;
         }
 
-        // Bind mount: if source is a file, create a file placeholder at target.
+        // Check source type to create the right placeholder at the target.
         let source_meta = fs::metadata(&vol.source)
             .with_context(|| format!("volume source inaccessible: {}", vol.source))?;
-        if source_meta.is_file() && !target.exists() {
-            File::create(&target)?;
+        if source_meta.is_file() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if !target.exists() {
+                File::create(&target)?;
+            }
+        } else {
+            fs::create_dir_all(&target)?;
         }
 
         mount(
