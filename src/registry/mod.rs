@@ -220,23 +220,19 @@ impl RegistryClient {
             inner: resp.into_body().into_reader(),
             hasher: Sha256::new(),
         };
-        let reader = if layer
-            .media_type
-            .as_deref()
-            .map(|media_type| {
-                media_type.contains("tar+gzip") || media_type.ends_with("diff.tar.gzip")
-            })
-            .unwrap_or(true)
-        {
-            let decoder = flate2::read::GzDecoder::new(reader);
-            let mut archive = tar::Archive::new(decoder);
+        let is_gzip = layer.media_type.as_deref().is_none_or(|mt| {
+            mt.contains("tar+gzip") || mt.ends_with("diff.tar.gzip")
+        });
+        let is_tar = matches!(
+            layer.media_type.as_deref(),
+            Some("application/vnd.oci.image.layer.v1.tar"
+                | "application/vnd.docker.image.rootfs.diff.tar")
+        );
+        let reader = if is_gzip {
+            let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(reader));
             extract_with_whiteouts(&mut archive, &tmp_dir)?;
             archive.into_inner().into_inner()
-        } else if matches!(
-            layer.media_type.as_deref(),
-            Some("application/vnd.oci.image.layer.v1.tar")
-                | Some("application/vnd.docker.image.rootfs.diff.tar")
-        ) {
+        } else if is_tar {
             let mut archive = tar::Archive::new(reader);
             extract_with_whiteouts(&mut archive, &tmp_dir)?;
             archive.into_inner()

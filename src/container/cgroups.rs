@@ -1,13 +1,12 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::time::Duration;
 
 const CGROUP_BASE: &str = "/sys/fs/cgroup/hippobox";
 
 pub fn check_cgroup_v2() -> Result<()> {
-    let controllers = Path::new("/sys/fs/cgroup/cgroup.controllers");
-    if !controllers.exists() {
-        anyhow::bail!("cgroup v2 not available (missing /sys/fs/cgroup/cgroup.controllers)");
+    if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+        bail!("cgroup v2 not available (missing /sys/fs/cgroup/cgroup.controllers)");
     }
     Ok(())
 }

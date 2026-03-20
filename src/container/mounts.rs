@@ -152,17 +152,16 @@ fn bind_host_device(name: &str) -> Result<()> {
 
 pub fn copy_host_files_to_rootfs(merged: &Path) -> Result<()> {
     for src in ["/etc/resolv.conf", "/etc/hostname"] {
-        let src_path = Path::new(src);
         let dest = merged.join(src.trim_start_matches('/'));
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
-        match fs::copy(src_path, &dest) {
+        match fs::copy(src, &dest) {
             Ok(_) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
             Err(err) => {
                 return Err(err)
-                    .with_context(|| format!("failed to copy {} into rootfs", src_path.display()));
+                    .with_context(|| format!("failed to copy {src} into rootfs"));
             }
         }
     }
