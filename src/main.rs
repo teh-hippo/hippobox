@@ -42,6 +42,10 @@ enum Commands {
         env: Vec<String>,
         #[arg(short = 'v', long = "volume", value_name = "SRC:DST[:ro|rw]")]
         volumes: Vec<String>,
+        #[arg(short = 'p', long = "publish", value_name = "HOST:CONTAINER[/PROTO]")]
+        ports: Vec<String>,
+        #[arg(long = "network", default_value = "host")]
+        network: String,
         image: String,
         #[arg(trailing_var_arg = true)]
         cmd: Vec<String>,
@@ -83,6 +87,7 @@ fn main() -> Result<()> {
                 serde_json::from_reader(std::io::BufReader::new(std::io::stdin()))
                     .context("failed to read rootless bootstrap spec from stdin")?;
             let exit_code = container::run_prepared(spec)?;
+
             std::process::exit(exit_code);
         }
     }
@@ -102,6 +107,8 @@ fn main() -> Result<()> {
             cmd,
             env,
             volumes,
+            ports,
+            network,
         } => {
             let image_ref = ImageRef::parse(&image)?;
             let base_dir = hippobox_dir();
@@ -141,6 +148,30 @@ fn main() -> Result<()> {
                 }
             }
 
+            let port_mappings: Vec<container::net::PortMapping> = ports
+                .iter()
+                .map(|p| container::net::parse_port(p))
+                .collect::<Result<_>>()?;
+
+            // -p implies network isolation unless --network=host is explicit.
+            let network_mode = if !port_mappings.is_empty()
+                && network == "host"
+                && !std::env::args().any(|a| a == "--network")
+            {
+                container::net::NetworkMode::None
+            } else {
+                container::net::parse_network_mode(&network)?
+            };
+
+            if !port_mappings.is_empty()
+                && network_mode == container::net::NetworkMode::Host
+            {
+                anyhow::bail!(
+                    "-p requires network isolation; use --network=none (default with -p) \
+                     or remove --network=host"
+                );
+            }
+
             let id = format!(
                 "{:x}",
                 std::time::SystemTime::now()
@@ -157,6 +188,9 @@ fn main() -> Result<()> {
                 user_cmd: cmd,
                 user_env: env,
                 volumes: volume_mounts,
+                network_mode,
+                port_mappings: port_mappings.clone(),
+                network_isolated: !port_mappings.is_empty(),
                 rootless,
             };
 

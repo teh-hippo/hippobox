@@ -14,9 +14,14 @@ pub fn setup_namespaces_and_pivot(
     new_root: &Path,
     rootless: bool,
     volumes: &[VolumeMount],
+    isolate_network: bool,
 ) -> Result<()> {
-    unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWIPC)
-        .context("failed to unshare namespaces")?;
+    let mut clone_flags =
+        CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWIPC;
+    if isolate_network {
+        clone_flags |= CloneFlags::CLONE_NEWNET;
+    }
+    unshare(clone_flags).context("failed to unshare namespaces")?;
 
     mount(
         None::<&str>,

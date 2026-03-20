@@ -6,19 +6,33 @@ use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::Path;
 
-pub fn run_container(config: ChildConfig, stop_signal: &str) -> Result<i32> {
+pub fn run_container(mut config: ChildConfig, stop_signal: &str) -> Result<i32> {
     if !config.rootless {
         super::cgroups::check_cgroup_v2()?;
         super::cgroups::create(&config.container_id)?;
     }
 
+    let has_ports = !config.port_mappings.is_empty();
+
+    // Ready pipe: child signals parent when netns is ready (for pasta).
+    let (ready_read, ready_write) = if has_ports {
+        let (r, w) = nix::unistd::pipe().context("failed to create ready pipe")?;
+        (Some(r), Some(w))
+    } else {
+        (None, None)
+    };
+
     let (read_fd, write_fd) = nix::unistd::pipe().context("failed to create pipe")?;
     let read_raw = read_fd.as_raw_fd();
     let write_raw = write_fd.into_raw_fd();
 
+    // Store the ready write fd in config so the child can signal us.
+    config.ready_fd = ready_write.as_ref().map(|fd| fd.as_raw_fd());
+
     match unsafe { unistd::fork() }.context("fork failed")? {
         ForkResult::Parent { child } => {
             drop(read_fd);
+            drop(ready_write);
 
             let pipe_file = unsafe { std::fs::File::from_raw_fd(write_raw) };
             let mut pipe_write = std::io::BufWriter::new(pipe_file);
@@ -28,6 +42,21 @@ pub fn run_container(config: ChildConfig, stop_signal: &str) -> Result<i32> {
             if !config.rootless {
                 super::cgroups::add_pid(&config.container_id, child.as_raw() as u32)?;
             }
+
+            // Wait for child to signal netns ready, then start pasta.
+            let mut pasta_child = None;
+            if has_ports {
+                if let Some(ready_fd) = ready_read {
+                    let mut buf = [0u8; 1];
+                    let _ = nix::unistd::read(ready_fd.as_raw_fd(), &mut buf);
+                    drop(ready_fd);
+                }
+                pasta_child = Some(
+                    super::net::spawn_pasta_for_pid(child.as_raw() as u32, &config.port_mappings)
+                        .context("failed to start port forwarding")?,
+                );
+            }
+
             let stop_signal = match stop_signal.trim_start_matches("SIG") {
                 "QUIT" => Signal::SIGQUIT,
                 "INT" => Signal::SIGINT,
@@ -37,7 +66,15 @@ pub fn run_container(config: ChildConfig, stop_signal: &str) -> Result<i32> {
                 "KILL" => Signal::SIGKILL,
                 _ => Signal::SIGTERM,
             };
-            parent_wait(child, stop_signal)
+            let exit_code = parent_wait(child, stop_signal)?;
+
+            // Clean up pasta on container exit.
+            if let Some(mut pasta) = pasta_child {
+                let _ = pasta.kill();
+                let _ = pasta.wait();
+            }
+
+            Ok(exit_code)
         }
         ForkResult::Child => {
             nix::unistd::close(write_raw).context("failed to close config pipe write end")?;
@@ -115,6 +152,11 @@ pub fn container_init(config_fd: i32) -> Result<()> {
     let pipe_file = unsafe { std::fs::File::from_raw_fd(config_fd) };
     let config: ChildConfig = serde_json::from_reader(std::io::BufReader::new(pipe_file))?;
 
+    // Create network namespace only if isolation is requested and not already
+    // provided (pasta creates the netns externally for port-mapped containers).
+    let needs_netns = config.network_mode == super::net::NetworkMode::None
+        && !config.network_isolated;
+
     // Copy host files into rootfs before pivot (host /etc is still accessible).
     super::mounts::copy_host_files_to_rootfs(Path::new(&config.rootfs))?;
 
@@ -122,7 +164,21 @@ pub fn container_init(config_fd: i32) -> Result<()> {
         Path::new(&config.rootfs),
         config.rootless,
         &config.volumes,
+        needs_netns,
     )?;
+
+    // Bring up loopback when WE created the netns (not when pasta did —
+    // pasta configures the full network including loopback and tap).
+    if needs_netns {
+        super::net::bring_up_loopback().context("failed to bring up loopback")?;
+    }
+
+    // Signal parent that netns is ready (for rootful pasta synchronisation).
+    if let Some(fd) = config.ready_fd {
+        let _ = nix::unistd::write(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }, &[1u8]);
+        let _ = nix::unistd::close(fd);
+    }
+
     super::mounts::setup_container_mounts(config.rootless)?;
 
     let hostname = &config.container_id[..config.container_id.len().min(12)];
@@ -190,6 +246,10 @@ pub(crate) struct ChildConfig {
     pub rootless: bool,
     pub user: Option<String>,
     pub volumes: Vec<super::VolumeMount>,
+    pub network_mode: super::net::NetworkMode,
+    pub port_mappings: Vec<super::net::PortMapping>,
+    pub network_isolated: bool,
+    pub ready_fd: Option<i32>,
 }
 
 fn setup_user(user_str: &str, rootless: bool) -> Result<()> {

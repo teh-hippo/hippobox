@@ -1,6 +1,7 @@
 mod cgroups;
 mod mounts;
 mod namespaces;
+pub(crate) mod net;
 mod process;
 mod rootfs;
 
@@ -39,6 +40,10 @@ pub struct ContainerSpec {
     pub user_cmd: Vec<String>,
     pub user_env: Vec<String>,
     pub volumes: Vec<VolumeMount>,
+    pub network_mode: net::NetworkMode,
+    pub port_mappings: Vec<net::PortMapping>,
+    /// Set when pasta (or another tool) has already created the network namespace.
+    pub network_isolated: bool,
     pub rootless: bool,
 }
 
@@ -155,6 +160,10 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
         rootless: spec.rootless,
         user,
         volumes: spec.volumes,
+        network_mode: spec.network_mode,
+        port_mappings: spec.port_mappings,
+        network_isolated: spec.network_isolated,
+        ready_fd: None,
     };
 
     process::run_container(child_config, stop_signal).context("container execution failed")
@@ -185,41 +194,65 @@ fn run_rootless_unshare(spec: ContainerSpec) -> Result<i32> {
         .or_else(|_| std::env::current_exe())
         .context("failed to locate current executable")?;
 
-    let mut command = Command::new("unshare");
-    unsafe {
-        command.pre_exec(|| {
-            if nix::libc::setpgid(0, 0) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let ret = nix::libc::prctl(
-                nix::libc::PR_SET_PDEATHSIG,
-                nix::libc::SIGTERM as nix::libc::c_ulong,
-                0,
-                0,
-                0,
-            );
-            if ret != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    let has_ports = !spec.port_mappings.is_empty();
+    let isolate_network = spec.network_mode == net::NetworkMode::None || has_ports;
+
+    if has_ports {
+        net::check_pasta()?;
     }
 
-    let mut child = command
-        .args([
-            "--user",
-            "--map-root-user",
-            "--map-auto",
-            "--mount",
-            "--uts",
-            "--ipc",
-            "--",
-        ])
-        .arg(exe)
-        .arg("--rootless-bootstrap")
-        .stdin(Stdio::piped())
-        .spawn()
-        .context("failed to execute unshare")?;
+    let pre_exec_fn = || unsafe {
+        if nix::libc::setpgid(0, 0) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let ret = nix::libc::prctl(
+            nix::libc::PR_SET_PDEATHSIG,
+            nix::libc::SIGTERM as nix::libc::c_ulong,
+            0,
+            0,
+            0,
+        );
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    };
+
+    let mut child = if has_ports {
+        // pasta wraps the process: creates user+net namespace from the HOST,
+        // binds host ports for forwarding, then runs unshare inside for
+        // mount/uts/ipc isolation. pasta's user namespace has single-UID
+        // mapping (0→real_uid) which is sufficient for most containers.
+        let pasta_path = net::check_pasta()?;
+        let mut cmd = Command::new(pasta_path);
+        unsafe { cmd.pre_exec(pre_exec_fn); }
+        cmd.args(["--config-net", "--quiet", "--foreground", "--no-map-gw"]);
+        net::add_port_args(&mut cmd, &spec.port_mappings);
+        cmd.args(["-u", "none", "-T", "none", "-U", "none"]);
+        cmd.args(["--", "unshare", "--mount", "--uts", "--ipc", "--"]);
+        cmd.arg(&exe).arg("--rootless-bootstrap");
+        cmd.stdin(Stdio::piped())
+            .spawn()
+            .context("failed to execute pasta")?
+    } else {
+        // Standard rootless: unshare handles all namespaces with full
+        // subordinate UID mapping (--map-auto).
+        let mut unshare_args: Vec<&str> = vec![
+            "--user", "--map-root-user", "--map-auto",
+            "--mount", "--uts", "--ipc",
+        ];
+        if isolate_network {
+            unshare_args.push("--net");
+        }
+        unshare_args.push("--");
+        let mut cmd = Command::new("unshare");
+        unsafe { cmd.pre_exec(pre_exec_fn); }
+        cmd.args(&unshare_args).arg(&exe).arg("--rootless-bootstrap");
+        cmd.stdin(Stdio::piped())
+            .spawn()
+            .context("failed to execute unshare")?
+    };
+
     {
         let stdin = child
             .stdin
@@ -247,7 +280,7 @@ fn run_rootless_unshare(spec: ContainerSpec) -> Result<i32> {
     // waitpid returns EINTR when our signal handler fires, letting us
     // forward signals immediately without a 50ms poll delay.
     let child_pid = Pid::from_raw(child.id() as i32);
-    std::mem::forget(child); // prevent Child::drop from double-waiting
+    std::mem::forget(child);
     loop {
         match nix::sys::wait::waitpid(child_pid, None) {
             Ok(WaitStatus::Exited(_, code)) => return Ok(code),
