@@ -438,30 +438,14 @@ impl<R: Read> Read for HashingReader<R> {
 
 /// Collect all layer digests referenced by any stored image manifest.
 fn collect_all_referenced_layers(base_dir: &Path) -> Result<std::collections::HashSet<String>> {
-    let images_dir = base_dir.join("images");
     let mut referenced = std::collections::HashSet::new();
-    if !images_dir.exists() {
-        return Ok(referenced);
-    }
-
-    let mut stack = vec![images_dir];
-    while let Some(dir) = stack.pop() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "json")
-                && let Some(stored) = fs::read(&path)
-                    .ok()
-                    .and_then(|data| serde_json::from_slice::<StoredImage>(&data).ok())
-            {
-                for layer in &stored.manifest.layers {
-                    referenced.insert(layer.digest.clone());
-                }
+    for (_, _, path) in crate::image::walk_stored_images(&base_dir.join("images"))? {
+        if let Some(stored) = fs::read(&path)
+            .ok()
+            .and_then(|data| serde_json::from_slice::<StoredImage>(&data).ok())
+        {
+            for layer in &stored.manifest.layers {
+                referenced.insert(layer.digest.clone());
             }
         }
     }

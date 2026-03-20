@@ -190,7 +190,9 @@ fn setup_user(user_str: &str, rootless: bool) -> Result<()> {
         None => {
             let uid = resolve_uid(user_str)?;
             // When no group specified, look up the user's primary group from /etc/passwd.
-            let gid = lookup_primary_gid(uid).unwrap_or(uid);
+            let gid = passwd_field_by_uid(uid, 3)
+                .and_then(|g| g.parse::<u32>().ok())
+                .unwrap_or(uid);
             (uid, gid)
         }
     };
@@ -202,8 +204,9 @@ fn setup_user(user_str: &str, rootless: bool) -> Result<()> {
     nix::unistd::setuid(nix::unistd::Uid::from_raw(uid))
         .context("failed to setuid")?;
 
-    // Set HOME if switching to non-root and HOME isn't already set.
-    if let Some(home) = uid.ne(&0).then(|| lookup_home(uid)).flatten() {
+    if uid != 0
+        && let Some(home) = passwd_field_by_uid(uid, 5)
+    {
         // Safe: we're single-threaded in the container init process before exec.
         unsafe { std::env::set_var("HOME", home) };
     }
@@ -214,56 +217,39 @@ fn resolve_uid(s: &str) -> Result<u32> {
     if let Ok(uid) = s.parse::<u32>() {
         return Ok(uid);
     }
-    // Look up username in /etc/passwd: name:x:uid:gid:...
-    let content = std::fs::read_to_string("/etc/passwd")
-        .context("failed to read /etc/passwd for user lookup")?;
-    for line in content.lines() {
-        let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() >= 3 && fields[0] == s {
-            return fields[2]
-                .parse::<u32>()
-                .with_context(|| format!("invalid uid in /etc/passwd for {s}"));
-        }
-    }
-    bail!("user not found in /etc/passwd: {s}")
+    resolve_name_to_id("/etc/passwd", 0, 2, s)
+        .with_context(|| format!("user not found in /etc/passwd: {s}"))
 }
 
 fn resolve_gid(s: &str) -> Result<u32> {
     if let Ok(gid) = s.parse::<u32>() {
         return Ok(gid);
     }
-    // Look up group name in /etc/group: name:x:gid:...
-    let content = std::fs::read_to_string("/etc/group")
-        .context("failed to read /etc/group for group lookup")?;
+    resolve_name_to_id("/etc/group", 0, 2, s)
+        .with_context(|| format!("group not found in /etc/group: {s}"))
+}
+
+/// Look up a field by name match in a colon-separated file (passwd/group).
+fn resolve_name_to_id(path: &str, name_col: usize, id_col: usize, name: &str) -> Result<u32> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {path}"))?;
     for line in content.lines() {
         let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() >= 3 && fields[0] == s {
-            return fields[2]
+        if fields.len() > id_col && fields[name_col] == name {
+            return fields[id_col]
                 .parse::<u32>()
-                .with_context(|| format!("invalid gid in /etc/group for {s}"));
+                .with_context(|| format!("invalid id in {path} for {name}"));
         }
     }
-    bail!("group not found in /etc/group: {s}")
+    bail!("name {name:?} not found in {path}")
 }
 
-fn lookup_primary_gid(uid: u32) -> Option<u32> {
+/// Look up fields from /etc/passwd by UID match.
+fn passwd_field_by_uid(uid: u32, field_idx: usize) -> Option<String> {
     let content = std::fs::read_to_string("/etc/passwd").ok()?;
-    for line in content.lines() {
+    content.lines().find_map(|line| {
         let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() >= 4 && fields[2].parse::<u32>().ok() == Some(uid) {
-            return fields[3].parse::<u32>().ok();
-        }
-    }
-    None
-}
-
-fn lookup_home(uid: u32) -> Option<String> {
-    let content = std::fs::read_to_string("/etc/passwd").ok()?;
-    for line in content.lines() {
-        let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() >= 6 && fields[2].parse::<u32>().ok() == Some(uid) {
-            return Some(fields[5].to_string());
-        }
-    }
-    None
+        (fields.len() > field_idx && fields[2].parse::<u32>().ok() == Some(uid))
+            .then(|| fields[field_idx].to_string())
+    })
 }

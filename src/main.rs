@@ -125,54 +125,17 @@ fn main() -> Result<()> {
 }
 
 fn list_images(base_dir: &Path) -> Result<()> {
-    let images_dir = base_dir.join("images");
-    let repos = walk_image_repos(&images_dir)?;
+    let repos = image::walk_stored_images(&base_dir.join("images"))?;
     if repos.is_empty() {
         println!("no images cached");
         return Ok(());
     }
 
     println!("{:<60} {:<15}", "REPOSITORY", "TAG");
-    for (repo_name, _tag_path, tag) in repos {
+    for (repo_name, tag, _) in repos {
         println!("{:<60} {:<15}", repo_name, tag);
     }
     Ok(())
-}
-
-fn walk_image_repos(images_dir: &Path) -> Result<Vec<(String, PathBuf, String)>> {
-    let mut results = Vec::new();
-    if !images_dir.exists() {
-        return Ok(results);
-    }
-
-    let mut stack = vec![images_dir.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if entry.file_type()?.is_dir() {
-                stack.push(path);
-                continue;
-            }
-
-            let file_name = entry.file_name();
-            let Some(tag) = file_name
-                .as_os_str()
-                .to_str()
-                .and_then(|name| name.strip_suffix(".json"))
-            else {
-                continue;
-            };
-
-            let repo_name = path
-                .parent()
-                .unwrap_or(&dir)
-                .strip_prefix(images_dir)
-                .map_or_else(|_| String::new(), |repo| repo.to_string_lossy().to_string());
-            results.push((repo_name, path, tag.to_string()));
-        }
-    }
-    Ok(results)
 }
 
 fn clean_all(base_dir: &Path) -> Result<()> {
