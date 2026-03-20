@@ -6,21 +6,12 @@ use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::Path;
 
-pub fn run_container(
-    container_id: &str,
-    rootfs: &Path,
-    argv: &[String],
-    env_vars: &[String],
-    workdir: &str,
-    stop_signal: &str,
-    rootless: bool,
-    user: Option<String>,
-) -> Result<i32> {
-    if !rootless {
+pub fn run_container(config: ChildConfig, stop_signal: &str) -> Result<i32> {
+    if !config.rootless {
         super::cgroups::check_cgroup_v2()?;
-        super::cgroups::create(container_id)?;
+        super::cgroups::create(&config.container_id)?;
     }
-    super::mounts::copy_host_files_to_rootfs(rootfs)?;
+    super::mounts::copy_host_files_to_rootfs(Path::new(&config.rootfs))?;
 
     let (read_fd, write_fd) = nix::unistd::pipe().context("failed to create pipe")?;
     let read_raw = read_fd.as_raw_fd();
@@ -30,21 +21,12 @@ pub fn run_container(
         ForkResult::Parent { child } => {
             drop(read_fd);
 
-            let config = ChildConfig {
-                rootfs: rootfs.to_string_lossy().to_string(),
-                argv: argv.to_vec(),
-                env_vars: env_vars.to_vec(),
-                workdir: workdir.to_string(),
-                container_id: container_id.to_string(),
-                rootless,
-                user,
-            };
             let mut pipe_write = unsafe { std::fs::File::from_raw_fd(write_raw) };
             serde_json::to_writer(&mut pipe_write, &config)?;
             drop(pipe_write);
 
-            if !rootless {
-                super::cgroups::add_pid(container_id, child.as_raw() as u32)?;
+            if !config.rootless {
+                super::cgroups::add_pid(&config.container_id, child.as_raw() as u32)?;
             }
             let stop_signal = match stop_signal.trim_start_matches("SIG") {
                 "QUIT" => Signal::SIGQUIT,
@@ -187,20 +169,17 @@ fn to_cstrings(values: &[String], label: &str) -> Result<Vec<CString>> {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct ChildConfig {
-    rootfs: String,
-    argv: Vec<String>,
-    env_vars: Vec<String>,
-    workdir: String,
-    container_id: String,
-    rootless: bool,
-    user: Option<String>,
+pub(crate) struct ChildConfig {
+    pub rootfs: String,
+    pub argv: Vec<String>,
+    pub env_vars: Vec<String>,
+    pub workdir: String,
+    pub container_id: String,
+    pub rootless: bool,
+    pub user: Option<String>,
 }
 
 fn setup_user(user_str: &str, rootless: bool) -> Result<()> {
-    if user_str.is_empty() {
-        return Ok(());
-    }
     if rootless {
         eprintln!("warning: USER directive ignored in rootless mode ({user_str})");
         return Ok(());

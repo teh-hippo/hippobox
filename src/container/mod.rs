@@ -141,13 +141,13 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
         })
         .collect();
 
-    if spec.rootless {
-        rootfs::mount_overlay(&layer_dirs, &upper, &work, &merged).with_context(|| {
-            "rootless overlay mount failed; Linux 5.11+ with unprivileged overlayfs support is required"
-        })?;
-    } else {
-        rootfs::mount_overlay(&layer_dirs, &upper, &work, &merged)?;
-    }
+    rootfs::mount_overlay(&layer_dirs, &upper, &work, &merged).with_context(|| {
+        if spec.rootless {
+            "overlay mount failed; Linux 5.11+ with unprivileged overlayfs support is required"
+        } else {
+            "overlay mount failed"
+        }
+    })?;
     cleanup.overlay_mounted = true;
 
     mounts::prepare_host_device_sources(&merged)?;
@@ -162,17 +162,17 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
     );
     eprintln!("  cmd: {:?}", argv);
 
-    process::run_container(
-        &spec.id,
-        &merged,
-        &argv,
-        &env_vars,
-        workdir,
-        stop_signal,
-        spec.rootless,
+    let child_config = process::ChildConfig {
+        rootfs: merged.to_string_lossy().to_string(),
+        argv,
+        env_vars,
+        workdir: workdir.to_string(),
+        container_id: spec.id,
+        rootless: spec.rootless,
         user,
-    )
-    .context("container execution failed")
+    };
+
+    process::run_container(child_config, stop_signal).context("container execution failed")
 }
 
 fn run_rootless_unshare(spec: ContainerSpec) -> Result<i32> {

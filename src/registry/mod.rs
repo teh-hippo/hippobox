@@ -454,14 +454,13 @@ fn collect_all_referenced_layers(base_dir: &Path) -> Result<std::collections::Ha
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "json") {
-                if let Some(stored) = fs::read(&path)
+            } else if path.extension().is_some_and(|e| e == "json")
+                && let Some(stored) = fs::read(&path)
                     .ok()
                     .and_then(|data| serde_json::from_slice::<StoredImage>(&data).ok())
-                {
-                    for layer in &stored.manifest.layers {
-                        referenced.insert(layer.digest.clone());
-                    }
+            {
+                for layer in &stored.manifest.layers {
+                    referenced.insert(layer.digest.clone());
                 }
             }
         }
