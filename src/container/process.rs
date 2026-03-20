@@ -20,7 +20,8 @@ pub fn run_container(config: ChildConfig, stop_signal: &str) -> Result<i32> {
         ForkResult::Parent { child } => {
             drop(read_fd);
 
-            let mut pipe_write = unsafe { std::fs::File::from_raw_fd(write_raw) };
+            let pipe_file = unsafe { std::fs::File::from_raw_fd(write_raw) };
+            let mut pipe_write = std::io::BufWriter::new(pipe_file);
             serde_json::to_writer(&mut pipe_write, &config)?;
             drop(pipe_write);
 
@@ -111,8 +112,8 @@ extern "C" fn note_pending_signal(_: nix::libc::c_int) {
 }
 
 pub fn container_init(config_fd: i32) -> Result<()> {
-    let pipe_read = unsafe { std::fs::File::from_raw_fd(config_fd) };
-    let config: ChildConfig = serde_json::from_reader(pipe_read)?;
+    let pipe_file = unsafe { std::fs::File::from_raw_fd(config_fd) };
+    let config: ChildConfig = serde_json::from_reader(std::io::BufReader::new(pipe_file))?;
 
     // Copy host files into rootfs before pivot (host /etc is still accessible).
     super::mounts::copy_host_files_to_rootfs(Path::new(&config.rootfs))?;

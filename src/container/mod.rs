@@ -211,11 +211,12 @@ fn run_rootless_unshare(spec: ContainerSpec) -> Result<i32> {
         .spawn()
         .context("failed to execute unshare")?;
     {
-        let mut stdin = child
+        let stdin = child
             .stdin
             .take()
             .context("failed to open rootless bootstrap stdin")?;
-        serde_json::to_writer(&mut stdin, &spec)
+        let mut writer = std::io::BufWriter::new(stdin);
+        serde_json::to_writer(&mut writer, &spec)
             .context("failed to send rootless bootstrap spec")?;
     }
 

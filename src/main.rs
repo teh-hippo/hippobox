@@ -68,7 +68,8 @@ fn main() -> Result<()> {
             return Err(std::io::Error::last_os_error())
                 .context("failed to set rootless PDEATHSIG");
         }
-        let spec: container::ContainerSpec = serde_json::from_reader(std::io::stdin())
+        let spec: container::ContainerSpec =
+            serde_json::from_reader(std::io::BufReader::new(std::io::stdin()))
             .context("failed to read rootless bootstrap spec from stdin")?;
         let exit_code = container::run_prepared(spec)?;
         std::process::exit(exit_code);
