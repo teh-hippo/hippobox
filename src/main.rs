@@ -156,7 +156,7 @@ fn main() -> Result<()> {
             // -p implies network isolation unless --network=host is explicit.
             let network_mode = if !port_mappings.is_empty()
                 && network == "host"
-                && !std::env::args().any(|a| a == "--network")
+                && !std::env::args().any(|a| a.starts_with("--network"))
             {
                 container::net::NetworkMode::None
             } else {
