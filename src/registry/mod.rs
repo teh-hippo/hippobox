@@ -27,6 +27,21 @@ impl RegistryClient {
     }
 
     pub fn pull(&mut self, image_ref: &ImageRef, base_dir: &Path) -> Result<StoredImage> {
+        let config_path = image_ref.image_metadata_path(base_dir);
+
+        // Snapshot old layer digests before overwriting (for auto-prune).
+        let old_layer_digests: Vec<String> = fs::read(&config_path)
+            .ok()
+            .and_then(|data| serde_json::from_slice::<StoredImage>(&data).ok())
+            .map(|old| {
+                old.manifest
+                    .layers
+                    .iter()
+                    .map(|l| l.digest.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let manifest = self.fetch_manifest(image_ref)?;
         let config = self.fetch_config(image_ref, &manifest)?;
 
@@ -46,13 +61,40 @@ impl RegistryClient {
         }
 
         let stored = StoredImage { manifest, config };
-        let config_path = image_ref.image_metadata_path(base_dir);
         fs::create_dir_all(
             config_path
                 .parent()
                 .context("invalid image metadata path")?,
         )?;
         fs::write(&config_path, serde_json::to_vec(&stored)?)?;
+
+        // Auto-prune: remove old layers that are no longer referenced by any image.
+        if !old_layer_digests.is_empty() {
+            let new_digests: std::collections::HashSet<&str> =
+                stored.manifest.layers.iter().map(|l| l.digest.as_str()).collect();
+            let orphaned: Vec<&str> = old_layer_digests
+                .iter()
+                .filter(|d| !new_digests.contains(d.as_str()))
+                .map(|d| d.as_str())
+                .collect();
+
+            if !orphaned.is_empty() {
+                let all_referenced = collect_all_referenced_layers(base_dir)?;
+                for digest in orphaned {
+                    if all_referenced.contains(digest) {
+                        continue;
+                    }
+                    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+                    let layer_dir = base_dir.join("layers/sha256").join(hex);
+                    if layer_dir.exists() {
+                        fs::remove_dir_all(&layer_dir).with_context(|| {
+                            format!("failed to prune old layer {}", &hex[..hex.len().min(12)])
+                        })?;
+                        eprintln!("  pruned old layer {}", &hex[..hex.len().min(12)]);
+                    }
+                }
+            }
+        }
 
         Ok(stored)
     }
@@ -392,4 +434,37 @@ impl<R: Read> Read for HashingReader<R> {
         }
         Ok(n)
     }
+}
+
+/// Collect all layer digests referenced by any stored image manifest.
+fn collect_all_referenced_layers(base_dir: &Path) -> Result<std::collections::HashSet<String>> {
+    let images_dir = base_dir.join("images");
+    let mut referenced = std::collections::HashSet::new();
+    if !images_dir.exists() {
+        return Ok(referenced);
+    }
+
+    let mut stack = vec![images_dir];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "json") {
+                if let Some(stored) = fs::read(&path)
+                    .ok()
+                    .and_then(|data| serde_json::from_slice::<StoredImage>(&data).ok())
+                {
+                    for layer in &stored.manifest.layers {
+                        referenced.insert(layer.digest.clone());
+                    }
+                }
+            }
+        }
+    }
+    Ok(referenced)
 }

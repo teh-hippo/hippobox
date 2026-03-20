@@ -180,8 +180,8 @@ fn clean_all(base_dir: &Path) -> Result<()> {
 
     for sub in ["layers", "images", "containers"] {
         let dir = base_dir.join(sub);
-        if dir.exists() {
-            fs::remove_dir_all(&dir)?;
+        if dir.exists() && fs::remove_dir_all(&dir).is_err() {
+            eprintln!("warning: failed to remove {}", dir.display());
         }
     }
     ensure_storage_dirs()?;
