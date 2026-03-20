@@ -36,6 +36,8 @@ pub struct ContainerConfig {
     pub stop_signal: Option<String>,
     #[serde(default)]
     pub user: Option<String>,
+    #[serde(default)]
+    pub volumes: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

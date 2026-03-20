@@ -118,7 +118,11 @@ pub fn container_init(config_fd: i32) -> Result<()> {
     // Copy host files into rootfs before pivot (host /etc is still accessible).
     super::mounts::copy_host_files_to_rootfs(Path::new(&config.rootfs))?;
 
-    super::namespaces::setup_namespaces_and_pivot(Path::new(&config.rootfs), config.rootless)?;
+    super::namespaces::setup_namespaces_and_pivot(
+        Path::new(&config.rootfs),
+        config.rootless,
+        &config.volumes,
+    )?;
     super::mounts::setup_container_mounts(config.rootless)?;
 
     let hostname = &config.container_id[..config.container_id.len().min(12)];
@@ -185,6 +189,7 @@ pub(crate) struct ChildConfig {
     pub container_id: String,
     pub rootless: bool,
     pub user: Option<String>,
+    pub volumes: Vec<super::VolumeMount>,
 }
 
 fn setup_user(user_str: &str, rootless: bool) -> Result<()> {

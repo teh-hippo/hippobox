@@ -40,6 +40,8 @@ enum Commands {
     Run {
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
+        #[arg(short = 'v', long = "volume", value_name = "SRC:DST[:ro|rw]")]
+        volumes: Vec<String>,
         image: String,
         #[arg(trailing_var_arg = true)]
         cmd: Vec<String>,
@@ -95,7 +97,12 @@ fn main() -> Result<()> {
             let _ = client.pull(&image_ref, &hippobox_dir())?;
             eprintln!("pulled {image}");
         }
-        Commands::Run { image, cmd, env } => {
+        Commands::Run {
+            image,
+            cmd,
+            env,
+            volumes,
+        } => {
             let image_ref = ImageRef::parse(&image)?;
             let base_dir = hippobox_dir();
             let rootless = unsafe { nix::libc::geteuid() } != 0;
@@ -111,6 +118,29 @@ fn main() -> Result<()> {
             }
 
             let (manifest, config) = container::load_image(&image_ref, &base_dir)?;
+
+            let mut volume_mounts: Vec<container::VolumeMount> = volumes
+                .iter()
+                .map(|v| container::parse_volume(v))
+                .collect::<Result<_>>()?;
+
+            // Add tmpfs volumes for image VOLUME directives not covered by user -v.
+            if let Some(image_volumes) = config
+                .config
+                .as_ref()
+                .and_then(|c| c.volumes.as_ref())
+            {
+                for vol_path in image_volumes.keys() {
+                    if !volume_mounts.iter().any(|v| v.target == *vol_path) {
+                        volume_mounts.push(container::VolumeMount {
+                            source: "tmpfs".to_string(),
+                            target: vol_path.clone(),
+                            read_only: false,
+                        });
+                    }
+                }
+            }
+
             let id = format!(
                 "{:x}",
                 std::time::SystemTime::now()
@@ -126,6 +156,7 @@ fn main() -> Result<()> {
                 base_dir,
                 user_cmd: cmd,
                 user_env: env,
+                volumes: volume_mounts,
                 rootless,
             };
 

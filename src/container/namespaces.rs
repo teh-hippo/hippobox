@@ -5,9 +5,16 @@ use nix::unistd::{chdir, pivot_root};
 use std::fs;
 use std::path::Path;
 
+use super::VolumeMount;
+
 /// Set up mount/UTS/IPC isolation and pivot into the container root.
-/// PID isolation is not enabled yet; the runtime keeps the host PID namespace for now.
-pub fn setup_namespaces_and_pivot(new_root: &Path, rootless: bool) -> Result<()> {
+/// Volume mounts happen after unshare (inside the new mount namespace)
+/// but before pivot_root (so host paths are still accessible).
+pub fn setup_namespaces_and_pivot(
+    new_root: &Path,
+    rootless: bool,
+    volumes: &[VolumeMount],
+) -> Result<()> {
     unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWIPC)
         .context("failed to unshare namespaces")?;
 
@@ -41,6 +48,10 @@ pub fn setup_namespaces_and_pivot(new_root: &Path, rootless: bool) -> Result<()>
         )
         .context("failed to stage proc for rootless rootfs")?;
     }
+
+    // Mount volumes inside the new mount namespace, before pivot_root.
+    // Host paths are still accessible; read-only remount works here.
+    super::mounts::mount_volumes(new_root, volumes)?;
 
     let old_root = new_root.join("old_root");
     fs::create_dir_all(&old_root)?;

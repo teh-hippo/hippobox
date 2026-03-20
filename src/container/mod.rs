@@ -20,6 +20,14 @@ use crate::image::ref_parser::ImageRef;
 use crate::registry::manifest::{ImageConfig, Manifest, StoredImage};
 
 pub(crate) use process::container_init;
+pub use mounts::parse_volume;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VolumeMount {
+    pub source: String,
+    pub target: String,
+    pub read_only: bool,
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ContainerSpec {
@@ -30,6 +38,7 @@ pub struct ContainerSpec {
     pub base_dir: PathBuf,
     pub user_cmd: Vec<String>,
     pub user_env: Vec<String>,
+    pub volumes: Vec<VolumeMount>,
     pub rootless: bool,
 }
 
@@ -145,6 +154,7 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
         container_id: spec.id,
         rootless: spec.rootless,
         user,
+        volumes: spec.volumes,
     };
 
     process::run_container(child_config, stop_signal).context("container execution failed")
