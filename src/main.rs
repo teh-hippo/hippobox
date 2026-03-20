@@ -15,6 +15,10 @@ fn hippobox_dir() -> PathBuf {
 
 fn ensure_storage_dirs() -> Result<()> {
     let base = hippobox_dir();
+    // Skip syscalls when dirs already exist (common case after first run).
+    if base.join("containers").is_dir() {
+        return Ok(());
+    }
     for sub in ["layers/sha256", "images", "containers"] {
         fs::create_dir_all(base.join(sub))?;
     }

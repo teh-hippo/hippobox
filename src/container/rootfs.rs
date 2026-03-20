@@ -9,15 +9,18 @@ pub fn mount_overlay(
     work: &Path,
     merged: &Path,
 ) -> Result<()> {
-    let lowerdir = lower_dirs
-        .iter()
-        .map(|p| p.to_string_lossy().to_string())
-        .collect::<Vec<_>>()
-        .join(":");
-
-    let options = format!(
-        "lowerdir={},upperdir={},workdir={}",
-        lowerdir,
+    use std::fmt::Write;
+    let mut options = String::with_capacity(256);
+    options.push_str("lowerdir=");
+    for (i, p) in lower_dirs.iter().enumerate() {
+        if i > 0 {
+            options.push(':');
+        }
+        let _ = write!(options, "{}", p.display());
+    }
+    let _ = write!(
+        options,
+        ",upperdir={},workdir={}",
         upper.display(),
         work.display()
     );

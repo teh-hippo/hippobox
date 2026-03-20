@@ -84,8 +84,10 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
     let work = container_dir.join("work");
     let merged = container_dir.join("merged");
 
+    // Single create_dir_all for parent, then cheap mkdir for leaves.
+    std::fs::create_dir_all(&container_dir)?;
     for dir in [&upper, &work, &merged] {
-        std::fs::create_dir_all(dir)?;
+        std::fs::create_dir(dir)?;
     }
 
     let lock_file = acquire_container_lock(&container_dir)?;
@@ -297,9 +299,7 @@ pub fn gc_stale_containers(base_dir: &Path) {
         Err(_) => return,
     };
 
-    let dirs: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-
-    for entry in dirs {
+    for entry in entries.flatten() {
         let path = entry.path();
         if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
             continue;
