@@ -49,30 +49,40 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    let args: Vec<_> = std::env::args().collect();
-    if args.len() >= 3 && args[1] == "--container-init" {
-        let fd: i32 = args[2].parse().expect("invalid fd for container-init");
-        return container::container_init(fd);
-    }
-    if args.len() >= 2 && args[1] == "--rootless-bootstrap" {
-        let prctl_ret = unsafe {
-            nix::libc::prctl(
-                nix::libc::PR_SET_PDEATHSIG,
-                nix::libc::SIGTERM as nix::libc::c_ulong,
-                0,
-                0,
-                0,
-            )
-        };
-        if prctl_ret != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to set rootless PDEATHSIG");
+    // Fast-path: check for internal commands before collecting all args.
+    // These paths are the child re-exec from fork/unshare so every µs counts.
+    let mut args = std::env::args_os();
+    let _ = args.next(); // skip argv[0]
+    if let Some(arg1) = args.next() {
+        if arg1 == "--container-init" {
+            let fd: i32 = args
+                .next()
+                .expect("missing fd for container-init")
+                .to_string_lossy()
+                .parse()
+                .expect("invalid fd for container-init");
+            return container::container_init(fd);
         }
-        let spec: container::ContainerSpec =
-            serde_json::from_reader(std::io::BufReader::new(std::io::stdin()))
-            .context("failed to read rootless bootstrap spec from stdin")?;
-        let exit_code = container::run_prepared(spec)?;
-        std::process::exit(exit_code);
+        if arg1 == "--rootless-bootstrap" {
+            let prctl_ret = unsafe {
+                nix::libc::prctl(
+                    nix::libc::PR_SET_PDEATHSIG,
+                    nix::libc::SIGTERM as nix::libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                )
+            };
+            if prctl_ret != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to set rootless PDEATHSIG");
+            }
+            let spec: container::ContainerSpec =
+                serde_json::from_reader(std::io::BufReader::new(std::io::stdin()))
+                    .context("failed to read rootless bootstrap spec from stdin")?;
+            let exit_code = container::run_prepared(spec)?;
+            std::process::exit(exit_code);
+        }
     }
 
     let cli = Cli::parse();

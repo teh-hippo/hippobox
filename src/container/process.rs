@@ -124,12 +124,17 @@ pub fn container_init(config_fd: i32) -> Result<()> {
     let hostname = &config.container_id[..config.container_id.len().min(12)];
     nix::unistd::sethostname(hostname).context("failed to set hostname")?;
 
-    std::fs::create_dir_all("/etc").context("failed to create /etc")?;
-    std::fs::write(
-        "/etc/hosts",
-        format!("127.0.0.1\tlocalhost\n::1\tlocalhost\n127.0.0.1\t{hostname}\n"),
-    )
-    .context("failed to write /etc/hosts")?;
+    // /etc exists in most images; skip the recursive walk of create_dir_all.
+    if let Err(e) = std::fs::create_dir("/etc")
+        && e.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Err(e).context("failed to create /etc");
+    }
+    // Write hosts file directly to avoid format! allocation.
+    use std::io::Write;
+    let mut f = std::fs::File::create("/etc/hosts").context("failed to create /etc/hosts")?;
+    write!(f, "127.0.0.1\tlocalhost\n::1\tlocalhost\n127.0.0.1\t{hostname}\n")
+        .context("failed to write /etc/hosts")?;
 
     if let Some(ref user_str) = config.user {
         setup_user(user_str, config.rootless)?;
