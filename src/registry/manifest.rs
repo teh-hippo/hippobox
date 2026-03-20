@@ -34,6 +34,8 @@ pub struct ContainerConfig {
     pub working_dir: Option<String>,
     #[serde(default)]
     pub stop_signal: Option<String>,
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

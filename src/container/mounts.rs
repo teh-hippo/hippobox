@@ -35,6 +35,15 @@ pub fn setup_container_mounts(rootless: bool) -> Result<()> {
         Some("newinstance,ptmxmode=0666"),
         "failed to mount /dev/pts",
     )?;
+    // sysfs may fail in some user namespace configurations — non-fatal.
+    let _ = mount_fs(
+        "/sys",
+        "sysfs",
+        "sysfs",
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC | MsFlags::MS_RDONLY,
+        None::<&str>,
+        "failed to mount /sys",
+    );
 
     Ok(())
 }

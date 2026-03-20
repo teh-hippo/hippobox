@@ -14,6 +14,7 @@ pub fn run_container(
     workdir: &str,
     stop_signal: &str,
     rootless: bool,
+    user: Option<String>,
 ) -> Result<i32> {
     if !rootless {
         super::cgroups::check_cgroup_v2()?;
@@ -36,6 +37,7 @@ pub fn run_container(
                 workdir: workdir.to_string(),
                 container_id: container_id.to_string(),
                 rootless,
+                user,
             };
             let mut pipe_write = unsafe { std::fs::File::from_raw_fd(write_raw) };
             serde_json::to_writer(&mut pipe_write, &config)?;
@@ -57,6 +59,26 @@ pub fn run_container(
         }
         ForkResult::Child => {
             nix::unistd::close(write_raw).context("failed to close config pipe write end")?;
+
+            let ppid_before = nix::unistd::getppid();
+            let prctl_ret = unsafe {
+                nix::libc::prctl(
+                    nix::libc::PR_SET_PDEATHSIG,
+                    nix::libc::SIGTERM as nix::libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                )
+            };
+            if prctl_ret != 0 {
+                bail!(
+                    "failed to set PR_SET_PDEATHSIG: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            if nix::unistd::getppid() != ppid_before {
+                std::process::exit(1);
+            }
 
             let exe = std::fs::read_link("/proc/self/exe")
                 .or_else(|_| std::env::current_exe())
@@ -117,6 +139,17 @@ pub fn container_init(config_fd: i32) -> Result<()> {
     let hostname = &config.container_id[..config.container_id.len().min(12)];
     nix::unistd::sethostname(hostname).context("failed to set hostname")?;
 
+    std::fs::create_dir_all("/etc").context("failed to create /etc")?;
+    std::fs::write(
+        "/etc/hosts",
+        format!("127.0.0.1\tlocalhost\n::1\tlocalhost\n127.0.0.1\t{hostname}\n"),
+    )
+    .context("failed to write /etc/hosts")?;
+
+    if let Some(ref user_str) = config.user {
+        setup_user(user_str, config.rootless)?;
+    }
+
     let prctl_ret = unsafe { nix::libc::prctl(nix::libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if prctl_ret != 0 {
         return Err(std::io::Error::last_os_error()).context("failed to set PR_SET_NO_NEW_PRIVS");
@@ -161,4 +194,97 @@ struct ChildConfig {
     workdir: String,
     container_id: String,
     rootless: bool,
+    user: Option<String>,
+}
+
+fn setup_user(user_str: &str, rootless: bool) -> Result<()> {
+    if user_str.is_empty() {
+        return Ok(());
+    }
+    if rootless {
+        eprintln!("warning: USER directive ignored in rootless mode ({user_str})");
+        return Ok(());
+    }
+
+    let (uid, gid) = match user_str.split_once(':') {
+        Some((u, g)) => (resolve_uid(u)?, resolve_gid(g)?),
+        None => {
+            let uid = resolve_uid(user_str)?;
+            // When no group specified, look up the user's primary group from /etc/passwd.
+            let gid = lookup_primary_gid(uid).unwrap_or(uid);
+            (uid, gid)
+        }
+    };
+
+    nix::unistd::setgroups(&[nix::unistd::Gid::from_raw(gid)])
+        .context("failed to set supplementary groups")?;
+    nix::unistd::setgid(nix::unistd::Gid::from_raw(gid))
+        .context("failed to setgid")?;
+    nix::unistd::setuid(nix::unistd::Uid::from_raw(uid))
+        .context("failed to setuid")?;
+
+    // Set HOME if switching to non-root and HOME isn't already set.
+    if let Some(home) = uid.ne(&0).then(|| lookup_home(uid)).flatten() {
+        // Safe: we're single-threaded in the container init process before exec.
+        unsafe { std::env::set_var("HOME", home) };
+    }
+    Ok(())
+}
+
+fn resolve_uid(s: &str) -> Result<u32> {
+    if let Ok(uid) = s.parse::<u32>() {
+        return Ok(uid);
+    }
+    // Look up username in /etc/passwd: name:x:uid:gid:...
+    let content = std::fs::read_to_string("/etc/passwd")
+        .context("failed to read /etc/passwd for user lookup")?;
+    for line in content.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 3 && fields[0] == s {
+            return fields[2]
+                .parse::<u32>()
+                .with_context(|| format!("invalid uid in /etc/passwd for {s}"));
+        }
+    }
+    bail!("user not found in /etc/passwd: {s}")
+}
+
+fn resolve_gid(s: &str) -> Result<u32> {
+    if let Ok(gid) = s.parse::<u32>() {
+        return Ok(gid);
+    }
+    // Look up group name in /etc/group: name:x:gid:...
+    let content = std::fs::read_to_string("/etc/group")
+        .context("failed to read /etc/group for group lookup")?;
+    for line in content.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 3 && fields[0] == s {
+            return fields[2]
+                .parse::<u32>()
+                .with_context(|| format!("invalid gid in /etc/group for {s}"));
+        }
+    }
+    bail!("group not found in /etc/group: {s}")
+}
+
+fn lookup_primary_gid(uid: u32) -> Option<u32> {
+    let content = std::fs::read_to_string("/etc/passwd").ok()?;
+    for line in content.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 4 && fields[2].parse::<u32>().ok() == Some(uid) {
+            return fields[3].parse::<u32>().ok();
+        }
+    }
+    None
+}
+
+fn lookup_home(uid: u32) -> Option<String> {
+    let content = std::fs::read_to_string("/etc/passwd").ok()?;
+    for line in content.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 6 && fields[2].parse::<u32>().ok() == Some(uid) {
+            return Some(fields[5].to_string());
+        }
+    }
+    None
 }

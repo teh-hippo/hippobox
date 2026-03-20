@@ -84,6 +84,9 @@ fn main() -> Result<()> {
             let image_ref = ImageRef::parse(&image)?;
             let base_dir = hippobox_dir();
             let rootless = unsafe { nix::libc::geteuid() } != 0;
+
+            container::gc_stale_containers(&base_dir);
+
             let image_path = image_ref.image_metadata_path(&base_dir);
 
             if !image_path.exists() {
@@ -173,6 +176,8 @@ fn walk_image_repos(images_dir: &Path) -> Result<Vec<(String, PathBuf, String)>>
 }
 
 fn clean_all(base_dir: &Path) -> Result<()> {
+    container::gc_stale_containers(base_dir);
+
     for sub in ["layers", "images", "containers"] {
         let dir = base_dir.join(sub);
         if dir.exists() {
