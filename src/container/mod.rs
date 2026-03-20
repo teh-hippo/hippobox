@@ -54,27 +54,20 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
         .filter(|u| !u.is_empty());
 
     let entrypoint = container_config.and_then(|c| c.entrypoint.as_deref());
-    let cmd = container_config.and_then(|c| c.cmd.as_deref());
-    let argv = if spec.user_cmd.is_empty() {
-        match (entrypoint, cmd) {
-            (Some(ep), Some(cmd)) => ep.iter().cloned().chain(cmd.iter().cloned()).collect(),
-            (Some(ep), None) => ep.to_vec(),
-            (None, Some(cmd)) => cmd.to_vec(),
-            (None, None) => bail!("no CMD or ENTRYPOINT in image config and no command provided"),
-        }
+    let tail: Vec<String> = if spec.user_cmd.is_empty() {
+        container_config
+            .and_then(|c| c.cmd.as_deref())
+            .map(|c| c.to_vec())
+            .unwrap_or_default()
     } else {
-        entrypoint.map_or_else(
-            || spec.user_cmd.clone(),
-            |ep| {
-                ep.iter()
-                    .cloned()
-                    .chain(spec.user_cmd.iter().cloned())
-                    .collect()
-            },
-        )
+        spec.user_cmd.clone()
+    };
+    let argv: Vec<String> = match entrypoint {
+        Some(ep) => ep.iter().cloned().chain(tail).collect(),
+        None => tail,
     };
     if argv.is_empty() {
-        bail!("resolved command is empty");
+        bail!("no CMD or ENTRYPOINT in image config and no command provided");
     }
 
     let env_vars = container_config

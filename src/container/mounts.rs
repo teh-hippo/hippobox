@@ -106,10 +106,16 @@ fn mount_dev() -> Result<()> {
         bind_host_device(name)?;
     }
 
-    ensure_symlink("/proc/self/fd/0", "/dev/stdin")?;
-    ensure_symlink("/proc/self/fd/1", "/dev/stdout")?;
-    ensure_symlink("/proc/self/fd/2", "/dev/stderr")?;
-    ensure_symlink("/proc/self/fd", "/dev/fd")?;
+    for &(target, link_path) in &[
+        ("/proc/self/fd/0", "/dev/stdin"),
+        ("/proc/self/fd/1", "/dev/stdout"),
+        ("/proc/self/fd/2", "/dev/stderr"),
+        ("/proc/self/fd", "/dev/fd"),
+    ] {
+        let _ = fs::remove_file(link_path);
+        symlink(target, link_path)
+            .with_context(|| format!("failed to create symlink {link_path} -> {target}"))?;
+    }
 
     Ok(())
 }
@@ -141,14 +147,6 @@ fn bind_host_device(name: &str) -> Result<()> {
         None::<&str>,
     )
     .with_context(|| format!("failed to bind-mount {source} onto {target}"))?;
-    Ok(())
-}
-
-fn ensure_symlink(target: &str, link_path: &str) -> Result<()> {
-    let link = Path::new(link_path);
-    let _ = fs::remove_file(link);
-    symlink(target, link)
-        .with_context(|| format!("failed to create symlink {link_path} -> {target}"))?;
     Ok(())
 }
 

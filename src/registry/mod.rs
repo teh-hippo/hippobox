@@ -4,7 +4,8 @@ pub mod manifest;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::{self};
+use std::ffi::CString;
+use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -281,18 +282,23 @@ impl RegistryClient {
     }
 }
 
+fn has_unsafe_components(path: &Path) -> bool {
+    path.is_absolute()
+        || path.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+}
+
 fn extract_with_whiteouts(archive: &mut tar::Archive<impl Read>, target: &Path) -> Result<()> {
     archive.set_preserve_permissions(true);
     archive.set_unpack_xattrs(false);
+
+    // Resolve a relative path under target, ensuring no symlink traversal.
     let safe_dir = |relative: &Path| -> Result<PathBuf> {
-        if relative.is_absolute()
-            || relative.components().any(|component| {
-                matches!(
-                    component,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                )
-            })
-        {
+        if has_unsafe_components(relative) {
             bail!("unsafe archive path component in {}", relative.display());
         }
         let mut out = target.to_path_buf();
@@ -306,9 +312,10 @@ fn extract_with_whiteouts(archive: &mut tar::Archive<impl Read>, target: &Path) 
                             out.display()
                         );
                     }
-                    Ok(_) => {}
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                    Err(err) => return Err(err.into()),
+                    Err(err) if err.kind() != io::ErrorKind::NotFound => {
+                        return Err(err.into());
+                    }
+                    _ => {}
                 }
             }
         }
@@ -319,14 +326,7 @@ fn extract_with_whiteouts(archive: &mut tar::Archive<impl Read>, target: &Path) 
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
-        if path.is_absolute()
-            || path.components().any(|component| {
-                matches!(
-                    component,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                )
-            })
-        {
+        if has_unsafe_components(&path) {
             bail!("unsafe archive path component in {}", path.display());
         }
 
@@ -335,23 +335,18 @@ fn extract_with_whiteouts(archive: &mut tar::Archive<impl Read>, target: &Path) 
             .and_then(|name| name.to_str())
             .unwrap_or("");
         if file_name == ".wh..wh..opq" {
-            let parent_rel = path.parent().unwrap_or(Path::new(""));
-            let parent = safe_dir(parent_rel)?;
-            use std::ffi::CString;
-
+            let parent = safe_dir(path.parent().unwrap_or(Path::new("")))?;
             let c_path = CString::new(parent.to_string_lossy().as_bytes())?;
             let c_name = CString::new("trusted.overlay.opaque")?;
-            let value = b"y";
             let ret = unsafe {
                 nix::libc::setxattr(
                     c_path.as_ptr(),
                     c_name.as_ptr(),
-                    value.as_ptr() as *const nix::libc::c_void,
-                    value.len(),
+                    b"y".as_ptr() as *const nix::libc::c_void,
+                    1,
                     0,
                 )
             };
-
             if ret != 0 {
                 return Err(io::Error::last_os_error()).with_context(|| {
                     format!("failed to set opaque xattr on {}", parent.display())
@@ -372,22 +367,19 @@ fn extract_with_whiteouts(archive: &mut tar::Archive<impl Read>, target: &Path) 
             }
             let parent = safe_dir(path.parent().unwrap_or(Path::new("")))?;
             let whiteout_path = parent.join(deleted_name);
-            if whiteout_path.exists() {
-                let metadata = fs::symlink_metadata(&whiteout_path)?;
+            if let Ok(metadata) = fs::symlink_metadata(&whiteout_path) {
                 if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
                     fs::remove_dir_all(&whiteout_path)?;
                 } else {
                     fs::remove_file(&whiteout_path)?;
                 }
             }
-            use nix::sys::stat;
 
-            let dev = stat::makedev(0, 0);
-            stat::mknod(
+            nix::sys::stat::mknod(
                 &whiteout_path,
-                stat::SFlag::S_IFCHR,
-                stat::Mode::S_IRUSR | stat::Mode::S_IWUSR,
-                dev,
+                nix::sys::stat::SFlag::S_IFCHR,
+                nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+                nix::sys::stat::makedev(0, 0),
             )
             .with_context(|| format!("failed to create whiteout at {}", whiteout_path.display()))?;
             continue;
