@@ -11,7 +11,6 @@ pub fn run_container(config: ChildConfig, stop_signal: &str) -> Result<i32> {
         super::cgroups::check_cgroup_v2()?;
         super::cgroups::create(&config.container_id)?;
     }
-    super::mounts::copy_host_files_to_rootfs(Path::new(&config.rootfs))?;
 
     let (read_fd, write_fd) = nix::unistd::pipe().context("failed to create pipe")?;
     let read_raw = read_fd.as_raw_fd();
@@ -114,6 +113,9 @@ extern "C" fn note_pending_signal(_: nix::libc::c_int) {
 pub fn container_init(config_fd: i32) -> Result<()> {
     let pipe_read = unsafe { std::fs::File::from_raw_fd(config_fd) };
     let config: ChildConfig = serde_json::from_reader(pipe_read)?;
+
+    // Copy host files into rootfs before pivot (host /etc is still accessible).
+    super::mounts::copy_host_files_to_rootfs(Path::new(&config.rootfs))?;
 
     super::namespaces::setup_namespaces_and_pivot(Path::new(&config.rootfs), config.rootless)?;
     super::mounts::setup_container_mounts(config.rootless)?;
