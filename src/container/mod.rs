@@ -77,27 +77,7 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
         .unwrap_or_else(|| {
             vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()]
         });
-    let env_vars = spec
-        .user_env
-        .iter()
-        .try_fold(env_vars, |mut env_vars, override_var| {
-            let Some((key, _)) = override_var.split_once('=') else {
-                bail!("invalid environment override {override_var:?}, expected KEY=VALUE");
-            };
-            if key.is_empty() {
-                bail!("invalid environment override {override_var:?}, empty key");
-            }
-            if let Some(existing) = env_vars.iter_mut().find(|value| {
-                value
-                    .split_once('=')
-                    .is_some_and(|(existing, _)| existing == key)
-            }) {
-                *existing = override_var.clone();
-            } else {
-                env_vars.push(override_var.clone());
-            }
-            Ok(env_vars)
-        })?;
+    let env_vars = apply_env_overrides(env_vars, &spec.user_env)?;
 
     let container_dir = spec.base_dir.join("containers").join(&spec.id);
     let upper = container_dir.join("upper");
@@ -166,6 +146,26 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
     };
 
     process::run_container(child_config, stop_signal).context("container execution failed")
+}
+
+fn apply_env_overrides(mut env_vars: Vec<String>, overrides: &[String]) -> Result<Vec<String>> {
+    for override_var in overrides {
+        let Some((key, _)) = override_var.split_once('=') else {
+            bail!("invalid environment override {override_var:?}, expected KEY=VALUE");
+        };
+        if key.is_empty() {
+            bail!("invalid environment override {override_var:?}, empty key");
+        }
+        if let Some(existing) = env_vars.iter_mut().find(|v| {
+            v.split_once('=')
+                .is_some_and(|(k, _)| k == key)
+        }) {
+            *existing = override_var.clone();
+        } else {
+            env_vars.push(override_var.clone());
+        }
+    }
+    Ok(env_vars)
 }
 
 fn run_rootless_unshare(spec: ContainerSpec) -> Result<i32> {
@@ -461,5 +461,31 @@ mod tests {
 
         // Second run should be a no-op.
         gc_stale_containers(tmp.path());
+    }
+
+    #[test]
+    fn env_override_replaces_existing() {
+        let base = vec!["PATH=/usr/bin".into(), "HOME=/root".into()];
+        let result = apply_env_overrides(base, &["HOME=/home/user".into()]).unwrap();
+        assert_eq!(result, vec!["PATH=/usr/bin", "HOME=/home/user"]);
+    }
+
+    #[test]
+    fn env_override_appends_new() {
+        let base = vec!["PATH=/usr/bin".into()];
+        let result = apply_env_overrides(base, &["FOO=bar".into()]).unwrap();
+        assert_eq!(result, vec!["PATH=/usr/bin", "FOO=bar"]);
+    }
+
+    #[test]
+    fn env_override_rejects_missing_equals() {
+        let base = vec![];
+        assert!(apply_env_overrides(base, &["NOEQUALS".into()]).is_err());
+    }
+
+    #[test]
+    fn env_override_rejects_empty_key() {
+        let base = vec![];
+        assert!(apply_env_overrides(base, &["=value".into()]).is_err());
     }
 }
