@@ -27,6 +27,9 @@ const BLOCKED_SYSCALLS: &[&str] = &[
     "get_mempolicy",
     "init_module",
     "io_setup",
+    "io_uring_enter",
+    "io_uring_register",
+    "io_uring_setup",
     "ioperm",
     "iopl",
     "kcmp",
@@ -43,6 +46,7 @@ const BLOCKED_SYSCALLS: &[&str] = &[
     "open_by_handle_at",
     "open_tree",
     "perf_event_open",
+    "personality",
     "pidfd_open",
     "pivot_root",
     "process_vm_readv",
@@ -110,6 +114,9 @@ fn syscall_number(name: &str) -> Option<i64> {
         "get_mempolicy" => 239,
         "init_module" => 175,
         "io_setup" => 206,
+        "io_uring_enter" => 426,
+        "io_uring_register" => 427,
+        "io_uring_setup" => 425,
         "ioperm" => 173,
         "iopl" => 172,
         "kcmp" => 312,
@@ -126,6 +133,7 @@ fn syscall_number(name: &str) -> Option<i64> {
         "open_by_handle_at" => 304,
         "open_tree" => 428,
         "perf_event_open" => 298,
+        "personality" => 135,
         "pidfd_open" => 434,
         "pivot_root" => 155,
         "process_vm_readv" => 310,
@@ -149,4 +157,47 @@ fn syscall_number(name: &str) -> Option<i64> {
         "ustat" => 136,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_blocked_syscalls_have_numbers() {
+        for name in BLOCKED_SYSCALLS {
+            assert!(
+                syscall_number(name).is_some(),
+                "BLOCKED_SYSCALLS entry {name:?} has no syscall number mapping"
+            );
+        }
+    }
+
+    #[test]
+    fn no_duplicate_syscall_numbers() {
+        let mut seen = std::collections::HashSet::new();
+        for name in BLOCKED_SYSCALLS {
+            if let Some(nr) = syscall_number(name) {
+                assert!(
+                    seen.insert(nr),
+                    "duplicate syscall number {nr} for {name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_syscall_returns_none() {
+        assert_eq!(syscall_number("not_a_real_syscall"), None);
+        assert_eq!(syscall_number(""), None);
+    }
+
+    #[test]
+    fn spot_check_syscall_numbers() {
+        assert_eq!(syscall_number("mount"), Some(165));
+        assert_eq!(syscall_number("ptrace"), Some(101));
+        assert_eq!(syscall_number("reboot"), Some(169));
+        assert_eq!(syscall_number("bpf"), Some(321));
+        assert_eq!(syscall_number("unshare"), Some(272));
+    }
 }

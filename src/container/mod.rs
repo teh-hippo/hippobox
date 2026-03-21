@@ -1,28 +1,22 @@
 mod cgroups;
+mod cleanup;
+mod init;
 mod mounts;
 mod namespaces;
 pub(crate) mod net;
 mod process;
 mod rootfs;
+mod rootless;
 mod seccomp;
 
 use anyhow::{Context, Result, bail};
-use nix::fcntl::{Flock, FlockArg};
-use nix::sys::signal::{self, Signal};
-use nix::sys::wait::WaitStatus;
-use nix::unistd::Pid;
-use std::fs::File;
-use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::image::ref_parser::ImageRef;
-use crate::registry::manifest::{ImageConfig, Manifest, StoredImage};
+use crate::image::manifest::{ImageConfig, Manifest, StoredImage};
 
-pub(crate) use process::container_init;
+pub(crate) use init::container_init;
+pub use cleanup::gc_stale_containers;
 pub use mounts::parse_volume;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -51,7 +45,7 @@ pub struct ContainerSpec {
 
 pub fn run(spec: ContainerSpec) -> Result<i32> {
     if spec.rootless {
-        return run_rootless_unshare(spec);
+        return rootless::run_rootless_unshare(spec);
     }
 
     run_prepared(spec)
@@ -112,9 +106,9 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
         std::fs::create_dir(dir)?;
     }
 
-    let lock_file = acquire_container_lock(&container_dir)?;
+    let lock_file = cleanup::acquire_container_lock(&container_dir)?;
 
-    let mut cleanup = CleanupGuard {
+    let mut cleanup_guard = cleanup::CleanupGuard {
         id: spec.id.clone(),
         container_dir,
         merged: merged.clone(),
@@ -129,14 +123,7 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
         .layers
         .iter()
         .rev()
-        .map(|layer| {
-            spec.base_dir.join("layers/sha256").join(
-                layer
-                    .digest
-                    .strip_prefix("sha256:")
-                    .unwrap_or(&layer.digest),
-            )
-        })
+        .map(|layer| layer.layer_dir(&spec.base_dir))
         .collect();
 
     // Validate all layer dirs exist before mounting overlay.
@@ -154,7 +141,7 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
         let marker = dir.join(".in-use");
         let _ = std::fs::write(&marker, spec.id.as_bytes());
     }
-    cleanup.layer_dirs = layer_dirs.clone();
+    cleanup_guard.layer_dirs = layer_dirs.clone();
 
     rootfs::mount_overlay(&layer_dirs, &upper, &work, &merged, spec.rootless).with_context(|| {
         if spec.rootless {
@@ -163,7 +150,7 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
             "overlay mount failed"
         }
     })?;
-    cleanup.overlay_mounted = true;
+    cleanup_guard.overlay_mounted = true;
 
     // For rootless containers, install the rename shim to work around EXDEV on
     // unprivileged overlayfs (redirect_dir=nofollow blocks directory renames).
@@ -208,11 +195,15 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
     process::run_container(child_config, stop_signal).context("container execution failed")
 }
 
+pub(crate) fn resolve_self_exe() -> Result<PathBuf> {
+    std::fs::read_link("/proc/self/exe")
+        .or_else(|_| std::env::current_exe())
+        .context("failed to locate current executable")
+}
+
 /// Locate the rename shim .so next to the hippobox binary.
 fn find_rename_shim() -> Option<PathBuf> {
-    let exe = std::fs::read_link("/proc/self/exe")
-        .or_else(|_| std::env::current_exe())
-        .ok()?;
+    let exe = resolve_self_exe().ok()?;
     let dir = exe.parent()?;
     let shim = dir.join("librename_shim.so");
     shim.exists().then_some(shim)
@@ -238,127 +229,6 @@ fn apply_env_overrides(mut env_vars: Vec<String>, overrides: &[String]) -> Resul
     Ok(env_vars)
 }
 
-fn run_rootless_unshare(spec: ContainerSpec) -> Result<i32> {
-    let exe = std::fs::read_link("/proc/self/exe")
-        .or_else(|_| std::env::current_exe())
-        .context("failed to locate current executable")?;
-
-    let has_ports = !spec.port_mappings.is_empty();
-    let isolate_network = spec.network_mode == net::NetworkMode::None || has_ports;
-
-    if has_ports {
-        net::check_pasta()?;
-    }
-
-    // Pass the spec over a dedicated pipe so stdin stays connected to the
-    // terminal/caller for the container process (needed by MCP stdio, etc).
-    let (spec_read, spec_write) = nix::unistd::pipe().context("failed to create spec pipe")?;
-    let spec_read_raw = spec_read.into_raw_fd();
-    let spec_write_raw = spec_write.as_raw_fd();
-    let spec_read_str = spec_read_raw.to_string();
-
-    let pre_exec_fn = move || unsafe {
-        if nix::libc::setpgid(0, 0) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let ret = nix::libc::prctl(
-            nix::libc::PR_SET_PDEATHSIG,
-            nix::libc::SIGTERM as nix::libc::c_ulong,
-            0,
-            0,
-            0,
-        );
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // Ensure the spec pipe read fd survives across exec.
-        nix::libc::fcntl(spec_read_raw, nix::libc::F_SETFD, 0);
-        // Close write end so the child doesn't keep it open (would prevent EOF).
-        nix::libc::close(spec_write_raw);
-        Ok(())
-    };
-
-    let child = if has_ports {
-        // pasta wraps the process: creates user+net namespace from the HOST,
-        // binds host ports for forwarding, then runs unshare inside for
-        // mount/uts/ipc isolation. pasta's user namespace has single-UID
-        // mapping (0→real_uid) which is sufficient for most containers.
-        let pasta_path = net::check_pasta()?;
-        let mut cmd = Command::new(pasta_path);
-        unsafe { cmd.pre_exec(pre_exec_fn); }
-        cmd.args(["--config-net", "--quiet", "--foreground", "--no-map-gw"]);
-        net::add_port_args(&mut cmd, &spec.port_mappings);
-        cmd.args(["-u", "none", "-T", "none", "-U", "none"]);
-        cmd.args(["--", "unshare", "--mount", "--uts", "--ipc", "--"]);
-        cmd.arg(&exe).arg("--rootless-bootstrap").arg(&spec_read_str);
-        cmd.spawn()
-            .context("failed to execute pasta")?
-    } else {
-        // Standard rootless: unshare handles all namespaces with full
-        // subordinate UID mapping (--map-auto).
-        let mut unshare_args: Vec<&str> = vec![
-            "--user", "--map-root-user", "--map-auto",
-            "--mount", "--uts", "--ipc",
-        ];
-        if isolate_network {
-            unshare_args.push("--net");
-        }
-        unshare_args.push("--");
-        let mut cmd = Command::new("unshare");
-        unsafe { cmd.pre_exec(pre_exec_fn); }
-        cmd.args(&unshare_args).arg(&exe).arg("--rootless-bootstrap").arg(&spec_read_str);
-        cmd.spawn()
-            .context("failed to execute unshare")?
-    };
-
-    // Close read end in parent, write spec to the pipe, then close write end.
-    unsafe { nix::libc::close(spec_read_raw); }
-    {
-        let pipe_file = unsafe { std::fs::File::from_raw_fd(spec_write.into_raw_fd()) };
-        let mut writer = std::io::BufWriter::new(pipe_file);
-        serde_json::to_writer(&mut writer, &spec)
-            .context("failed to send rootless bootstrap spec")?;
-    }
-
-    unsafe {
-        signal::signal(
-            Signal::SIGINT,
-            signal::SigHandler::Handler(note_rootless_signal),
-        )
-        .context("failed to install rootless SIGINT handler")?;
-        signal::signal(
-            Signal::SIGTERM,
-            signal::SigHandler::Handler(note_rootless_signal),
-        )
-        .context("failed to install rootless SIGTERM handler")?;
-    }
-
-    // Use blocking waitpid instead of polling try_wait+sleep.
-    // waitpid returns EINTR when our signal handler fires, letting us
-    // forward signals immediately without a 50ms poll delay.
-    let child_pid = Pid::from_raw(child.id() as i32);
-    std::mem::forget(child);
-    loop {
-        match nix::sys::wait::waitpid(child_pid, None) {
-            Ok(WaitStatus::Exited(_, code)) => return Ok(code),
-            Ok(WaitStatus::Signaled(_, sig, _)) => return Ok(128 + sig as i32),
-            Err(nix::errno::Errno::EINTR) => {
-                if ROOTLESS_PENDING_SIGNAL.swap(0, Ordering::SeqCst) != 0 {
-                    let _ = unsafe { nix::libc::kill(-child_pid.as_raw(), nix::libc::SIGTERM) };
-                }
-            }
-            Err(err) => return Err(err).context("failed to wait for unshare"),
-            _ => continue,
-        }
-    }
-}
-
-static ROOTLESS_PENDING_SIGNAL: AtomicU8 = AtomicU8::new(0);
-
-extern "C" fn note_rootless_signal(_: nix::libc::c_int) {
-    ROOTLESS_PENDING_SIGNAL.store(1, Ordering::SeqCst);
-}
-
 pub fn load_image(image_ref: &ImageRef, base_dir: &Path) -> Result<(Manifest, ImageConfig)> {
     let config_path = image_ref.image_metadata_path(base_dir);
     let data = std::fs::read(&config_path).with_context(|| {
@@ -376,205 +246,10 @@ pub fn load_image(image_ref: &ImageRef, base_dir: &Path) -> Result<(Manifest, Im
     Ok((stored.manifest, stored.config))
 }
 
-fn acquire_container_lock(container_dir: &Path) -> Result<Flock<File>> {
-    let lock_path = container_dir.join("hippobox.lock");
-    let lock_file = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("failed to open lock at {}", lock_path.display()))?;
-    Flock::lock(lock_file, FlockArg::LockExclusive)
-        .map_err(|(_, e)| e)
-        .with_context(|| format!("failed to flock {}", lock_path.display()))
-}
-
-/// Clean up stale containers from previous runs that didn't get a chance to clean
-/// up (e.g. the hippobox process was killed). Best-effort: logs warnings and
-/// continues on individual failures.
-pub fn gc_stale_containers(base_dir: &Path) {
-    let containers_dir = base_dir.join("containers");
-    let entries = match std::fs::read_dir(&containers_dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
-            continue;
-        }
-
-        if let Err(e) = gc_try_clean_container(&path) {
-            eprintln!(
-                "warning: gc failed for {}: {e}",
-                path.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-            );
-        }
-    }
-}
-
-fn gc_try_clean_container(container_dir: &Path) -> Result<()> {
-    let lock_path = container_dir.join("hippobox.lock");
-
-    // No lock file means a legacy or partially-created container. Try to clean it.
-    if lock_path.exists() {
-        let lock_file = File::open(&lock_path)?;
-        match Flock::lock(lock_file, FlockArg::LockExclusiveNonblock) {
-            Ok(_flock) => {
-                // Lock acquired — the owner process is dead. Proceed with cleanup.
-            }
-            Err((_, nix::errno::Errno::EAGAIN)) => {
-                // Lock held by another process — container is active.
-                return Ok(());
-            }
-            Err((_, e)) => return Err(e).context("failed to probe container lock"),
-        }
-    }
-
-    let merged = container_dir.join("merged");
-    if merged.exists() {
-        // Unmount device bind mounts first (children before parent).
-        let _ = mounts::cleanup_host_device_sources(&merged);
-
-        // Try non-detach overlay unmount. If EBUSY, an orphaned container process
-        // is still rooted there — don't remove the directory.
-        match nix::mount::umount2(&merged, nix::mount::MntFlags::empty()) {
-            Ok(_) => {}
-            Err(
-                nix::errno::Errno::EINVAL
-                | nix::errno::Errno::ENOENT
-                | nix::errno::Errno::EPERM,
-            ) => {
-                // EINVAL: not mounted. ENOENT: path gone. EPERM: not privileged
-                // (rootless container mounts live in a user namespace and aren't
-                // visible here). All fine — just remove the dir.
-            }
-            Err(nix::errno::Errno::EBUSY) => {
-                eprintln!(
-                    "warning: overlay still busy for {}, skipping",
-                    container_dir
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                );
-                return Ok(());
-            }
-            Err(e) => {
-                return Err(e).context("failed to unmount stale overlay");
-            }
-        }
-    }
-
-    let _ = std::fs::remove_dir_all(container_dir);
-    Ok(())
-}
-
-struct CleanupGuard {
-    id: String,
-    container_dir: PathBuf,
-    merged: PathBuf,
-    layer_dirs: Vec<PathBuf>,
-    overlay_mounted: bool,
-    rootless: bool,
-    _lock: Flock<File>,
-}
-
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        if !self.rootless {
-            let _ = cgroups::cleanup(&self.id);
-        }
-        if self.overlay_mounted {
-            let _ = mounts::cleanup_host_device_sources(&self.merged);
-            let _ = rootfs::unmount_overlay(&self.merged);
-        }
-        // Remove in-use markers so GC can prune these layers if orphaned.
-        for dir in &self.layer_dirs {
-            let _ = std::fs::remove_file(dir.join(".in-use"));
-        }
-        let _ = std::fs::remove_dir_all(&self.container_dir);
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
-
-    fn make_container_dir(base: &Path, name: &str) -> PathBuf {
-        let dir = base.join("containers").join(name);
-        std::fs::create_dir_all(dir.join("merged")).unwrap();
-        std::fs::create_dir_all(dir.join("upper")).unwrap();
-        std::fs::create_dir_all(dir.join("work")).unwrap();
-        dir
-    }
-
-    #[test]
-    fn gc_removes_dir_with_no_lock_file() {
-        let tmp = TempDir::new().unwrap();
-        let container = make_container_dir(tmp.path(), "stale-no-lock");
-
-        gc_stale_containers(tmp.path());
-        assert!(!container.exists(), "stale container without lock should be removed");
-    }
-
-    #[test]
-    fn gc_skips_container_with_held_lock() {
-        let tmp = TempDir::new().unwrap();
-        let container = make_container_dir(tmp.path(), "active");
-        let _lock = acquire_container_lock(&container).unwrap();
-
-        gc_stale_containers(tmp.path());
-        assert!(container.exists(), "active container should be kept");
-    }
-
-    #[test]
-    fn gc_removes_container_with_released_lock() {
-        let tmp = TempDir::new().unwrap();
-        let container = make_container_dir(tmp.path(), "dead-owner");
-
-        // Acquire and immediately release the lock.
-        {
-            let _lock = acquire_container_lock(&container).unwrap();
-        }
-
-        gc_stale_containers(tmp.path());
-        assert!(!container.exists(), "container with released lock should be removed");
-    }
-
-    #[test]
-    fn gc_handles_empty_containers_dir() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join("containers")).unwrap();
-
-        gc_stale_containers(tmp.path());
-        // Should not panic or error.
-    }
-
-    #[test]
-    fn gc_handles_missing_containers_dir() {
-        let tmp = TempDir::new().unwrap();
-        // No containers/ dir at all.
-
-        gc_stale_containers(tmp.path());
-        // Should not panic or error.
-    }
-
-    #[test]
-    fn gc_is_idempotent() {
-        let tmp = TempDir::new().unwrap();
-        let container = make_container_dir(tmp.path(), "once-stale");
-
-        gc_stale_containers(tmp.path());
-        assert!(!container.exists());
-
-        // Second run should be a no-op.
-        gc_stale_containers(tmp.path());
-    }
 
     #[test]
     fn env_override_replaces_existing() {
@@ -600,5 +275,12 @@ mod tests {
     fn env_override_rejects_empty_key() {
         let base = vec![];
         assert!(apply_env_overrides(base, &["=value".into()]).is_err());
+    }
+
+    #[test]
+    fn env_override_value_with_equals() {
+        let base = vec!["PATH=/usr/bin".into()];
+        let result = apply_env_overrides(base, &["FOO=a=b=c".into()]).unwrap();
+        assert_eq!(result, vec!["PATH=/usr/bin", "FOO=a=b=c"]);
     }
 }

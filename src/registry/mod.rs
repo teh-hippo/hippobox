@@ -1,18 +1,17 @@
 pub mod auth;
-pub mod manifest;
+mod extract;
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::fs;
-use std::io::{self, Read};
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Component, Path, PathBuf};
+use std::io::Read;
+use std::path::Path;
 
+use crate::image::manifest::{Descriptor, ImageConfig, Manifest, StoredImage};
 use crate::image::ref_parser::ImageRef;
 use auth::get_anonymous_token;
-use manifest::{Descriptor, ImageConfig, Manifest, StoredImage};
+use extract::{HashingReader, create_extract_temp_dir, extract_with_whiteouts};
 
 pub struct RegistryClient {
     agent: ureq::Agent,
@@ -47,11 +46,8 @@ impl RegistryClient {
         let config = self.fetch_config(image_ref, &manifest)?;
 
         for layer in &manifest.layers {
-            let digest_hex = layer
-                .digest
-                .strip_prefix("sha256:")
-                .unwrap_or(&layer.digest);
-            let layer_dir = base_dir.join("layers/sha256").join(digest_hex);
+            let digest_hex = layer.hex();
+            let layer_dir = layer.layer_dir(base_dir);
             if layer_dir.exists() {
                 eprintln!("  layer {} already exists, skipping", &digest_hex[..12]);
                 continue;
@@ -119,7 +115,8 @@ impl RegistryClient {
         let response: serde_json::Value = serde_json::from_reader(
             self.authenticated_get(image_ref, &url, &accept)?
                 .into_body()
-                .into_reader(),
+                .into_reader()
+                .take(10 * 1024 * 1024),
         )
         .context("failed to parse manifest response")?;
 
@@ -150,7 +147,8 @@ impl RegistryClient {
             return serde_json::from_reader(
                 self.authenticated_get(image_ref, &url, &accept)?
                     .into_body()
-                    .into_reader(),
+                    .into_reader()
+                    .take(10 * 1024 * 1024),
             )
             .context("failed to parse platform manifest");
         }
@@ -166,7 +164,8 @@ impl RegistryClient {
         serde_json::from_reader(
             self.authenticated_get(image_ref, &url, "application/json")?
                 .into_body()
-                .into_reader(),
+                .into_reader()
+                .take(10 * 1024 * 1024),
         )
         .context("failed to parse image config")
     }
@@ -281,152 +280,6 @@ impl RegistryClient {
     }
 }
 
-fn has_unsafe_components(path: &Path) -> bool {
-    path.is_absolute()
-        || path.components().any(|c| {
-            matches!(
-                c,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-}
-
-fn extract_with_whiteouts(archive: &mut tar::Archive<impl Read>, target: &Path) -> Result<()> {
-    archive.set_preserve_permissions(true);
-    archive.set_unpack_xattrs(false);
-
-    // Resolve a relative path under target, ensuring no symlink traversal.
-    let safe_dir = |relative: &Path| -> Result<PathBuf> {
-        if has_unsafe_components(relative) {
-            bail!("unsafe archive path component in {}", relative.display());
-        }
-        let mut out = target.to_path_buf();
-        for component in relative.components() {
-            if let Component::Normal(part) = component {
-                out.push(part);
-                match fs::symlink_metadata(&out) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        bail!(
-                            "refusing to traverse symlink while extracting: {}",
-                            out.display()
-                        );
-                    }
-                    Err(err) if err.kind() != io::ErrorKind::NotFound => {
-                        return Err(err.into());
-                    }
-                    _ => {}
-                }
-            }
-        }
-        fs::create_dir_all(&out)?;
-        Ok(out)
-    };
-
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.into_owned();
-        if has_unsafe_components(&path) {
-            bail!("unsafe archive path component in {}", path.display());
-        }
-
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        if file_name == ".wh..wh..opq" {
-            let parent = safe_dir(path.parent().unwrap_or(Path::new("")))?;
-            let c_path = CString::new(parent.to_string_lossy().as_bytes())?;
-            let c_name = CString::new("trusted.overlay.opaque")?;
-            let ret = unsafe {
-                nix::libc::setxattr(
-                    c_path.as_ptr(),
-                    c_name.as_ptr(),
-                    b"y".as_ptr() as *const nix::libc::c_void,
-                    1,
-                    0,
-                )
-            };
-            if ret != 0 {
-                return Err(io::Error::last_os_error()).with_context(|| {
-                    format!("failed to set opaque xattr on {}", parent.display())
-                });
-            }
-            continue;
-        }
-
-        if let Some(deleted_name) = file_name.strip_prefix(".wh.") {
-            if deleted_name.is_empty()
-                || Path::new(deleted_name).components().count() != 1
-                || deleted_name == "."
-                || deleted_name == ".."
-                || deleted_name.contains('/')
-                || deleted_name.contains('\\')
-            {
-                bail!("unsafe whiteout name: {deleted_name}");
-            }
-            let parent = safe_dir(path.parent().unwrap_or(Path::new("")))?;
-            let whiteout_path = parent.join(deleted_name);
-            if let Ok(metadata) = fs::symlink_metadata(&whiteout_path) {
-                if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-                    fs::remove_dir_all(&whiteout_path)?;
-                } else {
-                    fs::remove_file(&whiteout_path)?;
-                }
-            }
-
-            nix::sys::stat::mknod(
-                &whiteout_path,
-                nix::sys::stat::SFlag::S_IFCHR,
-                nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
-                nix::sys::stat::makedev(0, 0),
-            )
-            .with_context(|| format!("failed to create whiteout at {}", whiteout_path.display()))?;
-            continue;
-        }
-
-        if !entry.unpack_in(target)? {
-            bail!("archive entry escapes target directory: {}", path.display());
-        }
-    }
-    Ok(())
-}
-
-fn create_extract_temp_dir(target_dir: &Path) -> Result<PathBuf> {
-    let pid = std::process::id();
-
-    for nonce in 0..64 {
-        let tmp_dir = target_dir.with_extension(format!("tmp-{pid}-{nonce}"));
-        match fs::create_dir(&tmp_dir) {
-            Ok(()) => {
-                fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o700))?;
-                return Ok(tmp_dir);
-            }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err.into()),
-        }
-    }
-
-    bail!(
-        "failed to create a unique extraction temp dir for {}",
-        target_dir.display()
-    );
-}
-
-struct HashingReader<R: Read> {
-    inner: R,
-    hasher: Sha256,
-}
-
-impl<R: Read> Read for HashingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        if n > 0 {
-            self.hasher.update(&buf[..n]);
-        }
-        Ok(n)
-    }
-}
-
 /// Collect all layer digests referenced by any stored image manifest.
 fn collect_all_referenced_layers(base_dir: &Path) -> Result<std::collections::HashSet<String>> {
     let mut referenced = std::collections::HashSet::new();
@@ -442,3 +295,5 @@ fn collect_all_referenced_layers(base_dir: &Path) -> Result<std::collections::Ha
     }
     Ok(referenced)
 }
+
+

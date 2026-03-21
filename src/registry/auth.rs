@@ -2,6 +2,7 @@ use crate::image::ref_parser::ImageRef;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::io::Read;
 
 pub fn get_anonymous_token(
     cache: &mut HashMap<String, String>,
@@ -82,9 +83,12 @@ fn fetch_anonymous_token(agent: &ureq::Agent, image_ref: &ImageRef) -> Result<St
         bail!("token endpoint returned {}", token_resp.status());
     }
 
-    let body = token_resp
+    let mut body = String::new();
+    token_resp
         .into_body()
-        .read_to_string()
+        .into_reader()
+        .take(1024 * 1024)
+        .read_to_string(&mut body)
         .context("failed to read token response")?;
 
     let token_data: TokenResponse =

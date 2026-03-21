@@ -228,7 +228,7 @@ fn mount_dev() -> Result<()> {
     Ok(())
 }
 
-fn mount_fs(
+pub(crate) fn mount_fs(
     target: &str,
     source: &str,
     fstype: &str,

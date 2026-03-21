@@ -15,6 +15,16 @@ pub struct Descriptor {
     pub size: u64,
 }
 
+impl Descriptor {
+    pub fn hex(&self) -> &str {
+        self.digest.strip_prefix("sha256:").unwrap_or(&self.digest)
+    }
+
+    pub fn layer_dir(&self, base_dir: &std::path::Path) -> std::path::PathBuf {
+        base_dir.join("layers/sha256").join(self.hex())
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ImageConfig {
     pub config: Option<ContainerConfig>,

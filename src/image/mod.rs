@@ -1,3 +1,4 @@
+pub mod manifest;
 pub mod ref_parser;
 
 use anyhow::Result;

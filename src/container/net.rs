@@ -188,4 +188,16 @@ mod tests {
         assert!(parse_network_mode("bridge").is_err());
         assert!(parse_network_mode("").is_err());
     }
+
+    #[test]
+    fn parse_port_max_valid() {
+        let pm = parse_port("65535:65535").unwrap();
+        assert_eq!(pm.host_port, 65535);
+        assert_eq!(pm.container_port, 65535);
+    }
+
+    #[test]
+    fn parse_port_overflow() {
+        assert!(parse_port("65536:80").is_err());
+    }
 }

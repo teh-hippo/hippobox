@@ -16,10 +16,6 @@ fn hippobox_dir() -> PathBuf {
 
 fn ensure_storage_dirs() -> Result<()> {
     let base = hippobox_dir();
-    // Skip syscalls when dirs already exist (common case after first run).
-    if base.join("containers").is_dir() {
-        return Ok(());
-    }
     for sub in ["layers/sha256", "images", "containers"] {
         fs::create_dir_all(base.join(sub))?;
     }
@@ -27,7 +23,7 @@ fn ensure_storage_dirs() -> Result<()> {
 }
 
 #[derive(Parser)]
-#[command(name = "hippobox", about = "Lightweight Linux container manager")]
+#[command(name = "hippobox", about = "Lightweight Linux container manager", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -120,7 +116,7 @@ fn main() -> Result<()> {
         } => {
             let image_ref = ImageRef::parse(&image)?;
             let base_dir = hippobox_dir();
-            let rootless = unsafe { nix::libc::geteuid() } != 0;
+            let rootless = !nix::unistd::geteuid().is_root();
 
             container::gc_stale_containers(&base_dir);
 
