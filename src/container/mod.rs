@@ -13,9 +13,10 @@ use nix::sys::wait::WaitStatus;
 use nix::unistd::Pid;
 use std::fs::File;
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::image::ref_parser::ImageRef;
@@ -249,7 +250,14 @@ fn run_rootless_unshare(spec: ContainerSpec) -> Result<i32> {
         net::check_pasta()?;
     }
 
-    let pre_exec_fn = || unsafe {
+    // Pass the spec over a dedicated pipe so stdin stays connected to the
+    // terminal/caller for the container process (needed by MCP stdio, etc).
+    let (spec_read, spec_write) = nix::unistd::pipe().context("failed to create spec pipe")?;
+    let spec_read_raw = spec_read.into_raw_fd();
+    let spec_write_raw = spec_write.as_raw_fd();
+    let spec_read_str = spec_read_raw.to_string();
+
+    let pre_exec_fn = move || unsafe {
         if nix::libc::setpgid(0, 0) != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -263,10 +271,14 @@ fn run_rootless_unshare(spec: ContainerSpec) -> Result<i32> {
         if ret != 0 {
             return Err(io::Error::last_os_error());
         }
+        // Ensure the spec pipe read fd survives across exec.
+        nix::libc::fcntl(spec_read_raw, nix::libc::F_SETFD, 0);
+        // Close write end so the child doesn't keep it open (would prevent EOF).
+        nix::libc::close(spec_write_raw);
         Ok(())
     };
 
-    let mut child = if has_ports {
+    let child = if has_ports {
         // pasta wraps the process: creates user+net namespace from the HOST,
         // binds host ports for forwarding, then runs unshare inside for
         // mount/uts/ipc isolation. pasta's user namespace has single-UID
@@ -278,9 +290,8 @@ fn run_rootless_unshare(spec: ContainerSpec) -> Result<i32> {
         net::add_port_args(&mut cmd, &spec.port_mappings);
         cmd.args(["-u", "none", "-T", "none", "-U", "none"]);
         cmd.args(["--", "unshare", "--mount", "--uts", "--ipc", "--"]);
-        cmd.arg(&exe).arg("--rootless-bootstrap");
-        cmd.stdin(Stdio::piped())
-            .spawn()
+        cmd.arg(&exe).arg("--rootless-bootstrap").arg(&spec_read_str);
+        cmd.spawn()
             .context("failed to execute pasta")?
     } else {
         // Standard rootless: unshare handles all namespaces with full
@@ -295,18 +306,16 @@ fn run_rootless_unshare(spec: ContainerSpec) -> Result<i32> {
         unshare_args.push("--");
         let mut cmd = Command::new("unshare");
         unsafe { cmd.pre_exec(pre_exec_fn); }
-        cmd.args(&unshare_args).arg(&exe).arg("--rootless-bootstrap");
-        cmd.stdin(Stdio::piped())
-            .spawn()
+        cmd.args(&unshare_args).arg(&exe).arg("--rootless-bootstrap").arg(&spec_read_str);
+        cmd.spawn()
             .context("failed to execute unshare")?
     };
 
+    // Close read end in parent, write spec to the pipe, then close write end.
+    unsafe { nix::libc::close(spec_read_raw); }
     {
-        let stdin = child
-            .stdin
-            .take()
-            .context("failed to open rootless bootstrap stdin")?;
-        let mut writer = std::io::BufWriter::new(stdin);
+        let pipe_file = unsafe { std::fs::File::from_raw_fd(spec_write.into_raw_fd()) };
+        let mut writer = std::io::BufWriter::new(pipe_file);
         serde_json::to_writer(&mut writer, &spec)
             .context("failed to send rootless bootstrap spec")?;
     }

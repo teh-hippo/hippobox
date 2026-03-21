@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use image::ref_parser::ImageRef;
 use registry::RegistryClient;
 use std::fs;
+use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 
 fn hippobox_dir() -> PathBuf {
@@ -70,6 +71,12 @@ fn main() -> Result<()> {
             return container::container_init(fd);
         }
         if arg1 == "--rootless-bootstrap" {
+            let fd: i32 = args
+                .next()
+                .expect("missing fd for rootless-bootstrap")
+                .to_string_lossy()
+                .parse()
+                .expect("invalid fd for rootless-bootstrap");
             let prctl_ret = unsafe {
                 nix::libc::prctl(
                     nix::libc::PR_SET_PDEATHSIG,
@@ -83,9 +90,10 @@ fn main() -> Result<()> {
                 return Err(std::io::Error::last_os_error())
                     .context("failed to set rootless PDEATHSIG");
             }
+            let pipe_file = unsafe { std::fs::File::from_raw_fd(fd) };
             let spec: container::ContainerSpec =
-                serde_json::from_reader(std::io::BufReader::new(std::io::stdin()))
-                    .context("failed to read rootless bootstrap spec from stdin")?;
+                serde_json::from_reader(std::io::BufReader::new(pipe_file))
+                    .context("failed to read rootless bootstrap spec from pipe")?;
             let exit_code = container::run_prepared(spec)?;
 
             std::process::exit(exit_code);
