@@ -107,14 +107,18 @@ fn is_dir_path(path: *const c_char) -> bool {
 /// Copy source tree to dest, then remove source. Returns 0 on success, -1 on error.
 fn exdev_fallback(src: *const c_char, dst: *const c_char) -> c_int {
     if copy_tree(src, dst) != 0 {
-        // Copy failed — try to clean up partial dest.
+        // Copy failed — preserve errno, clean up partial dest, restore errno.
+        let saved = unsafe { *libc::__errno_location() };
         remove_tree(dst);
+        unsafe { *libc::__errno_location() = saved };
         return -1;
     }
     if remove_tree(src) != 0 {
-        // Source removal failed. Dest is complete but source still exists.
-        // Not ideal, but the rename conceptually succeeded.
-        return 0;
+        // Source removal failed — roll back dest so we don't leave duplicates.
+        let saved = unsafe { *libc::__errno_location() };
+        remove_tree(dst);
+        unsafe { *libc::__errno_location() = saved };
+        return -1;
     }
     0
 }
@@ -136,8 +140,12 @@ fn copy_tree(src: *const c_char, dst: *const c_char) -> c_int {
         return copy_dir(src, dst, st.st_mode);
     }
 
-    // Regular file (or special file — best-effort copy).
-    copy_file(src, dst, st.st_mode)
+    if mode == libc::S_IFREG {
+        return copy_file(src, dst, st.st_mode);
+    }
+
+    // Special files (FIFO, device, socket): recreate with mknod.
+    unsafe { libc::mknod(dst, st.st_mode, st.st_rdev) }
 }
 
 fn copy_symlink(src: *const c_char, dst: *const c_char) -> c_int {
@@ -174,8 +182,15 @@ fn copy_dir(src: *const c_char, dst: *const c_char, mode: mode_t) -> c_int {
             continue;
         }
 
-        let child_src = join_path(src, name.as_ptr());
-        let child_dst = join_path(dst, name.as_ptr());
+        let mut child_src = [0u8; 4096];
+        let mut child_dst = [0u8; 4096];
+        if !join_path(src, name.as_ptr(), &mut child_src)
+            || !join_path(dst, name.as_ptr(), &mut child_dst)
+        {
+            unsafe { *libc::__errno_location() = libc::ENAMETOOLONG };
+            ret = -1;
+            break;
+        }
 
         if copy_tree(child_src.as_ptr().cast(), child_dst.as_ptr().cast()) != 0 {
             ret = -1;
@@ -251,7 +266,12 @@ fn remove_tree(path: *const c_char) -> c_int {
             continue;
         }
 
-        let child = join_path(path, name.as_ptr());
+        let mut child = [0u8; 4096];
+        if !join_path(path, name.as_ptr(), &mut child) {
+            unsafe { *libc::__errno_location() = libc::ENAMETOOLONG };
+            ret = -1;
+            break;
+        }
         if remove_tree(child.as_ptr().cast()) != 0 {
             ret = -1;
             break;
@@ -267,12 +287,15 @@ fn remove_tree(path: *const c_char) -> c_int {
 
 // ── Path helpers (no allocator) ────────────────────────────────────
 
-fn join_path(dir: *const c_char, name: *const c_char) -> [u8; 4096] {
-    let mut buf = [0u8; 4096];
+/// Join dir + "/" + name into buf. Returns false if the result would overflow PATH_MAX.
+fn join_path(dir: *const c_char, name: *const c_char, buf: &mut [u8; 4096]) -> bool {
     let mut i = 0;
 
     let mut p = dir as *const u8;
-    while unsafe { *p } != 0 && i < 4094 {
+    while unsafe { *p } != 0 {
+        if i >= 4094 {
+            return false;
+        }
         buf[i] = unsafe { *p };
         i += 1;
         p = unsafe { p.add(1) };
@@ -282,11 +305,14 @@ fn join_path(dir: *const c_char, name: *const c_char) -> [u8; 4096] {
         i += 1;
     }
     p = name as *const u8;
-    while unsafe { *p } != 0 && i < 4095 {
+    while unsafe { *p } != 0 {
+        if i >= 4095 {
+            return false;
+        }
         buf[i] = unsafe { *p };
         i += 1;
         p = unsafe { p.add(1) };
     }
     buf[i] = 0;
-    buf
+    true
 }
