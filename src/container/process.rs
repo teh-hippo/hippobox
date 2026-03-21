@@ -180,6 +180,7 @@ pub fn container_init(config_fd: i32) -> Result<()> {
     }
 
     super::mounts::setup_container_mounts(config.rootless)?;
+    super::mounts::mask_proc_paths()?;
 
     let hostname = &config.container_id[..config.container_id.len().min(12)];
     nix::unistd::sethostname(hostname).context("failed to set hostname")?;

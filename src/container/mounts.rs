@@ -97,6 +97,96 @@ pub fn cleanup_host_device_sources(rootfs: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Paths in /proc to mask completely (files get /dev/null, dirs get empty tmpfs).
+const MASKED_PROC_PATHS: &[&str] = &[
+    "/proc/acpi",
+    "/proc/kcore",
+    "/proc/keys",
+    "/proc/latency_stats",
+    "/proc/sched_debug",
+    "/proc/scsi",
+    "/proc/timer_list",
+];
+
+/// Paths in /proc that should be read-only (bind-mount + remount ro).
+const READONLY_PROC_PATHS: &[&str] = &[
+    "/proc/asound",
+    "/proc/bus",
+    "/proc/fs",
+    "/proc/irq",
+    "/proc/sys",
+    "/proc/sysrq-trigger",
+];
+
+/// Mask sensitive /proc paths by bind-mounting /dev/null or tmpfs over them.
+/// Docker and Podman do the same to prevent information leaks and kernel exposure.
+pub fn mask_proc_paths() -> Result<()> {
+    for path in MASKED_PROC_PATHS {
+        let p = Path::new(path);
+        if !p.exists() {
+            continue;
+        }
+        let result = if p.is_dir() {
+            mount(
+                Some("tmpfs"),
+                *path,
+                Some("tmpfs"),
+                MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+                Some("size=0"),
+            )
+        } else {
+            mount(
+                Some("/dev/null"),
+                *path,
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+        };
+        if let Err(e) = result {
+            eprintln!("warning: failed to mask {path}: {e}");
+            continue;
+        }
+        // Remount read-only so the masked path can't be written to.
+        if p.is_file() {
+            let _ = mount(
+                None::<&str>,
+                *path,
+                None::<&str>,
+                MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+                None::<&str>,
+            );
+        }
+    }
+
+    for path in READONLY_PROC_PATHS {
+        let p = Path::new(path);
+        if !p.exists() {
+            continue;
+        }
+        // Bind-mount in place, then remount read-only.
+        if let Err(e) = mount(
+            Some(*path),
+            *path,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        ) {
+            eprintln!("warning: failed to bind {path}: {e}");
+            continue;
+        }
+        let _ = mount(
+            None::<&str>,
+            *path,
+            None::<&str>,
+            MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+            None::<&str>,
+        );
+    }
+
+    Ok(())
+}
+
 fn mount_dev() -> Result<()> {
     mount_fs(
         "/dev",
