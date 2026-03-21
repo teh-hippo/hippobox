@@ -50,6 +50,19 @@ pub fn setup_container_mounts(rootless: bool) -> Result<()> {
         );
     }
 
+    // Mount tmpfs on /tmp to bypass overlayfs for temporary files.
+    // Most build workloads and package managers write heavily to /tmp;
+    // tmpfs avoids the overlay copy-up path entirely.
+    if Path::new("/tmp").is_dir() {
+        let _ = mount(
+            Some("tmpfs"),
+            "/tmp",
+            Some("tmpfs"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+            Some("mode=1777"),
+        );
+    }
+
     Ok(())
 }
 
