@@ -85,6 +85,8 @@ run_bench() {
 # Sustained-workload scenario: 30k source files, 50MB data, grep/sed/tar/rename/sha256sum
 # Exercises filesystem I/O, CPU, process spawning, directory renames (EXDEV shim)
 SCENARIO_WORKLOAD='set -e
+
+# Create source tree: 50 modules x 20 packages x 30 files = 30,000 files
 i=0; while [ $i -lt 50 ]; do
   j=0; while [ $j -lt 20 ]; do
     dir="/tmp/b/s/m${i}/p${j}"; mkdir -p "$dir"
@@ -95,23 +97,68 @@ i=0; while [ $i -lt 50 ]; do
     done; j=$((j+1))
   done; i=$((i+1))
 done
+
+# Validate: 30,000 source files created
+c=$(find /tmp/b/s -name "*.go" | wc -l)
+[ "$c" -eq 30000 ] || { echo "FAIL: expected 30000 files, got $c" >&2; exit 1; }
+
+# Generate data files: 100 x 500KB = 50MB
 mkdir -p /tmp/b/data
 i=1; while [ $i -le 100 ]; do dd if=/dev/urandom bs=1024 count=500 of="/tmp/b/data/d${i}.bin" 2>/dev/null; i=$((i+1)); done
-find /tmp/b/s -name "*.go" | wc -l
+
+# Validate: 100 data files, each 512000 bytes
+dc=$(ls /tmp/b/data/*.bin | wc -l)
+[ "$dc" -eq 100 ] || { echo "FAIL: expected 100 data files, got $dc" >&2; exit 1; }
+ds=$(stat -c%s /tmp/b/data/d1.bin)
+[ "$ds" -eq 512000 ] || { echo "FAIL: expected 512000 byte data file, got $ds" >&2; exit 1; }
+
+# Search
 grep -rl "Println" /tmp/b/s | wc -l
+
+# Transform: 3 sed passes over all source
 find /tmp/b/s -name "*.go" -exec sed -i "s/Println/Printf/g" {} +
 find /tmp/b/s -name "*.go" -exec sed -i "s/func H/func Process/g" {} +
 find /tmp/b/s -name "*.go" -exec sed -i "s/package m/package mod/g" {} +
+
+# Validate: sed actually transformed the files
+grep -q "Printf" /tmp/b/s/m0/p0/f0.go || { echo "FAIL: sed did not transform Println->Printf" >&2; exit 1; }
+rem=$(grep -rl "Println" /tmp/b/s | wc -l)
+[ "$rem" -eq 0 ] || { echo "FAIL: $rem files still contain Println after sed" >&2; exit 1; }
+
+# Tar compress
 tar czf /tmp/b/a1.tar.gz -C /tmp/b s data
+ts=$(stat -c%s /tmp/b/a1.tar.gz)
+[ "$ts" -gt 1000000 ] || { echo "FAIL: archive too small ($ts bytes)" >&2; exit 1; }
+
+# Directory renames (EXDEV shim exercise)
 i=0; while [ $i -lt 50 ]; do mv "/tmp/b/s/m${i}" "/tmp/b/s/x${i}"; i=$((i+1)); done
+
+# Validate: renames worked — old gone, new present with correct count
+[ ! -d "/tmp/b/s/m0" ] || { echo "FAIL: m0 still exists after rename" >&2; exit 1; }
+[ -f "/tmp/b/s/x0/p0/f0.go" ] || { echo "FAIL: file missing after rename" >&2; exit 1; }
+rc=$(find /tmp/b/s -name "*.go" | wc -l)
+[ "$rc" -eq 30000 ] || { echo "FAIL: expected 30000 files after rename, got $rc" >&2; exit 1; }
+
+# sha256sum all source files
 find /tmp/b/s -type f -exec sha256sum {} + | wc -l
+
+# Checksum data files for integrity comparison
 sha256sum /tmp/b/data/*.bin | awk "{print \$1}" | sort > /tmp/b/ck1.txt
+
+# Extract archive
 mkdir -p /tmp/b/r; tar xzf /tmp/b/a1.tar.gz -C /tmp/b/r
+
+# Validate: extracted tree matches original
+ec=$(find /tmp/b/r/s -name "*.go" | wc -l)
+[ "$ec" -eq 30000 ] || { echo "FAIL: expected 30000 restored files, got $ec" >&2; exit 1; }
+
+# Verify data checksums match after round-trip
 sha256sum /tmp/b/r/data/*.bin | awk "{print \$1}" | sort > /tmp/b/ck2.txt
-diff /tmp/b/ck1.txt /tmp/b/ck2.txt
+diff /tmp/b/ck1.txt /tmp/b/ck2.txt || { echo "FAIL: data checksums differ after extract" >&2; exit 1; }
+
+# Re-compress the restored tree
 tar czf /tmp/b/a2.tar.gz -C /tmp/b/r s data
-find /tmp/b/s -name "*.go" -exec wc -l {} + | tail -1
-find /tmp/b/r/s -name "*.go" -exec wc -l {} + | tail -1
+
 rm -rf /tmp/b'
 
 # Run scenario benchmark (seconds, fewer iterations since each run is ~40s)
