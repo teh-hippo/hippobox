@@ -4,6 +4,7 @@ mod namespaces;
 pub(crate) mod net;
 mod process;
 mod rootfs;
+mod seccomp;
 
 use anyhow::{Context, Result, bail};
 use nix::fcntl::{Flock, FlockArg};
