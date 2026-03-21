@@ -13,6 +13,9 @@ use crate::image::ref_parser::ImageRef;
 use auth::get_anonymous_token;
 use extract::{HashingReader, create_extract_temp_dir, extract_with_whiteouts};
 
+const MAX_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// OCI registry HTTP client for pulling container images.
 pub struct RegistryClient {
     agent: ureq::Agent,
     token_cache: HashMap<String, String>,
@@ -26,21 +29,14 @@ impl RegistryClient {
         }
     }
 
+    /// Pull an image, downloading missing layers and storing metadata to disk.
     pub fn pull(&mut self, image_ref: &ImageRef, base_dir: &Path) -> Result<StoredImage> {
         let config_path = image_ref.image_metadata_path(base_dir);
 
-        // Snapshot old layer digests before overwriting (for auto-prune).
-        let old_layer_digests: Vec<String> = fs::read(&config_path)
+        // Snapshot old stored image before overwriting (for auto-prune).
+        let old_stored: Option<StoredImage> = fs::read(&config_path)
             .ok()
-            .and_then(|data| serde_json::from_slice::<StoredImage>(&data).ok())
-            .map(|old| {
-                old.manifest
-                    .layers
-                    .iter()
-                    .map(|l| l.digest.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
+            .and_then(|data| serde_json::from_slice(&data).ok());
 
         let manifest = self.fetch_manifest(image_ref)?;
         let config = self.fetch_config(image_ref, &manifest)?;
@@ -66,13 +62,12 @@ impl RegistryClient {
         fs::write(&config_path, serde_json::to_vec(&stored)?)?;
 
         // Auto-prune: remove old layers that are no longer referenced by any image.
-        if !old_layer_digests.is_empty() {
+        if let Some(ref old) = old_stored {
             let new_digests: std::collections::HashSet<&str> =
                 stored.manifest.layers.iter().map(|l| l.digest.as_str()).collect();
-            let orphaned: Vec<&str> = old_layer_digests
-                .iter()
-                .filter(|d| !new_digests.contains(d.as_str()))
-                .map(|d| d.as_str())
+            let orphaned: Vec<&str> = old.manifest.layers.iter()
+                .map(|l| l.digest.as_str())
+                .filter(|d| !new_digests.contains(d))
                 .collect();
 
             if !orphaned.is_empty() {
@@ -116,7 +111,7 @@ impl RegistryClient {
             self.authenticated_get(image_ref, &url, &accept)?
                 .into_body()
                 .into_reader()
-                .take(10 * 1024 * 1024),
+                .take(MAX_RESPONSE_BYTES),
         )
         .context("failed to parse manifest response")?;
 
@@ -148,7 +143,7 @@ impl RegistryClient {
                 self.authenticated_get(image_ref, &url, &accept)?
                     .into_body()
                     .into_reader()
-                    .take(10 * 1024 * 1024),
+                    .take(MAX_RESPONSE_BYTES),
             )
             .context("failed to parse platform manifest");
         }
@@ -165,7 +160,7 @@ impl RegistryClient {
             self.authenticated_get(image_ref, &url, "application/json")?
                 .into_body()
                 .into_reader()
-                .take(10 * 1024 * 1024),
+                .take(MAX_RESPONSE_BYTES),
         )
         .context("failed to parse image config")
     }
@@ -218,43 +213,48 @@ impl RegistryClient {
 
         let tmp_dir = create_extract_temp_dir(target_dir)?;
 
-        let reader = HashingReader {
-            inner: resp.into_body().into_reader(),
-            hasher: Sha256::new(),
-        };
-        let is_gzip = layer.media_type.as_deref().is_none_or(|mt| {
-            mt.contains("tar+gzip") || mt.ends_with("diff.tar.gzip")
-        });
-        let is_tar = matches!(
-            layer.media_type.as_deref(),
-            Some("application/vnd.oci.image.layer.v1.tar"
-                | "application/vnd.docker.image.rootfs.diff.tar")
-        );
-        let reader = if is_gzip {
-            let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(reader));
-            extract_with_whiteouts(&mut archive, &tmp_dir)?;
-            archive.into_inner().into_inner()
-        } else if is_tar {
-            let mut archive = tar::Archive::new(reader);
-            extract_with_whiteouts(&mut archive, &tmp_dir)?;
-            archive.into_inner()
-        } else {
-            fs::remove_dir_all(&tmp_dir).ok();
-            bail!("unsupported layer media type: {:?}", layer.media_type);
-        };
-
-        let computed = format!("sha256:{:x}", reader.hasher.finalize());
-        if computed != layer.digest {
-            let _ = fs::remove_dir_all(&tmp_dir);
-            bail!(
-                "layer digest mismatch: expected {}, got {}",
-                layer.digest,
-                computed
+        let result = (|| -> Result<()> {
+            let reader = HashingReader {
+                inner: resp.into_body().into_reader(),
+                hasher: Sha256::new(),
+            };
+            let is_gzip = layer.media_type.as_deref().is_none_or(|mt| {
+                mt.contains("tar+gzip") || mt.ends_with("diff.tar.gzip")
+            });
+            let is_tar = matches!(
+                layer.media_type.as_deref(),
+                Some("application/vnd.oci.image.layer.v1.tar"
+                    | "application/vnd.docker.image.rootfs.diff.tar")
             );
-        }
+            let reader = if is_gzip {
+                let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(reader));
+                extract_with_whiteouts(&mut archive, &tmp_dir)?;
+                archive.into_inner().into_inner()
+            } else if is_tar {
+                let mut archive = tar::Archive::new(reader);
+                extract_with_whiteouts(&mut archive, &tmp_dir)?;
+                archive.into_inner()
+            } else {
+                bail!("unsupported layer media type: {:?}", layer.media_type);
+            };
 
-        fs::rename(&tmp_dir, target_dir)?;
-        Ok(())
+            let computed = format!("sha256:{:x}", reader.hasher.finalize());
+            if computed != layer.digest {
+                bail!(
+                    "layer digest mismatch: expected {}, got {}",
+                    layer.digest,
+                    computed
+                );
+            }
+
+            fs::rename(&tmp_dir, target_dir)?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+        }
+        result
     }
 
     fn authenticated_get(

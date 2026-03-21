@@ -72,7 +72,7 @@ const BLOCKED_SYSCALLS: &[&str] = &[
 
 /// Build and install a seccomp BPF filter blocking dangerous syscalls.
 /// Must be called after PR_SET_NO_NEW_PRIVS and before execvpe.
-pub fn apply_seccomp_filter() -> Result<()> {
+pub(super) fn apply_seccomp_filter() -> Result<()> {
     let mut rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = BTreeMap::new();
 
     for name in BLOCKED_SYSCALLS {

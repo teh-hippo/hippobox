@@ -1,11 +1,11 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{self, ForkResult, Pid};
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 
-pub fn run_container(mut config: ChildConfig, stop_signal: &str) -> Result<i32> {
+pub(super) fn run_container(mut config: ChildConfig, stop_signal: &str) -> Result<i32> {
     if !config.rootless {
         super::cgroups::check_cgroup_v2()?;
         super::cgroups::create(&config.container_id)?;
@@ -87,24 +87,16 @@ pub fn run_container(mut config: ChildConfig, stop_signal: &str) -> Result<i32> 
         }
         ForkResult::Child => {
             nix::unistd::close(write_raw).context("failed to close config pipe write end")?;
+            // Close ready pipe fds in child — they're only needed by the parent.
+            // pipe() doesn't set CLOEXEC, so these would leak across execv.
+            drop(ready_read);
+            if let Some(rw) = ready_write {
+                // Keep the raw fd alive for container_init (stored in config.ready_fd)
+                // but relinquish Rust ownership so Drop doesn't close it.
+                let _ = rw.into_raw_fd();
+            }
 
-            let ppid_before = nix::unistd::getppid();
-            let prctl_ret = unsafe {
-                nix::libc::prctl(
-                    nix::libc::PR_SET_PDEATHSIG,
-                    nix::libc::SIGTERM as nix::libc::c_ulong,
-                    0,
-                    0,
-                    0,
-                )
-            };
-            if prctl_ret != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("failed to set PR_SET_PDEATHSIG");
-            }
-            if nix::unistd::getppid() != ppid_before {
-                std::process::exit(1);
-            }
+            super::set_pdeathsig_with_race_check()?;
 
             let exe = super::resolve_self_exe()?;
             let exe_c = CString::new(exe.to_string_lossy().as_bytes())
@@ -113,7 +105,10 @@ pub fn run_container(mut config: ChildConfig, stop_signal: &str) -> Result<i32> 
             let arg_fd = CString::new(read_raw.to_string())?;
 
             let err = nix::unistd::execv(&exe_c, &[exe_c.clone(), arg_init, arg_fd]).unwrap_err();
-            bail!("execv failed: {err}")
+            // Don't bail!/return here — unwinding would run CleanupGuard::drop
+            // in this child process while the parent is still waiting.
+            eprintln!("execv failed: {err}");
+            std::process::exit(127)
         }
     }
 }
@@ -176,7 +171,7 @@ pub(super) struct ChildConfig {
     pub volumes: Vec<super::VolumeMount>,
     pub network_mode: super::net::NetworkMode,
     pub port_mappings: Vec<super::net::PortMapping>,
-    pub network_isolated: bool,
+    pub external_netns: bool,
     pub ready_fd: Option<i32>,
 }
 

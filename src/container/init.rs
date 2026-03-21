@@ -15,7 +15,7 @@ pub fn container_init(config_fd: i32) -> Result<()> {
     // Create network namespace only if isolation is requested and not already
     // provided (pasta creates the netns externally for port-mapped containers).
     let needs_netns = config.network_mode == super::net::NetworkMode::None
-        && !config.network_isolated;
+        && !config.external_netns;
 
     // Copy host files into rootfs before pivot (host /etc is still accessible).
     super::mounts::copy_host_files_to_rootfs(Path::new(&config.rootfs))?;
@@ -88,29 +88,14 @@ pub fn container_init(config_fd: i32) -> Result<()> {
         ForkResult::Child => {
             // PID 1 in the new namespace. Re-arm death signal (cleared by fork)
             // with race check against intermediate parent.
-            let ppid_before = nix::unistd::getppid();
-            unsafe {
-                nix::libc::prctl(
-                    nix::libc::PR_SET_PDEATHSIG,
-                    nix::libc::SIGTERM as nix::libc::c_ulong,
-                    0, 0, 0,
-                );
-            }
-            if nix::unistd::getppid() != ppid_before {
-                std::process::exit(1);
-            }
+            super::set_pdeathsig_with_race_check()?;
             // Mount fresh /proc for the new PID namespace view.
-            let _ = std::fs::create_dir_all("/proc");
-            nix::mount::mount(
-                Some("proc"),
-                "/proc",
-                Some("proc"),
-                nix::mount::MsFlags::MS_NOSUID
-                    | nix::mount::MsFlags::MS_NODEV
-                    | nix::mount::MsFlags::MS_NOEXEC,
+            super::mounts::mount_fs(
+                "/proc", "proc", "proc",
+                nix::mount::MsFlags::MS_NOSUID | nix::mount::MsFlags::MS_NODEV | nix::mount::MsFlags::MS_NOEXEC,
                 None::<&str>,
-            )
-            .context("failed to mount /proc in PID namespace")?;
+                "failed to mount /proc in PID namespace",
+            )?;
             super::mounts::mask_proc_paths()?;
         }
     }
@@ -119,9 +104,7 @@ pub fn container_init(config_fd: i32) -> Result<()> {
         && let Some(home) = setup_user(user_str, config.rootless)?
     {
         // Update HOME in env_vars for the exec'd process.
-        if let Some(existing) = config.env_vars.iter_mut().find(|v| {
-            v.split_once('=').is_some_and(|(k, _)| k == "HOME")
-        }) {
+        if let Some(existing) = super::env_find_mut(&mut config.env_vars, "HOME") {
             *existing = format!("HOME={home}");
         } else {
             config.env_vars.push(format!("HOME={home}"));
@@ -255,5 +238,18 @@ mod tests {
         ).unwrap();
 
         assert!(resolve_name_to_id(tmp.path().to_str().unwrap(), 0, 2, "nonexistent").is_err());
+    }
+
+    #[test]
+    fn resolve_uid_numeric() {
+        assert_eq!(resolve_uid("0").unwrap(), 0);
+        assert_eq!(resolve_uid("1000").unwrap(), 1000);
+        assert_eq!(resolve_uid("65534").unwrap(), 65534);
+    }
+
+    #[test]
+    fn resolve_gid_numeric() {
+        assert_eq!(resolve_gid("0").unwrap(), 0);
+        assert_eq!(resolve_gid("999").unwrap(), 999);
     }
 }

@@ -10,7 +10,7 @@ use super::VolumeMount;
 /// Set up mount/UTS/IPC isolation and pivot into the container root.
 /// Volume mounts happen after unshare (inside the new mount namespace)
 /// but before pivot_root (so host paths are still accessible).
-pub fn setup_namespaces_and_pivot(
+pub(super) fn setup_namespaces_and_pivot(
     new_root: &Path,
     rootless: bool,
     volumes: &[VolumeMount],
@@ -67,7 +67,7 @@ pub fn setup_namespaces_and_pivot(
 
     // Mount volumes inside the new mount namespace, before pivot_root.
     // Host paths are still accessible; read-only remount works here.
-    super::mounts::mount_volumes(new_root, volumes)?;
+    super::volumes::mount_volumes(new_root, volumes)?;
 
     let old_root = new_root.join("old_root");
     fs::create_dir_all(&old_root)?;

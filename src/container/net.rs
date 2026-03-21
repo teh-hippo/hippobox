@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 
 /// Bring up the loopback network interface via ioctl.
 /// Uses raw libc calls — no external tools or extra crates.
-pub fn bring_up_loopback() -> Result<()> {
+pub(super) fn bring_up_loopback() -> Result<()> {
     unsafe {
         let sock = nix::libc::socket(nix::libc::AF_INET, nix::libc::SOCK_DGRAM, 0);
         if sock < 0 {
@@ -35,6 +35,7 @@ pub fn bring_up_loopback() -> Result<()> {
     Ok(())
 }
 
+/// A host:container port mapping for network-isolated containers.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PortMapping {
     pub host_port: u16,
@@ -42,12 +43,14 @@ pub struct PortMapping {
     pub protocol: String,
 }
 
+/// Container network mode: host networking or isolated (with optional port forwarding).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NetworkMode {
     Host,
     None,
 }
 
+/// Parse a port mapping spec like `8080:80` or `5353:53/udp`.
 pub fn parse_port(spec: &str) -> Result<PortMapping> {
     let (port_part, protocol) = match spec.rsplit_once('/') {
         Some((p, proto)) => {
@@ -81,6 +84,7 @@ pub fn parse_port(spec: &str) -> Result<PortMapping> {
     })
 }
 
+/// Parse a network mode string (`"host"` or `"none"`).
 pub fn parse_network_mode(s: &str) -> Result<NetworkMode> {
     match s {
         "host" => Ok(NetworkMode::Host),
@@ -90,7 +94,7 @@ pub fn parse_network_mode(s: &str) -> Result<NetworkMode> {
 }
 
 /// Check that `pasta` is installed. Returns the path if found.
-pub fn check_pasta() -> Result<std::path::PathBuf> {
+pub(super) fn check_pasta() -> Result<std::path::PathBuf> {
     which("pasta").context(
         "pasta not found; required for port mapping (-p)\n\
          install: apt install passt  (Debian/Ubuntu)\n\
@@ -109,7 +113,7 @@ fn which(name: &str) -> Option<std::path::PathBuf> {
 
 /// Spawn `pasta` attached to a process's network namespace (by PID).
 /// Used from the rootful parent after the child signals netns is ready.
-pub fn spawn_pasta_for_pid(pid: u32, ports: &[PortMapping]) -> Result<std::process::Child> {
+pub(super) fn spawn_pasta_for_pid(pid: u32, ports: &[PortMapping]) -> Result<std::process::Child> {
     let pasta_path = check_pasta()?;
     let mut cmd = std::process::Command::new(pasta_path);
     cmd.args(["--config-net", "--quiet", "--foreground", "--no-map-gw"]);
@@ -124,7 +128,7 @@ pub fn spawn_pasta_for_pid(pid: u32, ports: &[PortMapping]) -> Result<std::proce
         .context("failed to start pasta for port forwarding")
 }
 
-pub fn add_port_args(cmd: &mut std::process::Command, ports: &[PortMapping]) {
+pub(super) fn add_port_args(cmd: &mut std::process::Command, ports: &[PortMapping]) {
     for pm in ports {
         match pm.protocol.as_str() {
             "udp" => {
@@ -199,5 +203,30 @@ mod tests {
     #[test]
     fn parse_port_overflow() {
         assert!(parse_port("65536:80").is_err());
+    }
+
+    #[test]
+    fn add_port_args_tcp() {
+        let mut cmd = std::process::Command::new("echo");
+        let ports = vec![PortMapping { host_port: 8080, container_port: 80, protocol: "tcp".to_string() }];
+        add_port_args(&mut cmd, &ports);
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap().to_string()).collect();
+        assert_eq!(args, vec!["-t", "8080:80"]);
+    }
+
+    #[test]
+    fn add_port_args_udp() {
+        let mut cmd = std::process::Command::new("echo");
+        let ports = vec![PortMapping { host_port: 5353, container_port: 53, protocol: "udp".to_string() }];
+        add_port_args(&mut cmd, &ports);
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap().to_string()).collect();
+        assert_eq!(args, vec!["-u", "5353:53"]);
+    }
+
+    #[test]
+    fn add_port_args_empty() {
+        let mut cmd = std::process::Command::new("echo");
+        add_port_args(&mut cmd, &[]);
+        assert_eq!(cmd.get_args().count(), 0);
     }
 }

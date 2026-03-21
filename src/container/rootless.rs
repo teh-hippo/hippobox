@@ -9,9 +9,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 pub(super) fn run_rootless_unshare(spec: super::ContainerSpec) -> Result<i32> {
-    let exe = std::fs::read_link("/proc/self/exe")
-        .or_else(|_| std::env::current_exe())
-        .context("failed to locate current executable")?;
+    let exe = super::resolve_self_exe()?;
 
     let has_ports = !spec.port_mappings.is_empty();
     let isolate_network = spec.network_mode == super::net::NetworkMode::None || has_ports;
@@ -34,9 +32,7 @@ pub(super) fn run_rootless_unshare(spec: super::ContainerSpec) -> Result<i32> {
         let ret = nix::libc::prctl(
             nix::libc::PR_SET_PDEATHSIG,
             nix::libc::SIGTERM as nix::libc::c_ulong,
-            0,
-            0,
-            0,
+            0, 0, 0,
         );
         if ret != 0 {
             return Err(io::Error::last_os_error());

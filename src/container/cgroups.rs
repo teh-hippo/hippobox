@@ -4,14 +4,14 @@ use std::time::Duration;
 
 const CGROUP_BASE: &str = "/sys/fs/cgroup/hippobox";
 
-pub fn check_cgroup_v2() -> Result<()> {
+pub(super) fn check_cgroup_v2() -> Result<()> {
     if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
         bail!("cgroup v2 not available (missing /sys/fs/cgroup/cgroup.controllers)");
     }
     Ok(())
 }
 
-pub fn create(container_id: &str) -> Result<()> {
+pub(super) fn create(container_id: &str) -> Result<()> {
     std::fs::create_dir_all(CGROUP_BASE)
         .with_context(|| format!("failed to create cgroup base at {CGROUP_BASE}"))?;
     std::fs::create_dir_all(cgroup_path(container_id))
@@ -19,14 +19,14 @@ pub fn create(container_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn add_pid(container_id: &str, pid: u32) -> Result<()> {
+pub(super) fn add_pid(container_id: &str, pid: u32) -> Result<()> {
     let procs_path = format!("{}/cgroup.procs", cgroup_path(container_id));
     std::fs::write(&procs_path, pid.to_string())
         .with_context(|| format!("failed to write PID to {procs_path}"))?;
     Ok(())
 }
 
-pub fn cleanup(container_id: &str) -> Result<()> {
+pub(super) fn cleanup(container_id: &str) -> Result<()> {
     let cgroup_path = cgroup_path(container_id);
     if !Path::new(&cgroup_path).exists() {
         return Ok(());
@@ -66,6 +66,18 @@ pub fn cleanup(container_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn cgroup_path(container_id: &str) -> String {
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cgroup_path_format() {
+        let path = cgroup_path("abc123");
+        assert!(path.ends_with("/abc123"));
+        assert!(path.contains("hippobox"));
+    }
+}
+
+pub(super) fn cgroup_path(container_id: &str) -> String {
     format!("{CGROUP_BASE}/{container_id}")
 }

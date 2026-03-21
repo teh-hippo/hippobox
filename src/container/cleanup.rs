@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use nix::fcntl::{Flock, FlockArg};
 use std::fs::File;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 pub(super) fn acquire_container_lock(container_dir: &Path) -> Result<Flock<File>> {
@@ -31,6 +32,15 @@ pub fn gc_stale_containers(base_dir: &Path) {
         let path = entry.path();
         if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
             continue;
+        }
+
+        // Skip containers we don't own (e.g. rootful containers when running rootless).
+        // Avoids wasting time on umount/remove_dir_all that will always EPERM.
+        if let Ok(meta) = std::fs::metadata(&path) {
+            use std::os::unix::fs::MetadataExt;
+            if meta.uid() != nix::unistd::getuid().as_raw() {
+                continue;
+            }
         }
 
         if let Err(e) = gc_try_clean_container(&path) {
@@ -96,8 +106,30 @@ fn gc_try_clean_container(container_dir: &Path) -> Result<()> {
         }
     }
 
+    fix_overlay_workdir(container_dir);
     let _ = std::fs::remove_dir_all(container_dir);
     Ok(())
+}
+
+/// Overlayfs work dirs have restrictive permissions (mode 000) that prevent
+/// removal. Recursively fix permissions before cleanup.
+fn fix_overlay_workdir(container_dir: &Path) {
+    fn fix_recursive(dir: &Path) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+                    fix_recursive(&path);
+                }
+            }
+        }
+    }
+    let work_dir = container_dir.join("work");
+    if work_dir.exists() {
+        let _ = std::fs::set_permissions(&work_dir, std::fs::Permissions::from_mode(0o700));
+        fix_recursive(&work_dir);
+    }
 }
 
 pub(super) struct CleanupGuard {
@@ -117,12 +149,21 @@ impl Drop for CleanupGuard {
         }
         if self.overlay_mounted {
             let _ = super::mounts::cleanup_host_device_sources(&self.merged);
-            let _ = super::rootfs::unmount_overlay(&self.merged);
+            if super::rootfs::unmount_overlay(&self.merged).is_err() {
+                // Overlay still mounted — don't remove the directory or we'd
+                // descend into the live overlay. GC will handle it later.
+                for dir in &self.layer_dirs {
+                    let _ = std::fs::remove_file(dir.join(".in-use"));
+                }
+                return;
+            }
         }
         // Remove in-use markers so GC can prune these layers if orphaned.
         for dir in &self.layer_dirs {
             let _ = std::fs::remove_file(dir.join(".in-use"));
         }
+        // Fix overlayfs work dir permissions before removal.
+        fix_overlay_workdir(&self.container_dir);
         let _ = std::fs::remove_dir_all(&self.container_dir);
     }
 }

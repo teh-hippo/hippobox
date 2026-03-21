@@ -15,8 +15,9 @@ pub fn get_anonymous_token(
     }
 
     let token = fetch_anonymous_token(agent, image_ref)?;
-    cache.insert(key, token.clone());
-    Ok(token)
+    let ret = token.clone();
+    cache.insert(key, token);
+    Ok(ret)
 }
 
 fn fetch_anonymous_token(agent: &ureq::Agent, image_ref: &ImageRef) -> Result<String> {

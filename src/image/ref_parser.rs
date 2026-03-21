@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 
+/// Parsed container image reference (registry/repo:tag).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImageRef {
     pub registry: String,
@@ -9,6 +10,7 @@ pub struct ImageRef {
 }
 
 impl ImageRef {
+    /// Parse an image reference like `nginx`, `ubuntu:24.04`, or `ghcr.io/org/repo:v1`.
     pub fn parse(input: &str) -> Result<Self> {
         let input = input.trim();
         if input.is_empty() {

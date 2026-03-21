@@ -73,19 +73,8 @@ fn main() -> Result<()> {
                 .to_string_lossy()
                 .parse()
                 .expect("invalid fd for rootless-bootstrap");
-            let prctl_ret = unsafe {
-                nix::libc::prctl(
-                    nix::libc::PR_SET_PDEATHSIG,
-                    nix::libc::SIGTERM as nix::libc::c_ulong,
-                    0,
-                    0,
-                    0,
-                )
-            };
-            if prctl_ret != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("failed to set rootless PDEATHSIG");
-            }
+            container::set_pdeathsig()
+                .context("failed to set rootless PDEATHSIG")?;
             let pipe_file = unsafe { std::fs::File::from_raw_fd(fd) };
             let spec: container::ContainerSpec =
                 serde_json::from_reader(std::io::BufReader::new(pipe_file))
@@ -193,8 +182,8 @@ fn main() -> Result<()> {
                 user_env: env,
                 volumes: volume_mounts,
                 network_mode,
-                port_mappings: port_mappings.clone(),
-                network_isolated: !port_mappings.is_empty(),
+                external_netns: !port_mappings.is_empty(),
+                port_mappings,
                 rootless,
             };
 

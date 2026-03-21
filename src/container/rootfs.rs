@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 /// Mount overlayfs with the given lower layers, upper dir, work dir, and merge point.
 /// When `rootless` is true, attempts `redirect_dir=on` first (needed for directory
 /// renames in unprivileged overlayfs), falling back without it if the kernel rejects it.
-pub fn mount_overlay(
+pub(super) fn mount_overlay(
     lower_dirs: &[PathBuf],
     upper: &Path,
     work: &Path,
@@ -56,7 +56,7 @@ pub fn mount_overlay(
 }
 
 /// Unmount overlayfs.
-pub fn unmount_overlay(merged: &Path) -> Result<()> {
+pub(super) fn unmount_overlay(merged: &Path) -> Result<()> {
     umount2(merged, MntFlags::MNT_DETACH).context("failed to unmount overlayfs")?;
     Ok(())
 }

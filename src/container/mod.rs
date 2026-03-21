@@ -3,6 +3,7 @@ mod cleanup;
 mod init;
 mod mounts;
 mod namespaces;
+mod volumes;
 pub(crate) mod net;
 mod process;
 mod rootfs;
@@ -17,8 +18,9 @@ use crate::image::manifest::{ImageConfig, Manifest, StoredImage};
 
 pub(crate) use init::container_init;
 pub use cleanup::gc_stale_containers;
-pub use mounts::parse_volume;
+pub use volumes::parse_volume;
 
+/// Bind-mount source and target for a container volume.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VolumeMount {
     pub source: String,
@@ -26,6 +28,7 @@ pub struct VolumeMount {
     pub read_only: bool,
 }
 
+/// Full specification for running a container, assembled from CLI args and image config.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ContainerSpec {
     pub id: String,
@@ -38,11 +41,12 @@ pub struct ContainerSpec {
     pub volumes: Vec<VolumeMount>,
     pub network_mode: net::NetworkMode,
     pub port_mappings: Vec<net::PortMapping>,
-    /// Set when pasta (or another tool) has already created the network namespace.
-    pub network_isolated: bool,
+    /// True when pasta (or another tool) has already created the network namespace.
+    pub external_netns: bool,
     pub rootless: bool,
 }
 
+/// Run a container from the given spec. Dispatches to rootless or rootful path.
 pub fn run(spec: ContainerSpec) -> Result<i32> {
     if spec.rootless {
         return rootless::run_rootless_unshare(spec);
@@ -51,6 +55,7 @@ pub fn run(spec: ContainerSpec) -> Result<i32> {
     run_prepared(spec)
 }
 
+/// Run a prepared container spec (rootful path, or called from rootless bootstrap).
 pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
     let container_config = spec.config.config.as_ref();
     let workdir = container_config
@@ -70,7 +75,7 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
             .map(|c| c.to_vec())
             .unwrap_or_default()
     } else {
-        spec.user_cmd.clone()
+        spec.user_cmd
     };
     let argv: Vec<String> = match entrypoint {
         Some(ep) => ep.iter().cloned().chain(tail).collect(),
@@ -89,7 +94,7 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
         });
     // Ensure HOME and TERM have sensible defaults (image env or user -e can override).
     for (key, default) in [("HOME", "/root"), ("TERM", "xterm")] {
-        if !env_vars.iter().any(|v| v.split_once('=').is_some_and(|(k, _)| k == key)) {
+        if !env_has_key(&env_vars, key) {
             env_vars.push(format!("{key}={default}"));
         }
     }
@@ -141,7 +146,6 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
         let marker = dir.join(".in-use");
         let _ = std::fs::write(&marker, spec.id.as_bytes());
     }
-    cleanup_guard.layer_dirs = layer_dirs.clone();
 
     rootfs::mount_overlay(&layer_dirs, &upper, &work, &merged, spec.rootless).with_context(|| {
         if spec.rootless {
@@ -150,6 +154,7 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
             "overlay mount failed"
         }
     })?;
+    cleanup_guard.layer_dirs = layer_dirs;
     cleanup_guard.overlay_mounted = true;
 
     // For rootless containers, install the rename shim to work around EXDEV on
@@ -178,7 +183,7 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
     eprintln!("  cmd: {:?}", argv);
 
     let child_config = process::ChildConfig {
-        rootfs: merged.to_string_lossy().to_string(),
+        rootfs: merged.to_string_lossy().into_owned(),
         argv,
         env_vars,
         workdir: workdir.to_string(),
@@ -188,7 +193,7 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
         volumes: spec.volumes,
         network_mode: spec.network_mode,
         port_mappings: spec.port_mappings,
-        network_isolated: spec.network_isolated,
+        external_netns: spec.external_netns,
         ready_fd: None,
     };
 
@@ -199,6 +204,33 @@ pub(crate) fn resolve_self_exe() -> Result<PathBuf> {
     std::fs::read_link("/proc/self/exe")
         .or_else(|_| std::env::current_exe())
         .context("failed to locate current executable")
+}
+
+/// Arm PR_SET_PDEATHSIG so this process receives SIGTERM when its parent dies.
+/// Returns `io::Result` for compatibility with `pre_exec` closures.
+pub(crate) fn set_pdeathsig() -> std::io::Result<()> {
+    let ret = unsafe {
+        nix::libc::prctl(
+            nix::libc::PR_SET_PDEATHSIG,
+            nix::libc::SIGTERM as nix::libc::c_ulong,
+            0, 0, 0,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Arm PR_SET_PDEATHSIG with a race check: verify the parent PID hasn't changed
+/// between getppid() and prctl() (the parent could have died in between).
+pub(crate) fn set_pdeathsig_with_race_check() -> Result<()> {
+    let ppid_before = nix::unistd::getppid();
+    set_pdeathsig().context("failed to set PR_SET_PDEATHSIG")?;
+    if nix::unistd::getppid() != ppid_before {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// Locate the rename shim .so next to the hippobox binary.
@@ -217,11 +249,8 @@ fn apply_env_overrides(mut env_vars: Vec<String>, overrides: &[String]) -> Resul
         if key.is_empty() {
             bail!("invalid environment override {override_var:?}, empty key");
         }
-        if let Some(existing) = env_vars.iter_mut().find(|v| {
-            v.split_once('=')
-                .is_some_and(|(k, _)| k == key)
-        }) {
-            *existing = override_var.clone();
+        if let Some(existing) = env_find_mut(&mut env_vars, key) {
+            override_var.clone_into(existing);
         } else {
             env_vars.push(override_var.clone());
         }
@@ -229,6 +258,17 @@ fn apply_env_overrides(mut env_vars: Vec<String>, overrides: &[String]) -> Resul
     Ok(env_vars)
 }
 
+/// Check if an env var list contains a given key.
+fn env_has_key(vars: &[String], key: &str) -> bool {
+    vars.iter().any(|v| v.split_once('=').is_some_and(|(k, _)| k == key))
+}
+
+/// Find a mutable reference to an env var by key.
+pub(super) fn env_find_mut<'a>(vars: &'a mut [String], key: &str) -> Option<&'a mut String> {
+    vars.iter_mut().find(|v| v.split_once('=').is_some_and(|(k, _)| k == key))
+}
+
+/// Load a previously pulled image's manifest and config from disk.
 pub fn load_image(image_ref: &ImageRef, base_dir: &Path) -> Result<(Manifest, ImageConfig)> {
     let config_path = image_ref.image_metadata_path(base_dir);
     let data = std::fs::read(&config_path).with_context(|| {

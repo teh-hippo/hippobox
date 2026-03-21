@@ -223,4 +223,63 @@ mod tests {
         assert_eq!(computed, expected);
         assert_eq!(buf.len(), 0);
     }
+
+    #[test]
+    fn extract_basic_tar() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+
+        let mut header = tar::Header::new_gnu();
+        header.set_path("hello.txt").unwrap();
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, b"hello" as &[u8]).unwrap();
+
+        let data = builder.into_inner().unwrap();
+        let mut archive = tar::Archive::new(std::io::Cursor::new(data));
+        extract_with_whiteouts(&mut archive, tmp.path()).unwrap();
+
+        assert_eq!(std::fs::read_to_string(tmp.path().join("hello.txt")).unwrap(), "hello");
+    }
+
+    #[test]
+    fn extract_rejects_absolute_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+
+        let mut header = tar::Header::new_gnu();
+        // set_path rejects absolute paths, so write path bytes directly
+        let path_bytes = b"/etc/shadow";
+        header.as_gnu_mut().unwrap().name[..path_bytes.len()].copy_from_slice(path_bytes);
+        header.as_gnu_mut().unwrap().name[path_bytes.len()] = 0;
+        header.set_size(4);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, b"evil" as &[u8]).unwrap();
+
+        let data = builder.into_inner().unwrap();
+        let mut archive = tar::Archive::new(std::io::Cursor::new(data));
+        assert!(extract_with_whiteouts(&mut archive, tmp.path()).is_err());
+    }
+
+    #[test]
+    fn extract_rejects_parent_traversal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+
+        let mut header = tar::Header::new_gnu();
+        // set_path rejects '..', so write path bytes directly
+        let path_bytes = b"../../etc/passwd";
+        header.as_gnu_mut().unwrap().name[..path_bytes.len()].copy_from_slice(path_bytes);
+        header.as_gnu_mut().unwrap().name[path_bytes.len()] = 0;
+        header.set_size(4);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, b"evil" as &[u8]).unwrap();
+
+        let data = builder.into_inner().unwrap();
+        let mut archive = tar::Archive::new(std::io::Cursor::new(data));
+        assert!(extract_with_whiteouts(&mut archive, tmp.path()).is_err());
+    }
 }
