@@ -48,7 +48,7 @@ pub fn run_container(mut config: ChildConfig, stop_signal: &str) -> Result<i32> 
             if has_ports {
                 if let Some(ready_fd) = ready_read {
                     let mut buf = [0u8; 1];
-                    let _ = nix::unistd::read(ready_fd.as_raw_fd(), &mut buf);
+                    let _ = nix::unistd::read(&ready_fd, &mut buf);
                     drop(ready_fd);
                 }
                 pasta_child = Some(
