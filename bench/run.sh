@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# hippobox benchmark suite — hippobox vs podman (default) vs podman (optimised)
+# hippobox benchmark suite — hippobox vs podman
 # All tests run rootless (userland). Images must be pre-pulled.
 set -euo pipefail
 
@@ -170,10 +170,8 @@ bench_redis_ping() {
         port=$(find_port)
         if [ "$runner" = "hippobox" ]; then
             _bench_redis_ping_hippobox "$port" >/dev/null || true
-        elif [ "$runner" = "podman" ]; then
-            _bench_redis_ping_podman "$port" "" >/dev/null || true
         else
-            _bench_redis_ping_podman "$port" "optimised" >/dev/null || true
+            _bench_redis_ping_podman "$port" >/dev/null || true
         fi
     done
 
@@ -183,10 +181,8 @@ bench_redis_ping() {
         port=$(find_port)
         if [ "$runner" = "hippobox" ]; then
             ms=$(_bench_redis_ping_hippobox "$port")
-        elif [ "$runner" = "podman" ]; then
-            ms=$(_bench_redis_ping_podman "$port" "")
         else
-            ms=$(_bench_redis_ping_podman "$port" "optimised")
+            ms=$(_bench_redis_ping_podman "$port")
         fi
         if [ "$ms" = "-1" ]; then
             printf "  %-22s %s\n" "$label" "$(red FAILED)"
@@ -221,13 +217,8 @@ _bench_redis_ping_hippobox() {
 }
 
 _bench_redis_ping_podman() {
-    local port=$1 mode=$2 start end cid
-    local -a cmd=()
-    if [ "$mode" = "optimised" ]; then
-        cmd=(podman --events-backend=none run -d --rm --log-driver=none --cgroups=no-conmon --network=host)
-    else
-        cmd=(podman run -d --rm -p "${port}:${port}")
-    fi
+    local port=$1 start end cid
+    local -a cmd=(podman run -d --rm -p "${port}:${port}")
     start=$(date +%s%N)
     cid=$("${cmd[@]}" \
         "$IMAGE_REDIS" redis-server --save "" --appendonly no \
@@ -260,8 +251,6 @@ bold "╚═══════════════════════�
 echo ""
 echo "  hippobox:          $HIPPOBOX"
 echo "  podman:            $(command -v podman) ($(podman --version 2>/dev/null | head -1))"
-echo "  podman optimised:  --events-backend=none --log-driver=none"
-echo "                     --cgroups=no-conmon --network=none/host"
 echo "  warmup:            $WARMUP runs"
 echo "  iterations:        $ITERATIONS timed runs"
 echo ""
@@ -273,8 +262,6 @@ printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "min" "median" "avg" "p95" "m
 printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "───" "──────" "───" "───" "───"
 run_bench "hippobox" $WARMUP $ITERATIONS $HIPPOBOX run "$IMAGE_BUSYBOX" true
 run_bench "podman" $WARMUP $ITERATIONS podman run --rm "$IMAGE_BUSYBOX" true
-run_bench "podman_opt" $WARMUP $ITERATIONS \
-    podman --events-backend=none run --rm --log-driver=none --cgroups=no-conmon --network=none "$IMAGE_BUSYBOX" true
 echo ""
 
 # ── Test 2: busybox echo hello ───────────────────────────────────────
@@ -284,8 +271,6 @@ printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "min" "median" "avg" "p95" "m
 printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "───" "──────" "───" "───" "───"
 run_bench "h_echo" $WARMUP $ITERATIONS $HIPPOBOX run "$IMAGE_BUSYBOX" echo hello
 run_bench "p_echo" $WARMUP $ITERATIONS podman run --rm "$IMAGE_BUSYBOX" echo hello
-run_bench "po_echo" $WARMUP $ITERATIONS \
-    podman --events-backend=none run --rm --log-driver=none --cgroups=no-conmon --network=none "$IMAGE_BUSYBOX" echo hello
 echo ""
 
 # ── Test 3: busybox sh computation ───────────────────────────────────
@@ -295,8 +280,6 @@ printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "min" "median" "avg" "p95" "m
 printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "───" "──────" "───" "───" "───"
 run_bench "h_sh" $WARMUP $ITERATIONS $HIPPOBOX run "$IMAGE_BUSYBOX" sh -c 'i=0; while [ $i -lt 100 ]; do i=$((i+1)); done'
 run_bench "p_sh" $WARMUP $ITERATIONS podman run --rm "$IMAGE_BUSYBOX" sh -c 'i=0; while [ $i -lt 100 ]; do i=$((i+1)); done'
-run_bench "po_sh" $WARMUP $ITERATIONS \
-    podman --events-backend=none run --rm --log-driver=none --cgroups=no-conmon --network=none "$IMAGE_BUSYBOX" sh -c 'i=0; while [ $i -lt 100 ]; do i=$((i+1)); done'
 echo ""
 
 # ── Test 4: redis-server --version ───────────────────────────────────
@@ -306,8 +289,6 @@ printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "min" "median" "avg" "p95" "m
 printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "───" "──────" "───" "───" "───"
 run_bench "h_redis_ver" $WARMUP $ITERATIONS $HIPPOBOX run "$IMAGE_REDIS" redis-server --version
 run_bench "p_redis_ver" $WARMUP $ITERATIONS podman run --rm "$IMAGE_REDIS" redis-server --version
-run_bench "po_redis_ver" $WARMUP $ITERATIONS \
-    podman --events-backend=none run --rm --log-driver=none --cgroups=no-conmon --network=none "$IMAGE_REDIS" redis-server --version
 echo ""
 
 # ── Test 5: ubuntu cat /etc/os-release ──────────────────────────────
@@ -317,8 +298,6 @@ printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "min" "median" "avg" "p95" "m
 printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "───" "──────" "───" "───" "───"
 run_bench "h_ubuntu_cat" $WARMUP $ITERATIONS $HIPPOBOX run "$IMAGE_UBUNTU" -- cat /etc/os-release
 run_bench "p_ubuntu_cat" $WARMUP $ITERATIONS podman run --rm "$IMAGE_UBUNTU" cat /etc/os-release
-run_bench "po_ubuntu_cat" $WARMUP $ITERATIONS \
-    podman --events-backend=none run --rm --log-driver=none --cgroups=no-conmon --network=none "$IMAGE_UBUNTU" cat /etc/os-release
 echo ""
 
 # ── Test 6: ubuntu directory rename ─────────────────────────────────
@@ -330,9 +309,6 @@ run_bench "h_ubuntu_rename" $WARMUP $ITERATIONS $HIPPOBOX run "$IMAGE_UBUNTU" --
     sh -c 'mkdir -p /opt/a/b/c && echo x > /opt/a/b/c/f && mv /opt/a /opt/z && cat /opt/z/b/c/f'
 run_bench "p_ubuntu_rename" $WARMUP $ITERATIONS podman run --rm "$IMAGE_UBUNTU" \
     sh -c 'mkdir -p /opt/a/b/c && echo x > /opt/a/b/c/f && mv /opt/a /opt/z && cat /opt/z/b/c/f'
-run_bench "po_ubuntu_rename" $WARMUP $ITERATIONS \
-    podman --events-backend=none run --rm --log-driver=none --cgroups=no-conmon --network=none "$IMAGE_UBUNTU" \
-    sh -c 'mkdir -p /opt/a/b/c && echo x > /opt/a/b/c/f && mv /opt/a /opt/z && cat /opt/z/b/c/f'
 echo ""
 
 # ── Test 7: ubuntu dpkg --configure ─────────────────────────────────
@@ -342,8 +318,6 @@ printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "min" "median" "avg" "p95" "m
 printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "───" "──────" "───" "───" "───"
 run_bench "h_ubuntu_dpkg" $WARMUP $ITERATIONS $HIPPOBOX run "$IMAGE_UBUNTU" -- dpkg --configure -a
 run_bench "p_ubuntu_dpkg" $WARMUP $ITERATIONS podman run --rm "$IMAGE_UBUNTU" dpkg --configure -a
-run_bench "po_ubuntu_dpkg" $WARMUP $ITERATIONS \
-    podman --events-backend=none run --rm --log-driver=none --cgroups=no-conmon --network=none "$IMAGE_UBUNTU" dpkg --configure -a
 echo ""
 
 # ── Test 8: Redis PING (server startup-to-ready) ────────────────────
@@ -353,7 +327,6 @@ printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "min" "median" "avg" "p95" "m
 printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "───" "──────" "───" "───" "───"
 bench_redis_ping "hippobox"      "h_redis_ping"  $WARMUP $ITERATIONS || true
 bench_redis_ping "podman"        "p_redis_ping"  $WARMUP $ITERATIONS || true
-bench_redis_ping "podman_opt"    "po_redis_ping" $WARMUP $ITERATIONS || true
 echo ""
 
 # ── Test 9: Ubuntu sustained workload scenario ──────────────────────
@@ -365,9 +338,6 @@ run_scenario "h_scenario" $SCENARIO_WARMUP $SCENARIO_ITERATIONS \
     $HIPPOBOX run "$IMAGE_UBUNTU" -- sh -c "$SCENARIO_WORKLOAD"
 run_scenario "p_scenario" $SCENARIO_WARMUP $SCENARIO_ITERATIONS \
     podman run --rm "$IMAGE_UBUNTU" sh -c "$SCENARIO_WORKLOAD"
-run_scenario "po_scenario" $SCENARIO_WARMUP $SCENARIO_ITERATIONS \
-    podman --events-backend=none run --rm --log-driver=none --cgroups=no-conmon --network=none \
-    "$IMAGE_UBUNTU" sh -c "$SCENARIO_WORKLOAD"
 echo ""
 
 # ── Summary ──────────────────────────────────────────────────────────
@@ -376,66 +346,55 @@ bold "╔═══════════════════════�
 bold "║                          Summary (median ms)                         ║"
 bold "╚════════════════════════════════════════════════════════════════════════╝"
 echo ""
-printf "  %-24s %10s %12s %12s %10s %10s\n" "Test" "hippobox" "podman" "podman opt" "h/p" "h/po"
-printf "  %-24s %10s %12s %12s %10s %10s\n" "────────────────────────" "──────────" "────────────" "────────────" "──────────" "──────────"
+printf "  %-24s %10s %12s %10s\n" "Test" "hippobox" "podman" "h/p"
+printf "  %-24s %10s %12s %10s\n" "────────────────────────" "──────────" "────────────" "──────────"
 
 summary_row() {
-    local name=$1 hvar=$2 pvar=$3 povar=$4
-    local h=${!hvar:--1} p=${!pvar:--1} po=${!povar:--1}
+    local name=$1 hvar=$2 pvar=$3
+    local h=${!hvar:--1} p=${!pvar:--1}
 
-    local r1="—" r2="—"
+    local r1="—"
     if [ "$h" -gt 0 ] && [ "$p" -gt 0 ]; then
         local pct=$((h * 100 / p))
         if [ "$pct" -lt 100 ]; then r1="$(green "${pct}%")"; else r1="$(red "${pct}%")"; fi
     fi
-    if [ "$h" -gt 0 ] && [ "$po" -gt 0 ]; then
-        local pct=$((h * 100 / po))
-        if [ "$pct" -lt 100 ]; then r2="$(green "${pct}%")"; else r2="$(red "${pct}%")"; fi
-    fi
 
-    local hs="—" ps="—" pos="—"
+    local hs="—" ps="—"
     [ "$h"  -gt 0 ] && hs="${h} ms"
     [ "$p"  -gt 0 ] && ps="${p} ms"
-    [ "$po" -gt 0 ] && pos="${po} ms"
 
-    printf "  %-24s %10s %12s %12s %10s %10s\n" "$name" "$hs" "$ps" "$pos" "$r1" "$r2"
+    printf "  %-24s %10s %12s %10s\n" "$name" "$hs" "$ps" "$r1"
 }
 
-summary_row "true"              "hippobox_med"        "podman_med"          "podman_opt_med"
-summary_row "echo"              "h_echo_med"          "p_echo_med"          "po_echo_med"
-summary_row "sh loop"           "h_sh_med"            "p_sh_med"            "po_sh_med"
-summary_row "redis --version"   "h_redis_ver_med"     "p_redis_ver_med"     "po_redis_ver_med"
-summary_row "ubuntu cat"        "h_ubuntu_cat_med"    "p_ubuntu_cat_med"    "po_ubuntu_cat_med"
-summary_row "ubuntu dir-rename" "h_ubuntu_rename_med" "p_ubuntu_rename_med" "po_ubuntu_rename_med"
-summary_row "ubuntu dpkg"       "h_ubuntu_dpkg_med"   "p_ubuntu_dpkg_med"   "po_ubuntu_dpkg_med"
-summary_row "redis PING"        "h_redis_ping_med"    "p_redis_ping_med"    "po_redis_ping_med"
+summary_row "true"              "hippobox_med"        "podman_med"
+summary_row "echo"              "h_echo_med"          "p_echo_med"
+summary_row "sh loop"           "h_sh_med"            "p_sh_med"
+summary_row "redis --version"   "h_redis_ver_med"     "p_redis_ver_med"
+summary_row "ubuntu cat"        "h_ubuntu_cat_med"    "p_ubuntu_cat_med"
+summary_row "ubuntu dir-rename" "h_ubuntu_rename_med" "p_ubuntu_rename_med"
+summary_row "ubuntu dpkg"       "h_ubuntu_dpkg_med"   "p_ubuntu_dpkg_med"
+summary_row "redis PING"        "h_redis_ping_med"    "p_redis_ping_med"
 
 # Scenario uses seconds for display
 summary_row_s() {
-    local name=$1 hvar=$2 pvar=$3 povar=$4
-    local h=${!hvar:--1} p=${!pvar:--1} po=${!povar:--1}
+    local name=$1 hvar=$2 pvar=$3
+    local h=${!hvar:--1} p=${!pvar:--1}
 
-    local r1="—" r2="—"
+    local r1="—"
     if [ "$h" -gt 0 ] && [ "$p" -gt 0 ]; then
         local pct=$((h * 100 / p))
         if [ "$pct" -le 105 ]; then r1="$(green "${pct}%")"; else r1="$(red "${pct}%")"; fi
     fi
-    if [ "$h" -gt 0 ] && [ "$po" -gt 0 ]; then
-        local pct=$((h * 100 / po))
-        if [ "$pct" -le 105 ]; then r2="$(green "${pct}%")"; else r2="$(red "${pct}%")"; fi
-    fi
 
-    local hs="—" ps="—" pos="—"
+    local hs="—" ps="—"
     if [ "$h" -gt 0 ]; then hs="$(( h / 1000 )).$(( h % 1000 / 100 ))s"; fi
     if [ "$p" -gt 0 ]; then ps="$(( p / 1000 )).$(( p % 1000 / 100 ))s"; fi
-    if [ "$po" -gt 0 ]; then pos="$(( po / 1000 )).$(( po % 1000 / 100 ))s"; fi
 
-    printf "  %-24s %10s %12s %12s %10s %10s\n" "$name" "$hs" "$ps" "$pos" "$r1" "$r2"
+    printf "  %-24s %10s %12s %10s\n" "$name" "$hs" "$ps" "$r1"
 }
 
-summary_row_s "scenario (sustained)" "h_scenario_med"      "p_scenario_med"      "po_scenario_med"
+summary_row_s "scenario (sustained)" "h_scenario_med"      "p_scenario_med"
 
 echo ""
-echo "  h/p  = hippobox / podman (default)    — lower % = hippobox faster"
-echo "  h/po = hippobox / podman (optimised)  — lower % = hippobox faster"
+echo "  h/p = hippobox / podman — lower % = hippobox faster"
 echo ""
