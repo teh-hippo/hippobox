@@ -205,6 +205,8 @@ pub fn container_init(config_fd: i32) -> Result<()> {
         return Err(std::io::Error::last_os_error()).context("failed to set PR_SET_NO_NEW_PRIVS");
     }
 
+    super::seccomp::apply_seccomp_filter()?;
+
     if !config.workdir.is_empty() && config.workdir != "/" {
         std::env::set_current_dir(&config.workdir)
             .with_context(|| format!("failed to chdir to {}", config.workdir))?;
