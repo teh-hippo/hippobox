@@ -13,7 +13,7 @@ use core::ffi::c_int;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 use libc::{
-    c_char, c_void, closedir, dirent, lstat, mkdir, mode_t, opendir, readdir, readlink, rmdir,
+    c_char, c_void, closedir, dirent, lstat, mkdir, mode_t, readdir, readlink, rmdir,
     stat as stat_t, symlink, unlink, AT_FDCWD, EXDEV, S_IFDIR, S_IFMT, S_IFLNK,
 };
 
@@ -105,21 +105,59 @@ fn is_dir_path(path: *const c_char) -> bool {
 }
 
 /// Copy source tree to dest, then remove source. Returns 0 on success, -1 on error.
+/// Uses a staging name to avoid data loss if remove_tree fails partway through.
 fn exdev_fallback(src: *const c_char, dst: *const c_char) -> c_int {
-    if copy_tree(src, dst) != 0 {
-        // Copy failed — preserve errno, clean up partial dest, restore errno.
+    // Stage 1: copy to a temporary name next to the real destination.
+    // If the copy or the source removal fails, we clean up the staging copy
+    // and leave the source intact.
+    let mut staging = [0u8; 4096];
+    {
+        let mut i = 0usize;
+        let mut p = dst as *const u8;
+        while unsafe { *p } != 0 {
+            if i >= 4080 {
+                unsafe { *libc::__errno_location() = libc::ENAMETOOLONG };
+                return -1;
+            }
+            staging[i] = unsafe { *p };
+            i += 1;
+            p = unsafe { p.add(1) };
+        }
+        // Append ".~hb~" suffix as staging marker.
+        for &b in b".~hb~" {
+            staging[i] = b;
+            i += 1;
+        }
+        staging[i] = 0;
+    }
+
+    if copy_tree(src, staging.as_ptr().cast()) != 0 {
         let saved = unsafe { *libc::__errno_location() };
-        remove_tree(dst);
+        remove_tree(staging.as_ptr().cast());
         unsafe { *libc::__errno_location() = saved };
         return -1;
     }
+
+    // Stage 2: remove the source. If this fails, remove the staging copy
+    // so the source is left untouched.
     if remove_tree(src) != 0 {
-        // Source removal failed — roll back dest so we don't leave duplicates.
         let saved = unsafe { *libc::__errno_location() };
-        remove_tree(dst);
+        remove_tree(staging.as_ptr().cast());
         unsafe { *libc::__errno_location() = saved };
         return -1;
     }
+
+    // Stage 3: atomic rename staging → final destination.
+    let real: RenameFn = unsafe { resolve(&REAL_RENAME, b"rename\0") };
+    if unsafe { real(staging.as_ptr().cast(), dst) } != 0 {
+        // rename failed — try to restore source from staging
+        let saved = unsafe { *libc::__errno_location() };
+        let _: RenameFn = unsafe { resolve(&REAL_RENAME, b"rename\0") };
+        let _ = unsafe { real(staging.as_ptr().cast(), src) };
+        unsafe { *libc::__errno_location() = saved };
+        return -1;
+    }
+
     0
 }
 
@@ -163,8 +201,14 @@ fn copy_dir(src: *const c_char, dst: *const c_char, mode: mode_t) -> c_int {
         return -1;
     }
 
-    let dir = unsafe { opendir(src) };
+    // Open with O_DIRECTORY | O_NOFOLLOW to prevent TOCTOU dir→symlink swap.
+    let fd = unsafe { libc::open(src, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW) };
+    if fd < 0 {
+        return -1;
+    }
+    let dir = unsafe { libc::fdopendir(fd) };
     if dir.is_null() {
+        unsafe { libc::close(fd) };
         return -1;
     }
 
@@ -209,7 +253,7 @@ fn copy_file(src: *const c_char, dst: *const c_char, mode: mode_t) -> c_int {
     let fd_out = unsafe {
         libc::open(
             dst,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW,
             mode & 0o7777,
         )
     };
@@ -248,8 +292,13 @@ fn remove_tree(path: *const c_char) -> c_int {
         return unsafe { unlink(path) };
     }
 
-    let dir = unsafe { opendir(path) };
+    let fd = unsafe { libc::open(path, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW) };
+    if fd < 0 {
+        return -1;
+    }
+    let dir = unsafe { libc::fdopendir(fd) };
     if dir.is_null() {
+        unsafe { libc::close(fd) };
         return -1;
     }
 
