@@ -116,6 +116,7 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
         id: spec.id.clone(),
         container_dir,
         merged: merged.clone(),
+        layer_dirs: Vec::new(),
         overlay_mounted: false,
         rootless: spec.rootless,
         _lock: lock_file,
@@ -135,6 +136,23 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
             )
         })
         .collect();
+
+    // Validate all layer dirs exist before mounting overlay.
+    for dir in &layer_dirs {
+        if !dir.exists() {
+            bail!(
+                "layer directory missing: {} — image may need re-pulling",
+                dir.display()
+            );
+        }
+    }
+
+    // Place in-use markers so GC won't prune layers while we're using them.
+    for dir in &layer_dirs {
+        let marker = dir.join(".in-use");
+        let _ = std::fs::write(&marker, spec.id.as_bytes());
+    }
+    cleanup.layer_dirs = layer_dirs.clone();
 
     rootfs::mount_overlay(&layer_dirs, &upper, &work, &merged).with_context(|| {
         if spec.rootless {
@@ -426,6 +444,7 @@ struct CleanupGuard {
     id: String,
     container_dir: PathBuf,
     merged: PathBuf,
+    layer_dirs: Vec<PathBuf>,
     overlay_mounted: bool,
     rootless: bool,
     _lock: Flock<File>,
@@ -439,6 +458,10 @@ impl Drop for CleanupGuard {
         if self.overlay_mounted {
             let _ = mounts::cleanup_host_device_sources(&self.merged);
             let _ = rootfs::unmount_overlay(&self.merged);
+        }
+        // Remove in-use markers so GC can prune these layers if orphaned.
+        for dir in &self.layer_dirs {
+            let _ = std::fs::remove_file(dir.join(".in-use"));
         }
         let _ = std::fs::remove_dir_all(&self.container_dir);
     }
