@@ -75,7 +75,9 @@ pub(super) fn run_container(mut config: ChildConfig, stop_signal: &str) -> Resul
                 "KILL" => Signal::SIGKILL,
                 _ => Signal::SIGTERM,
             };
-            let exit_code = parent_wait(child, stop_signal)?;
+            let exit_code = parent_wait(child, || {
+                let _ = signal::kill(child, stop_signal);
+            })?;
 
             // Clean up pasta on container exit.
             if let Some(mut pasta) = pasta_child {
@@ -113,7 +115,7 @@ pub(super) fn run_container(mut config: ChildConfig, stop_signal: &str) -> Resul
     }
 }
 
-pub(crate) fn parent_wait(child: Pid, stop_signal: Signal) -> Result<i32> {
+pub(crate) fn parent_wait(child: Pid, forward: impl Fn()) -> Result<i32> {
     unsafe {
         signal::signal(
             Signal::SIGINT,
@@ -133,7 +135,7 @@ pub(crate) fn parent_wait(child: Pid, stop_signal: Signal) -> Result<i32> {
             Ok(WaitStatus::Signaled(_, sig, _)) => return Ok(128 + sig as i32),
             Err(nix::errno::Errno::EINTR) => {
                 if PENDING_SIGNAL.swap(0, std::sync::atomic::Ordering::SeqCst) != 0 {
-                    let _ = signal::kill(child, stop_signal);
+                    forward();
                 }
             }
             Err(err) => return Err(err.into()),

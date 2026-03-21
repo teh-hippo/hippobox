@@ -1,12 +1,11 @@
 use anyhow::{Context, Result, bail};
 use nix::sys::signal::{self, Signal};
-use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{self, ForkResult};
 use std::ffi::CString;
 use std::os::fd::FromRawFd;
 use std::path::Path;
 
-use super::process::{PENDING_SIGNAL, ChildConfig, note_pending_signal, to_cstrings};
+use super::process::{ChildConfig, to_cstrings};
 
 pub fn container_init(config_fd: i32) -> Result<()> {
     let pipe_file = unsafe { std::fs::File::from_raw_fd(config_fd) };
@@ -65,25 +64,11 @@ pub fn container_init(config_fd: i32) -> Result<()> {
     match unsafe { unistd::fork() }.context("PID namespace fork failed")? {
         ForkResult::Parent { child } => {
             // Intermediate: forward signals and propagate child's exit code.
-            unsafe {
-                signal::signal(Signal::SIGINT, signal::SigHandler::Handler(note_pending_signal))
-                    .ok();
-                signal::signal(Signal::SIGTERM, signal::SigHandler::Handler(note_pending_signal))
-                    .ok();
-            }
-            loop {
-                match waitpid(child, None) {
-                    Ok(WaitStatus::Exited(_, code)) => std::process::exit(code),
-                    Ok(WaitStatus::Signaled(_, sig, _)) => std::process::exit(128 + sig as i32),
-                    Err(nix::errno::Errno::EINTR) => {
-                        if PENDING_SIGNAL.swap(0, std::sync::atomic::Ordering::SeqCst) != 0 {
-                            let _ = signal::kill(child, Signal::SIGTERM);
-                        }
-                        continue;
-                    }
-                    _ => std::process::exit(1),
-                }
-            }
+            let code = super::process::parent_wait(child, || {
+                let _ = signal::kill(child, Signal::SIGTERM);
+            })
+            .unwrap_or(1);
+            std::process::exit(code);
         }
         ForkResult::Child => {
             // PID 1 in the new namespace. Re-arm death signal (cleared by fork)
@@ -148,9 +133,9 @@ fn setup_user(user_str: &str, rootless: bool) -> Result<Option<String>> {
     }
 
     let (uid, gid) = match user_str.split_once(':') {
-        Some((u, g)) => (resolve_uid(u)?, resolve_gid(g)?),
+        Some((u, g)) => (resolve_id(u, "/etc/passwd", "user")?, resolve_id(g, "/etc/group", "group")?),
         None => {
-            let uid = resolve_uid(user_str)?;
+            let uid = resolve_id(user_str, "/etc/passwd", "user")?;
             // When no group specified, look up the user's primary group from /etc/passwd.
             let gid = passwd_field_by_uid(uid, 3)
                 .and_then(|g| g.parse::<u32>().ok())
@@ -172,20 +157,11 @@ fn setup_user(user_str: &str, rootless: bool) -> Result<Option<String>> {
     Ok(Some(home))
 }
 
-fn resolve_uid(s: &str) -> Result<u32> {
-    if let Ok(uid) = s.parse::<u32>() {
-        return Ok(uid);
-    }
-    resolve_name_to_id("/etc/passwd", 0, 2, s)
-        .with_context(|| format!("user not found in /etc/passwd: {s}"))
-}
-
-fn resolve_gid(s: &str) -> Result<u32> {
-    if let Ok(gid) = s.parse::<u32>() {
-        return Ok(gid);
-    }
-    resolve_name_to_id("/etc/group", 0, 2, s)
-        .with_context(|| format!("group not found in /etc/group: {s}"))
+fn resolve_id(s: &str, file: &str, label: &str) -> Result<u32> {
+    s.parse::<u32>().or_else(|_| {
+        resolve_name_to_id(file, 0, 2, s)
+            .with_context(|| format!("{label} not found in {file}: {s}"))
+    })
 }
 
 /// Look up a field by name match in a colon-separated file (passwd/group).
@@ -241,15 +217,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_uid_numeric() {
-        assert_eq!(resolve_uid("0").unwrap(), 0);
-        assert_eq!(resolve_uid("1000").unwrap(), 1000);
-        assert_eq!(resolve_uid("65534").unwrap(), 65534);
-    }
-
-    #[test]
-    fn resolve_gid_numeric() {
-        assert_eq!(resolve_gid("0").unwrap(), 0);
-        assert_eq!(resolve_gid("999").unwrap(), 999);
+    fn resolve_id_numeric() {
+        assert_eq!(resolve_id("0", "/etc/passwd", "user").unwrap(), 0);
+        assert_eq!(resolve_id("1000", "/etc/passwd", "user").unwrap(), 1000);
+        assert_eq!(resolve_id("65534", "/etc/group", "group").unwrap(), 65534);
     }
 }

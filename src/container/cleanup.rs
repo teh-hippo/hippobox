@@ -77,19 +77,15 @@ fn gc_try_clean_container(container_dir: &Path) -> Result<()> {
         // Unmount device bind mounts first (children before parent).
         let _ = super::mounts::cleanup_host_device_sources(&merged);
 
-        // Try non-detach overlay unmount. If EBUSY, an orphaned container process
-        // is still rooted there — don't remove the directory.
+        // Try non-detach overlay unmount.
+        // EINVAL: not mounted. ENOENT: path gone. EPERM: rootless user namespace mount.
         match nix::mount::umount2(&merged, nix::mount::MntFlags::empty()) {
-            Ok(_) => {}
-            Err(
+            Ok(_)
+            | Err(
                 nix::errno::Errno::EINVAL
                 | nix::errno::Errno::ENOENT
                 | nix::errno::Errno::EPERM,
-            ) => {
-                // EINVAL: not mounted. ENOENT: path gone. EPERM: not privileged
-                // (rootless container mounts live in a user namespace and aren't
-                // visible here). All fine — just remove the dir.
-            }
+            ) => {}
             Err(nix::errno::Errno::EBUSY) => {
                 eprintln!(
                     "warning: overlay still busy for {}, skipping",
@@ -100,9 +96,7 @@ fn gc_try_clean_container(container_dir: &Path) -> Result<()> {
                 );
                 return Ok(());
             }
-            Err(e) => {
-                return Err(e).context("failed to unmount stale overlay");
-            }
+            Err(e) => return Err(e).context("failed to unmount stale overlay"),
         }
     }
 
@@ -147,24 +141,19 @@ impl Drop for CleanupGuard {
         if !self.rootless {
             let _ = super::cgroups::cleanup(&self.id);
         }
-        if self.overlay_mounted {
+        let can_remove = if self.overlay_mounted {
             let _ = super::mounts::cleanup_host_device_sources(&self.merged);
-            if super::rootfs::unmount_overlay(&self.merged).is_err() {
-                // Overlay still mounted — don't remove the directory or we'd
-                // descend into the live overlay. GC will handle it later.
-                for dir in &self.layer_dirs {
-                    let _ = std::fs::remove_file(dir.join(".in-use"));
-                }
-                return;
-            }
-        }
-        // Remove in-use markers so GC can prune these layers if orphaned.
+            super::rootfs::unmount_overlay(&self.merged).is_ok()
+        } else {
+            true
+        };
         for dir in &self.layer_dirs {
             let _ = std::fs::remove_file(dir.join(".in-use"));
         }
-        // Fix overlayfs work dir permissions before removal.
-        fix_overlay_workdir(&self.container_dir);
-        let _ = std::fs::remove_dir_all(&self.container_dir);
+        if can_remove {
+            fix_overlay_workdir(&self.container_dir);
+            let _ = std::fs::remove_dir_all(&self.container_dir);
+        }
     }
 }
 

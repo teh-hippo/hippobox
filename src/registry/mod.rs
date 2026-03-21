@@ -63,32 +63,7 @@ impl RegistryClient {
 
         // Auto-prune: remove old layers that are no longer referenced by any image.
         if let Some(ref old) = old_stored {
-            let new_digests: std::collections::HashSet<&str> =
-                stored.manifest.layers.iter().map(|l| l.digest.as_str()).collect();
-            let orphaned: Vec<&str> = old.manifest.layers.iter()
-                .map(|l| l.digest.as_str())
-                .filter(|d| !new_digests.contains(d))
-                .collect();
-
-            if !orphaned.is_empty() {
-                let all_referenced = collect_all_referenced_layers(base_dir)?;
-                for digest in orphaned {
-                    if all_referenced.contains(digest) {
-                        continue;
-                    }
-                    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
-                    let layer_dir = base_dir.join("layers/sha256").join(hex);
-                    if layer_dir.exists() {
-                        if layer_dir.join(".in-use").exists() {
-                            continue;
-                        }
-                        fs::remove_dir_all(&layer_dir).with_context(|| {
-                            format!("failed to prune old layer {}", &hex[..hex.len().min(12)])
-                        })?;
-                        eprintln!("  pruned old layer {}", &hex[..hex.len().min(12)]);
-                    }
-                }
-            }
+            auto_prune_layers(old, &stored, base_dir)?;
         }
 
         Ok(stored)
@@ -278,6 +253,34 @@ impl RegistryClient {
 
         Ok(resp)
     }
+}
+
+/// Remove layers from `old` that are no longer referenced by `new` or any other stored image.
+fn auto_prune_layers(old: &StoredImage, new: &StoredImage, base_dir: &Path) -> Result<()> {
+    let new_digests: std::collections::HashSet<&str> =
+        new.manifest.layers.iter().map(|l| l.digest.as_str()).collect();
+    let orphaned: Vec<&str> = old.manifest.layers.iter()
+        .map(|l| l.digest.as_str())
+        .filter(|d| !new_digests.contains(d))
+        .collect();
+    if orphaned.is_empty() {
+        return Ok(());
+    }
+    let all_referenced = collect_all_referenced_layers(base_dir)?;
+    for digest in orphaned {
+        if all_referenced.contains(digest) {
+            continue;
+        }
+        let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+        let layer_dir = base_dir.join("layers/sha256").join(hex);
+        if layer_dir.exists() && !layer_dir.join(".in-use").exists() {
+            fs::remove_dir_all(&layer_dir).with_context(|| {
+                format!("failed to prune old layer {}", &hex[..hex.len().min(12)])
+            })?;
+            eprintln!("  pruned old layer {}", &hex[..hex.len().min(12)]);
+        }
+    }
+    Ok(())
 }
 
 /// Collect all layer digests referenced by any stored image manifest.

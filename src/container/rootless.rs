@@ -1,22 +1,15 @@
 use anyhow::{Context, Result};
-use nix::sys::signal::{self, Signal};
-use nix::sys::wait::WaitStatus;
 use nix::unistd::Pid;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
-use std::sync::atomic::{AtomicU8, Ordering};
 
 pub(super) fn run_rootless_unshare(spec: super::ContainerSpec) -> Result<i32> {
     let exe = super::resolve_self_exe()?;
 
     let has_ports = !spec.port_mappings.is_empty();
     let isolate_network = spec.network_mode == super::net::NetworkMode::None || has_ports;
-
-    if has_ports {
-        super::net::check_pasta()?;
-    }
 
     // Pass the spec over a dedicated pipe so stdin stays connected to the
     // terminal/caller for the container process (needed by MCP stdio, etc).
@@ -29,14 +22,7 @@ pub(super) fn run_rootless_unshare(spec: super::ContainerSpec) -> Result<i32> {
         if nix::libc::setpgid(0, 0) != 0 {
             return Err(io::Error::last_os_error());
         }
-        let ret = nix::libc::prctl(
-            nix::libc::PR_SET_PDEATHSIG,
-            nix::libc::SIGTERM as nix::libc::c_ulong,
-            0, 0, 0,
-        );
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        super::set_pdeathsig()?;
         // Ensure the spec pipe read fd survives across exec.
         nix::libc::fcntl(spec_read_raw, nix::libc::F_SETFD, 0);
         // Close write end so the child doesn't keep it open (would prevent EOF).
@@ -88,41 +74,10 @@ pub(super) fn run_rootless_unshare(spec: super::ContainerSpec) -> Result<i32> {
             .context("failed to send rootless bootstrap spec")?;
     }
 
-    unsafe {
-        signal::signal(
-            Signal::SIGINT,
-            signal::SigHandler::Handler(note_rootless_signal),
-        )
-        .context("failed to install rootless SIGINT handler")?;
-        signal::signal(
-            Signal::SIGTERM,
-            signal::SigHandler::Handler(note_rootless_signal),
-        )
-        .context("failed to install rootless SIGTERM handler")?;
-    }
-
-    // Use blocking waitpid instead of polling try_wait+sleep.
-    // waitpid returns EINTR when our signal handler fires, letting us
-    // forward signals immediately without a 50ms poll delay.
     let child_pid = Pid::from_raw(child.id() as i32);
     std::mem::forget(child);
-    loop {
-        match nix::sys::wait::waitpid(child_pid, None) {
-            Ok(WaitStatus::Exited(_, code)) => return Ok(code),
-            Ok(WaitStatus::Signaled(_, sig, _)) => return Ok(128 + sig as i32),
-            Err(nix::errno::Errno::EINTR) => {
-                if ROOTLESS_PENDING_SIGNAL.swap(0, Ordering::SeqCst) != 0 {
-                    let _ = unsafe { nix::libc::kill(-child_pid.as_raw(), nix::libc::SIGTERM) };
-                }
-            }
-            Err(err) => return Err(err).context("failed to wait for unshare"),
-            _ => continue,
-        }
-    }
-}
-
-static ROOTLESS_PENDING_SIGNAL: AtomicU8 = AtomicU8::new(0);
-
-extern "C" fn note_rootless_signal(_: nix::libc::c_int) {
-    ROOTLESS_PENDING_SIGNAL.store(1, Ordering::SeqCst);
+    super::process::parent_wait(child_pid, || {
+        let _ = unsafe { nix::libc::kill(-child_pid.as_raw(), nix::libc::SIGTERM) };
+    })
+    .context("failed to wait for unshare")
 }

@@ -68,16 +68,14 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
         .and_then(|c| c.user.clone())
         .filter(|u| !u.is_empty());
 
-    let entrypoint = container_config.and_then(|c| c.entrypoint.as_deref());
     let tail: Vec<String> = if spec.user_cmd.is_empty() {
         container_config
-            .and_then(|c| c.cmd.as_deref())
-            .map(|c| c.to_vec())
+            .and_then(|c| c.cmd.clone())
             .unwrap_or_default()
     } else {
         spec.user_cmd
     };
-    let argv: Vec<String> = match entrypoint {
+    let argv: Vec<String> = match container_config.and_then(|c| c.entrypoint.as_deref()) {
         Some(ep) => ep.iter().cloned().chain(tail).collect(),
         None => tail,
     };
@@ -94,7 +92,7 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
         });
     // Ensure HOME and TERM have sensible defaults (image env or user -e can override).
     for (key, default) in [("HOME", "/root"), ("TERM", "xterm")] {
-        if !env_has_key(&env_vars, key) {
+        if env_find_mut(&mut env_vars, key).is_none() {
             env_vars.push(format!("{key}={default}"));
         }
     }
@@ -256,11 +254,6 @@ fn apply_env_overrides(mut env_vars: Vec<String>, overrides: &[String]) -> Resul
         }
     }
     Ok(env_vars)
-}
-
-/// Check if an env var list contains a given key.
-fn env_has_key(vars: &[String], key: &str) -> bool {
-    vars.iter().any(|v| v.split_once('=').is_some_and(|(k, _)| k == key))
 }
 
 /// Find a mutable reference to an env var by key.

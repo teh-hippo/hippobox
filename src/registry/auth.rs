@@ -38,7 +38,6 @@ fn fetch_anonymous_token(agent: &ureq::Agent, image_ref: &ImageRef) -> Result<St
     let www_auth = resp
         .headers()
         .get("Www-Authenticate")
-        .or_else(|| resp.headers().get("www-authenticate"))
         .context("no Www-Authenticate header in 401 response")?
         .to_str()
         .context("invalid Www-Authenticate header encoding")?

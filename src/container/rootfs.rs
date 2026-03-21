@@ -50,13 +50,10 @@ pub(super) fn mount_overlay(
         MsFlags::empty(),
         Some(base_options.as_str()),
     )
-    .context("failed to mount overlayfs")?;
-
-    Ok(())
+    .context("failed to mount overlayfs")
 }
 
 /// Unmount overlayfs.
 pub(super) fn unmount_overlay(merged: &Path) -> Result<()> {
-    umount2(merged, MntFlags::MNT_DETACH).context("failed to unmount overlayfs")?;
-    Ok(())
+    umount2(merged, MntFlags::MNT_DETACH).context("failed to unmount overlayfs")
 }

@@ -15,15 +15,13 @@ pub(super) fn create(container_id: &str) -> Result<()> {
     std::fs::create_dir_all(CGROUP_BASE)
         .with_context(|| format!("failed to create cgroup base at {CGROUP_BASE}"))?;
     std::fs::create_dir_all(cgroup_path(container_id))
-        .with_context(|| format!("failed to create cgroup for {container_id}"))?;
-    Ok(())
+        .with_context(|| format!("failed to create cgroup for {container_id}"))
 }
 
 pub(super) fn add_pid(container_id: &str, pid: u32) -> Result<()> {
     let procs_path = format!("{}/cgroup.procs", cgroup_path(container_id));
     std::fs::write(&procs_path, pid.to_string())
-        .with_context(|| format!("failed to write PID to {procs_path}"))?;
-    Ok(())
+        .with_context(|| format!("failed to write PID to {procs_path}"))
 }
 
 pub(super) fn cleanup(container_id: &str) -> Result<()> {

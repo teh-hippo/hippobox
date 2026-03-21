@@ -3,160 +3,86 @@
 compile_error!("seccomp filter only supports x86_64; add syscall numbers for your arch");
 
 use anyhow::{Context, Result};
-use seccompiler::{
-    BpfProgram, SeccompAction, SeccompFilter,
-    TargetArch,
-};
+use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
 use std::collections::BTreeMap;
 
-/// Blocked syscalls matching Docker's default seccomp profile.
+/// Blocked syscalls (name + x86_64 number) matching Docker's default seccomp profile.
 /// Default action is ALLOW; these specific syscalls are blocked with EPERM.
-const BLOCKED_SYSCALLS: &[&str] = &[
-    "acct",
-    "add_key",
-    "bpf",
-    "clock_adjtime",
-    "clock_settime",
-    "create_module",
-    "delete_module",
-    "finit_module",
-    "fsconfig",
-    "fsmount",
-    "fsopen",
-    "get_kernel_syms",
-    "get_mempolicy",
-    "init_module",
-    "io_setup",
-    "io_uring_enter",
-    "io_uring_register",
-    "io_uring_setup",
-    "ioperm",
-    "iopl",
-    "kcmp",
-    "kexec_file_load",
-    "kexec_load",
-    "keyctl",
-    "lookup_dcookie",
-    "mbind",
-    "mount",
-    "mount_setattr",
-    "move_mount",
-    "move_pages",
-    "nfsservctl",
-    "open_by_handle_at",
-    "open_tree",
-    "perf_event_open",
-    "personality",
-    "pidfd_open",
-    "pivot_root",
-    "process_vm_readv",
-    "process_vm_writev",
-    "ptrace",
-    "query_module",
-    "quotactl",
-    "reboot",
-    "request_key",
-    "set_mempolicy",
-    "setns",
-    "settimeofday",
-    "swapon",
-    "swapoff",
-    "sysfs",
-    "syslog",
-    "umount2",
-    "unshare",
-    "uselib",
-    "userfaultfd",
-    "ustat",
+const BLOCKED_SYSCALLS: &[(&str, i64)] = &[
+    ("acct", 163),
+    ("add_key", 248),
+    ("bpf", 321),
+    ("clock_adjtime", 305),
+    ("clock_settime", 227),
+    ("create_module", 174),
+    ("delete_module", 176),
+    ("finit_module", 313),
+    ("fsconfig", 431),
+    ("fsmount", 432),
+    ("fsopen", 430),
+    ("get_kernel_syms", 177),
+    ("get_mempolicy", 239),
+    ("init_module", 175),
+    ("io_setup", 206),
+    ("io_uring_enter", 426),
+    ("io_uring_register", 427),
+    ("io_uring_setup", 425),
+    ("ioperm", 173),
+    ("iopl", 172),
+    ("kcmp", 312),
+    ("kexec_file_load", 320),
+    ("kexec_load", 246),
+    ("keyctl", 250),
+    ("lookup_dcookie", 212),
+    ("mbind", 237),
+    ("mount", 165),
+    ("mount_setattr", 442),
+    ("move_mount", 429),
+    ("move_pages", 279),
+    ("nfsservctl", 180),
+    ("open_by_handle_at", 304),
+    ("open_tree", 428),
+    ("perf_event_open", 298),
+    ("personality", 135),
+    ("pidfd_open", 434),
+    ("pivot_root", 155),
+    ("process_vm_readv", 310),
+    ("process_vm_writev", 311),
+    ("ptrace", 101),
+    ("query_module", 178),
+    ("quotactl", 179),
+    ("reboot", 169),
+    ("request_key", 249),
+    ("set_mempolicy", 238),
+    ("setns", 308),
+    ("settimeofday", 164),
+    ("swapon", 167),
+    ("swapoff", 168),
+    ("sysfs", 139),
+    ("syslog", 103),
+    ("umount2", 166),
+    ("unshare", 272),
+    ("uselib", 134),
+    ("userfaultfd", 323),
+    ("ustat", 136),
 ];
 
 /// Build and install a seccomp BPF filter blocking dangerous syscalls.
 /// Must be called after PR_SET_NO_NEW_PRIVS and before execvpe.
 pub(super) fn apply_seccomp_filter() -> Result<()> {
-    let mut rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = BTreeMap::new();
-
-    for name in BLOCKED_SYSCALLS {
-        if let Some(nr) = syscall_number(name) {
-            // Empty rule vec = unconditional match -> triggers match_action (EPERM).
-            rules.insert(nr, vec![]);
-        }
-    }
+    let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
+        BLOCKED_SYSCALLS.iter().map(|&(_, nr)| (nr, vec![])).collect();
 
     let filter = SeccompFilter::new(
         rules,
-        SeccompAction::Allow,   // default for unmatched syscalls
-        SeccompAction::Errno(1), // EPERM for blocked syscalls
+        SeccompAction::Allow,
+        SeccompAction::Errno(1),
         TargetArch::x86_64,
     )
     .context("failed to build seccomp filter")?;
 
     let prog: BpfProgram = filter.try_into().context("failed to compile BPF program")?;
-    seccompiler::apply_filter(&prog).context("failed to install seccomp filter")?;
-
-    Ok(())
-}
-
-fn syscall_number(name: &str) -> Option<i64> {
-    // x86_64 syscall numbers. Only includes syscalls we block.
-    Some(match name {
-        "acct" => 163,
-        "add_key" => 248,
-        "bpf" => 321,
-        "clock_adjtime" => 305,
-        "clock_settime" => 227,
-        "create_module" => 174,
-        "delete_module" => 176,
-        "finit_module" => 313,
-        "fsconfig" => 431,
-        "fsmount" => 432,
-        "fsopen" => 430,
-        "get_kernel_syms" => 177,
-        "get_mempolicy" => 239,
-        "init_module" => 175,
-        "io_setup" => 206,
-        "io_uring_enter" => 426,
-        "io_uring_register" => 427,
-        "io_uring_setup" => 425,
-        "ioperm" => 173,
-        "iopl" => 172,
-        "kcmp" => 312,
-        "kexec_file_load" => 320,
-        "kexec_load" => 246,
-        "keyctl" => 250,
-        "lookup_dcookie" => 212,
-        "mbind" => 237,
-        "mount" => 165,
-        "mount_setattr" => 442,
-        "move_mount" => 429,
-        "move_pages" => 279,
-        "nfsservctl" => 180,
-        "open_by_handle_at" => 304,
-        "open_tree" => 428,
-        "perf_event_open" => 298,
-        "personality" => 135,
-        "pidfd_open" => 434,
-        "pivot_root" => 155,
-        "process_vm_readv" => 310,
-        "process_vm_writev" => 311,
-        "ptrace" => 101,
-        "query_module" => 178,
-        "quotactl" => 179,
-        "reboot" => 169,
-        "request_key" => 249,
-        "set_mempolicy" => 238,
-        "setns" => 308,
-        "settimeofday" => 164,
-        "swapon" => 167,
-        "swapoff" => 168,
-        "sysfs" => 139,
-        "syslog" => 103,
-        "umount2" => 166,
-        "unshare" => 272,
-        "uselib" => 134,
-        "userfaultfd" => 323,
-        "ustat" => 136,
-        _ => return None,
-    })
+    seccompiler::apply_filter(&prog).context("failed to install seccomp filter")
 }
 
 #[cfg(test)]
@@ -164,40 +90,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_blocked_syscalls_have_numbers() {
-        for name in BLOCKED_SYSCALLS {
-            assert!(
-                syscall_number(name).is_some(),
-                "BLOCKED_SYSCALLS entry {name:?} has no syscall number mapping"
-            );
-        }
-    }
-
-    #[test]
     fn no_duplicate_syscall_numbers() {
         let mut seen = std::collections::HashSet::new();
-        for name in BLOCKED_SYSCALLS {
-            if let Some(nr) = syscall_number(name) {
-                assert!(
-                    seen.insert(nr),
-                    "duplicate syscall number {nr} for {name:?}"
-                );
-            }
+        for &(name, nr) in BLOCKED_SYSCALLS {
+            assert!(seen.insert(nr), "duplicate syscall number {nr} for {name:?}");
         }
-    }
-
-    #[test]
-    fn unknown_syscall_returns_none() {
-        assert_eq!(syscall_number("not_a_real_syscall"), None);
-        assert_eq!(syscall_number(""), None);
     }
 
     #[test]
     fn spot_check_syscall_numbers() {
-        assert_eq!(syscall_number("mount"), Some(165));
-        assert_eq!(syscall_number("ptrace"), Some(101));
-        assert_eq!(syscall_number("reboot"), Some(169));
-        assert_eq!(syscall_number("bpf"), Some(321));
-        assert_eq!(syscall_number("unshare"), Some(272));
+        let lookup = |name| BLOCKED_SYSCALLS.iter().find(|(n, _)| *n == name).map(|(_, nr)| *nr);
+        assert_eq!(lookup("mount"), Some(165));
+        assert_eq!(lookup("ptrace"), Some(101));
+        assert_eq!(lookup("reboot"), Some(169));
+        assert_eq!(lookup("bpf"), Some(321));
+        assert_eq!(lookup("unshare"), Some(272));
     }
 }

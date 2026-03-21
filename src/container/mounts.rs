@@ -209,7 +209,18 @@ fn mount_dev() -> Result<()> {
     )?;
 
     for &name in REQUIRED_DEVICES {
-        bind_host_device(name)?;
+        let source = format!("/.hippobox-dev/{name}");
+        let target = format!("/dev/{name}");
+        File::create(&target)
+            .with_context(|| format!("failed to create device placeholder at {target}"))?;
+        mount(
+            Some(source.as_str()),
+            target.as_str(),
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .with_context(|| format!("failed to bind-mount {source} onto {target}"))?;
     }
 
     for &(target, link_path) in &[
@@ -236,23 +247,6 @@ pub(super) fn mount_fs(
 ) -> Result<()> {
     fs::create_dir_all(target)?;
     mount(Some(source), target, Some(fstype), flags, options).context(context)?;
-    Ok(())
-}
-
-fn bind_host_device(name: &str) -> Result<()> {
-    let source = format!("/.hippobox-dev/{name}");
-    let target = format!("/dev/{name}");
-    File::create(&target)
-        .with_context(|| format!("failed to create device placeholder at {target}"))?;
-
-    mount(
-        Some(source.as_str()),
-        target.as_str(),
-        None::<&str>,
-        MsFlags::MS_BIND,
-        None::<&str>,
-    )
-    .with_context(|| format!("failed to bind-mount {source} onto {target}"))?;
     Ok(())
 }
 
