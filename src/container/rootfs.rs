@@ -3,34 +3,52 @@ use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use std::path::{Path, PathBuf};
 
 /// Mount overlayfs with the given lower layers, upper dir, work dir, and merge point.
+/// When `rootless` is true, attempts `redirect_dir=on` first (needed for directory
+/// renames in unprivileged overlayfs), falling back without it if the kernel rejects it.
 pub fn mount_overlay(
     lower_dirs: &[PathBuf],
     upper: &Path,
     work: &Path,
     merged: &Path,
+    rootless: bool,
 ) -> Result<()> {
     use std::fmt::Write;
-    let mut options = String::with_capacity(256);
-    options.push_str("lowerdir=");
+    let mut base_options = String::with_capacity(256);
+    base_options.push_str("lowerdir=");
     for (i, p) in lower_dirs.iter().enumerate() {
         if i > 0 {
-            options.push(':');
+            base_options.push(':');
         }
-        let _ = write!(options, "{}", p.display());
+        let _ = write!(base_options, "{}", p.display());
     }
     let _ = write!(
-        options,
+        base_options,
         ",upperdir={},workdir={}",
         upper.display(),
         work.display()
     );
+
+    if rootless {
+        let with_redirect = format!("{base_options},redirect_dir=on");
+        if mount(
+            Some("overlay"),
+            merged,
+            Some("overlay"),
+            MsFlags::empty(),
+            Some(with_redirect.as_str()),
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
+    }
 
     mount(
         Some("overlay"),
         merged,
         Some("overlay"),
         MsFlags::empty(),
-        Some(options.as_str()),
+        Some(base_options.as_str()),
     )
     .context("failed to mount overlayfs")?;
 

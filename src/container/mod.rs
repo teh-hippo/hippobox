@@ -154,7 +154,7 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
     }
     cleanup.layer_dirs = layer_dirs.clone();
 
-    rootfs::mount_overlay(&layer_dirs, &upper, &work, &merged).with_context(|| {
+    rootfs::mount_overlay(&layer_dirs, &upper, &work, &merged, spec.rootless).with_context(|| {
         if spec.rootless {
             "overlay mount failed; Linux 5.11+ with unprivileged overlayfs support is required"
         } else {
