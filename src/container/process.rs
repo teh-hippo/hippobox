@@ -150,7 +150,7 @@ extern "C" fn note_pending_signal(_: nix::libc::c_int) {
 
 pub fn container_init(config_fd: i32) -> Result<()> {
     let pipe_file = unsafe { std::fs::File::from_raw_fd(config_fd) };
-    let config: ChildConfig = serde_json::from_reader(std::io::BufReader::new(pipe_file))?;
+    let mut config: ChildConfig = serde_json::from_reader(std::io::BufReader::new(pipe_file))?;
 
     // Create network namespace only if isolation is requested and not already
     // provided (pasta creates the netns externally for port-mapped containers).
@@ -254,8 +254,17 @@ pub fn container_init(config_fd: i32) -> Result<()> {
         }
     }
 
-    if let Some(ref user_str) = config.user {
-        setup_user(user_str, config.rootless)?;
+    if let Some(ref user_str) = config.user
+        && let Some(home) = setup_user(user_str, config.rootless)?
+    {
+        // Update HOME in env_vars for the exec'd process.
+        if let Some(existing) = config.env_vars.iter_mut().find(|v| {
+            v.split_once('=').is_some_and(|(k, _)| k == "HOME")
+        }) {
+            *existing = format!("HOME={home}");
+        } else {
+            config.env_vars.push(format!("HOME={home}"));
+        }
     }
 
     let prctl_ret = unsafe { nix::libc::prctl(nix::libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
@@ -310,10 +319,12 @@ pub(crate) struct ChildConfig {
     pub ready_fd: Option<i32>,
 }
 
-fn setup_user(user_str: &str, rootless: bool) -> Result<()> {
+/// Set up user/group identity. Returns the home directory if it should
+/// override the default HOME in env_vars.
+fn setup_user(user_str: &str, rootless: bool) -> Result<Option<String>> {
     if rootless {
         eprintln!("warning: USER directive ignored in rootless mode ({user_str})");
-        return Ok(());
+        return Ok(None);
     }
 
     let (uid, gid) = match user_str.split_once(':') {
@@ -335,13 +346,10 @@ fn setup_user(user_str: &str, rootless: bool) -> Result<()> {
     nix::unistd::setuid(nix::unistd::Uid::from_raw(uid))
         .context("failed to setuid")?;
 
-    if uid != 0
-        && let Some(home) = passwd_field_by_uid(uid, 5)
-    {
-        // Safe: we're single-threaded in the container init process before exec.
-        unsafe { std::env::set_var("HOME", home) };
-    }
-    Ok(())
+    let home = passwd_field_by_uid(uid, 5).unwrap_or_else(|| {
+        if uid == 0 { "/root".to_string() } else { "/".to_string() }
+    });
+    Ok(Some(home))
 }
 
 fn resolve_uid(s: &str) -> Result<u32> {

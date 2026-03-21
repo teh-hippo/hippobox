@@ -84,13 +84,19 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
         bail!("no CMD or ENTRYPOINT in image config and no command provided");
     }
 
-    let env_vars = container_config
+    let mut env_vars = container_config
         .and_then(|c| c.env.as_deref())
         .filter(|vars| !vars.is_empty())
         .map(|vars| vars.to_vec())
         .unwrap_or_else(|| {
             vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()]
         });
+    // Ensure HOME and TERM have sensible defaults (image env or user -e can override).
+    for (key, default) in [("HOME", "/root"), ("TERM", "xterm")] {
+        if !env_vars.iter().any(|v| v.split_once('=').is_some_and(|(k, _)| k == key)) {
+            env_vars.push(format!("{key}={default}"));
+        }
+    }
     let env_vars = apply_env_overrides(env_vars, &spec.user_env)?;
 
     let container_dir = spec.base_dir.join("containers").join(&spec.id);
