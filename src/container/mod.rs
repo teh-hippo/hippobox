@@ -98,7 +98,7 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
             env_vars.push(format!("{key}={default}"));
         }
     }
-    let env_vars = apply_env_overrides(env_vars, &spec.user_env)?;
+    let mut env_vars = apply_env_overrides(env_vars, &spec.user_env)?;
 
     let container_dir = spec.base_dir.join("containers").join(&spec.id);
     let upper = container_dir.join("upper");
@@ -164,6 +164,19 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
     })?;
     cleanup.overlay_mounted = true;
 
+    // For rootless containers, install the rename shim to work around EXDEV on
+    // unprivileged overlayfs (redirect_dir=nofollow blocks directory renames).
+    if spec.rootless
+        && let Some(shim_path) = find_rename_shim()
+    {
+        let dest_dir = merged.join(".hippobox");
+        let _ = std::fs::create_dir(&dest_dir);
+        let dest = dest_dir.join("rename_shim.so");
+        if std::fs::copy(&shim_path, &dest).is_ok() {
+            env_vars.push("LD_PRELOAD=/.hippobox/rename_shim.so".to_string());
+        }
+    }
+
     mounts::prepare_host_device_sources(&merged)?;
 
     let image = &spec.image_ref;
@@ -192,6 +205,16 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
     };
 
     process::run_container(child_config, stop_signal).context("container execution failed")
+}
+
+/// Locate the rename shim .so next to the hippobox binary.
+fn find_rename_shim() -> Option<PathBuf> {
+    let exe = std::fs::read_link("/proc/self/exe")
+        .or_else(|_| std::env::current_exe())
+        .ok()?;
+    let dir = exe.parent()?;
+    let shim = dir.join("librename_shim.so");
+    shim.exists().then_some(shim)
 }
 
 fn apply_env_overrides(mut env_vars: Vec<String>, overrides: &[String]) -> Result<Vec<String>> {

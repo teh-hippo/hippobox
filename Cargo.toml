@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "shims/rename_shim"]
+
 [package]
 name = "hippobox"
 version = "0.1.0"

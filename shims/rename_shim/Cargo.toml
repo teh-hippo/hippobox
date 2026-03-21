@@ -1,0 +1,11 @@
+[package]
+name = "rename-shim"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "rename_shim"
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2"
