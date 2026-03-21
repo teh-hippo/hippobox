@@ -38,14 +38,17 @@ pub fn setup_container_mounts(rootless: bool) -> Result<()> {
         "failed to mount /dev/pts",
     )?;
     // sysfs may fail in some user namespace configurations — non-fatal.
-    let _ = mount_fs(
-        "/sys",
-        "sysfs",
-        "sysfs",
-        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC | MsFlags::MS_RDONLY,
-        None::<&str>,
-        "failed to mount /sys",
-    );
+    // For rootless, /sys is already bind-mounted from host before pivot_root.
+    if !rootless {
+        let _ = mount_fs(
+            "/sys",
+            "sysfs",
+            "sysfs",
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC | MsFlags::MS_RDONLY,
+            None::<&str>,
+            "failed to mount /sys",
+        );
+    }
 
     Ok(())
 }

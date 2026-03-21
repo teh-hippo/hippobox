@@ -52,6 +52,17 @@ pub fn setup_namespaces_and_pivot(
             None::<&str>,
         )
         .context("failed to stage proc for rootless rootfs")?;
+
+        // Bind-mount host /sys read-only for rootless (fresh sysfs mount fails in userns).
+        let root_sys = new_root.join("sys");
+        fs::create_dir_all(&root_sys)?;
+        let _ = mount(
+            Some("/sys"),
+            &root_sys,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        );
     }
 
     // Mount volumes inside the new mount namespace, before pivot_root.
