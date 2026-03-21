@@ -11,7 +11,7 @@ IMAGE_UBUNTU="docker.io/library/ubuntu:24.04"
 WARMUP=3
 ITERATIONS=15
 SCENARIO_WARMUP=1
-SCENARIO_ITERATIONS=5
+SCENARIO_ITERATIONS=10
 
 # ── colours ──────────────────────────────────────────────────────────
 bold()  { printf '\033[1m%s\033[0m' "$*"; }
