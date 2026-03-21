@@ -10,6 +10,8 @@ IMAGE_REDIS="docker.io/library/redis:latest"
 IMAGE_UBUNTU="docker.io/library/ubuntu:24.04"
 WARMUP=3
 ITERATIONS=15
+SCENARIO_WARMUP=1
+SCENARIO_ITERATIONS=3
 
 # ── colours ──────────────────────────────────────────────────────────
 bold()  { printf '\033[1m%s\033[0m' "$*"; }
@@ -72,6 +74,75 @@ run_bench() {
             return 1
         fi
         times+=("$ms")
+    done
+
+    stats times
+    printf "  %-22s  %6d ms   %6d ms   %6d ms   %6d ms   %6d ms\n" \
+        "$label" "$_min" "$_med" "$_avg" "$_p95" "$_max"
+    eval "${label}_med=$_med"
+}
+
+# Sustained-workload scenario: 30k source files, 50MB data, grep/sed/tar/rename/sha256sum
+# Exercises filesystem I/O, CPU, process spawning, directory renames (EXDEV shim)
+SCENARIO_WORKLOAD='set -e
+i=0; while [ $i -lt 50 ]; do
+  j=0; while [ $j -lt 20 ]; do
+    dir="/tmp/b/s/m${i}/p${j}"; mkdir -p "$dir"
+    k=0; while [ $k -lt 30 ]; do
+      printf "package m%d_p%d\nimport \"fmt\"\nfunc H%d%d%d(s string)string{\nfmt.Println(s)\n" "$i" "$j" "$i" "$j" "$k" > "$dir/f${k}.go"
+      n=1; while [ $n -le 50 ]; do printf "// line %d in %d/%d/%d\n" "$n" "$i" "$j" "$k" >> "$dir/f${k}.go"; n=$((n+1)); done
+      printf "return s\n}\n" >> "$dir/f${k}.go"; k=$((k+1))
+    done; j=$((j+1))
+  done; i=$((i+1))
+done
+mkdir -p /tmp/b/data
+i=1; while [ $i -le 100 ]; do dd if=/dev/urandom bs=1024 count=500 of="/tmp/b/data/d${i}.bin" 2>/dev/null; i=$((i+1)); done
+find /tmp/b/s -name "*.go" | wc -l
+grep -rl "Println" /tmp/b/s | wc -l
+find /tmp/b/s -name "*.go" -exec sed -i "s/Println/Printf/g" {} +
+find /tmp/b/s -name "*.go" -exec sed -i "s/func H/func Process/g" {} +
+find /tmp/b/s -name "*.go" -exec sed -i "s/package m/package mod/g" {} +
+tar czf /tmp/b/a1.tar.gz -C /tmp/b s data
+i=0; while [ $i -lt 50 ]; do mv "/tmp/b/s/m${i}" "/tmp/b/s/x${i}"; i=$((i+1)); done
+find /tmp/b/s -type f -exec sha256sum {} + | wc -l
+sha256sum /tmp/b/data/*.bin | awk "{print \$1}" | sort > /tmp/b/ck1.txt
+mkdir -p /tmp/b/r; tar xzf /tmp/b/a1.tar.gz -C /tmp/b/r
+sha256sum /tmp/b/r/data/*.bin | awk "{print \$1}" | sort > /tmp/b/ck2.txt
+diff /tmp/b/ck1.txt /tmp/b/ck2.txt
+tar czf /tmp/b/a2.tar.gz -C /tmp/b/r s data
+find /tmp/b/s -name "*.go" -exec wc -l {} + | tail -1
+find /tmp/b/r/s -name "*.go" -exec wc -l {} + | tail -1
+rm -rf /tmp/b'
+
+# Run scenario benchmark (seconds, fewer iterations since each run is ~40s)
+run_scenario() {
+    local label="$1"; shift
+    local wu="$1"; shift
+    local iters="$1"; shift
+
+    # Warmup
+    for ((i = 1; i <= wu; i++)); do
+        if ! "$@" >/dev/null 2>&1; then
+            printf "  %-22s %s\n" "$label" "$(red FAILED)"
+            eval "${label}_med=-1"
+            return 1
+        fi
+    done
+
+    # Timed runs
+    local times=()
+    for ((i = 1; i <= iters; i++)); do
+        local start end ms
+        start=$(date +%s%N)
+        if ! "$@" >/dev/null 2>&1; then
+            printf "  %-22s %s\n" "$label" "$(red FAILED)"
+            eval "${label}_med=-1"
+            return 1
+        fi
+        end=$(date +%s%N)
+        ms=$(( (end - start) / 1000000 ))
+        times+=("$ms")
+        printf "    run %d/%d: %d ms\n" "$i" "$iters" "$ms" >&2
     done
 
     stats times
@@ -285,6 +356,20 @@ bench_redis_ping "podman"        "p_redis_ping"  $WARMUP $ITERATIONS || true
 bench_redis_ping "podman_opt"    "po_redis_ping" $WARMUP $ITERATIONS || true
 echo ""
 
+# ── Test 9: Ubuntu sustained workload scenario ──────────────────────
+bold "── ubuntu: sustained workload (~40s: 30k files, grep, sed, tar, rename, sha256) ──"
+echo ""
+printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "min" "median" "avg" "p95" "max"
+printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "───" "──────" "───" "───" "───"
+run_scenario "h_scenario" $SCENARIO_WARMUP $SCENARIO_ITERATIONS \
+    $HIPPOBOX run "$IMAGE_UBUNTU" -- sh -c "$SCENARIO_WORKLOAD"
+run_scenario "p_scenario" $SCENARIO_WARMUP $SCENARIO_ITERATIONS \
+    podman run --rm "$IMAGE_UBUNTU" sh -c "$SCENARIO_WORKLOAD"
+run_scenario "po_scenario" $SCENARIO_WARMUP $SCENARIO_ITERATIONS \
+    podman --events-backend=none run --rm --log-driver=none --cgroups=no-conmon --network=none \
+    "$IMAGE_UBUNTU" sh -c "$SCENARIO_WORKLOAD"
+echo ""
+
 # ── Summary ──────────────────────────────────────────────────────────
 echo ""
 bold "╔════════════════════════════════════════════════════════════════════════╗"
@@ -324,6 +409,31 @@ summary_row "ubuntu cat"        "h_ubuntu_cat_med"    "p_ubuntu_cat_med"    "po_
 summary_row "ubuntu dir-rename" "h_ubuntu_rename_med" "p_ubuntu_rename_med" "po_ubuntu_rename_med"
 summary_row "ubuntu dpkg"       "h_ubuntu_dpkg_med"   "p_ubuntu_dpkg_med"   "po_ubuntu_dpkg_med"
 summary_row "redis PING"        "h_redis_ping_med"    "p_redis_ping_med"    "po_redis_ping_med"
+
+# Scenario uses seconds for display
+summary_row_s() {
+    local name=$1 hvar=$2 pvar=$3 povar=$4
+    local h=${!hvar:--1} p=${!pvar:--1} po=${!povar:--1}
+
+    local r1="—" r2="—"
+    if [ "$h" -gt 0 ] && [ "$p" -gt 0 ]; then
+        local pct=$((h * 100 / p))
+        if [ "$pct" -le 105 ]; then r1="$(green "${pct}%")"; else r1="$(red "${pct}%")"; fi
+    fi
+    if [ "$h" -gt 0 ] && [ "$po" -gt 0 ]; then
+        local pct=$((h * 100 / po))
+        if [ "$pct" -le 105 ]; then r2="$(green "${pct}%")"; else r2="$(red "${pct}%")"; fi
+    fi
+
+    local hs="—" ps="—" pos="—"
+    if [ "$h" -gt 0 ]; then hs="$(( h / 1000 )).$(( h % 1000 / 100 ))s"; fi
+    if [ "$p" -gt 0 ]; then ps="$(( p / 1000 )).$(( p % 1000 / 100 ))s"; fi
+    if [ "$po" -gt 0 ]; then pos="$(( po / 1000 )).$(( po % 1000 / 100 ))s"; fi
+
+    printf "  %-24s %10s %12s %12s %10s %10s\n" "$name" "$hs" "$ps" "$pos" "$r1" "$r2"
+}
+
+summary_row_s "scenario (sustained)" "h_scenario_med"      "p_scenario_med"      "po_scenario_med"
 
 echo ""
 echo "  h/p  = hippobox / podman (default)    — lower % = hippobox faster"

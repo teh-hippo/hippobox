@@ -77,7 +77,9 @@ bench/run.sh
 ```
 
 Compares hippobox vs podman (default) vs podman (optimised) across busybox,
-redis, and ubuntu workloads.
+redis, and ubuntu workloads. Includes a sustained-workload scenario (~40s per
+run: 30,000 source files, 50MB data, grep/sed/tar/rename/sha256sum) to verify
+zero container overhead beyond startup.
 
 ## TODO
 
