@@ -196,6 +196,64 @@ pub fn container_init(config_fd: i32) -> Result<()> {
     write!(f, "127.0.0.1\tlocalhost\n::1\tlocalhost\n127.0.0.1\t{hostname}\n")
         .context("failed to write /etc/hosts")?;
 
+    // Create PID namespace so the container command runs as PID 1.
+    // unshare(CLONE_NEWPID) affects children only, so we fork immediately
+    // after — the child becomes PID 1 in the new namespace.
+    nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWPID)
+        .context("failed to create PID namespace")?;
+
+    match unsafe { unistd::fork() }.context("PID namespace fork failed")? {
+        ForkResult::Parent { child } => {
+            // Intermediate: forward signals and propagate child's exit code.
+            unsafe {
+                signal::signal(Signal::SIGINT, signal::SigHandler::Handler(note_pending_signal))
+                    .ok();
+                signal::signal(Signal::SIGTERM, signal::SigHandler::Handler(note_pending_signal))
+                    .ok();
+            }
+            loop {
+                match waitpid(child, None) {
+                    Ok(WaitStatus::Exited(_, code)) => std::process::exit(code),
+                    Ok(WaitStatus::Signaled(_, sig, _)) => std::process::exit(128 + sig as i32),
+                    Err(nix::errno::Errno::EINTR) => {
+                        if PENDING_SIGNAL.swap(0, std::sync::atomic::Ordering::SeqCst) != 0 {
+                            let _ = signal::kill(child, Signal::SIGTERM);
+                        }
+                        continue;
+                    }
+                    _ => std::process::exit(1),
+                }
+            }
+        }
+        ForkResult::Child => {
+            // PID 1 in the new namespace. Re-arm death signal (cleared by fork)
+            // with race check against intermediate parent.
+            let ppid_before = nix::unistd::getppid();
+            unsafe {
+                nix::libc::prctl(
+                    nix::libc::PR_SET_PDEATHSIG,
+                    nix::libc::SIGTERM as nix::libc::c_ulong,
+                    0, 0, 0,
+                );
+            }
+            if nix::unistd::getppid() != ppid_before {
+                std::process::exit(1);
+            }
+            // Mount fresh /proc for the new PID namespace view.
+            let _ = std::fs::create_dir_all("/proc");
+            nix::mount::mount(
+                Some("proc"),
+                "/proc",
+                Some("proc"),
+                nix::mount::MsFlags::MS_NOSUID
+                    | nix::mount::MsFlags::MS_NODEV
+                    | nix::mount::MsFlags::MS_NOEXEC,
+                None::<&str>,
+            )
+            .context("failed to mount /proc in PID namespace")?;
+        }
+    }
+
     if let Some(ref user_str) = config.user {
         setup_user(user_str, config.rootless)?;
     }
