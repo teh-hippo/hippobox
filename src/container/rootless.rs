@@ -70,7 +70,9 @@ pub(super) fn run_rootless_unshare(spec: super::ContainerSpec) -> Result<i32> {
             unshare_args.push("--net");
         }
         unshare_args.push("--");
-        let mut cmd = Command::new("unshare");
+        let unshare_path = super::net::which("unshare")
+            .context("unshare not found in PATH")?;
+        let mut cmd = Command::new(unshare_path);
         unsafe { cmd.pre_exec(pre_exec_fn); }
         cmd.args(&unshare_args).arg(&exe).arg("--rootless-bootstrap").arg(&spec_read_str);
         cmd.spawn()

@@ -14,8 +14,9 @@ pub(super) fn bring_up_loopback() -> Result<()> {
         ifr.ifr_name[0] = b'l' as i8;
         ifr.ifr_name[1] = b'o' as i8;
 
-        // Get current flags
-        if nix::libc::ioctl(sock, nix::libc::SIOCGIFFLAGS, &mut ifr) < 0 {
+        // Get current flags (cast needed: ioctl request type differs between glibc and musl)
+        #[allow(clippy::unnecessary_cast)]
+        if nix::libc::ioctl(sock, nix::libc::SIOCGIFFLAGS as _, &mut ifr) < 0 {
             let err = std::io::Error::last_os_error();
             nix::libc::close(sock);
             return Err(err).context("failed to get loopback flags");
@@ -24,7 +25,8 @@ pub(super) fn bring_up_loopback() -> Result<()> {
         // Set IFF_UP
         ifr.ifr_ifru.ifru_flags |= nix::libc::IFF_UP as i16;
 
-        if nix::libc::ioctl(sock, nix::libc::SIOCSIFFLAGS, &ifr) < 0 {
+        #[allow(clippy::unnecessary_cast)]
+        if nix::libc::ioctl(sock, nix::libc::SIOCSIFFLAGS as _, &ifr) < 0 {
             let err = std::io::Error::last_os_error();
             nix::libc::close(sock);
             return Err(err).context("failed to bring up loopback");
@@ -103,7 +105,7 @@ pub(super) fn check_pasta() -> Result<std::path::PathBuf> {
     )
 }
 
-fn which(name: &str) -> Option<std::path::PathBuf> {
+pub(super) fn which(name: &str) -> Option<std::path::PathBuf> {
     std::env::var_os("PATH")?
         .to_str()?
         .split(':')
