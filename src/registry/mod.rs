@@ -88,6 +88,9 @@ impl RegistryClient {
                     let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
                     let layer_dir = base_dir.join("layers/sha256").join(hex);
                     if layer_dir.exists() {
+                        if layer_dir.join(".in-use").exists() {
+                            continue;
+                        }
                         fs::remove_dir_all(&layer_dir).with_context(|| {
                             format!("failed to prune old layer {}", &hex[..hex.len().min(12)])
                         })?;
