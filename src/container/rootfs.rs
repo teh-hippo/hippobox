@@ -23,7 +23,7 @@ pub fn mount_overlay(
     }
     let _ = write!(
         base_options,
-        ",upperdir={},workdir={}",
+        ",upperdir={},workdir={},volatile",
         upper.display(),
         work.display()
     );
