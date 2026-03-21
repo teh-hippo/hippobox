@@ -7,6 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HIPPOBOX="${SCRIPT_DIR}/../target/release/hippobox"
 IMAGE_BUSYBOX="docker.io/library/busybox:latest"
 IMAGE_REDIS="docker.io/library/redis:latest"
+IMAGE_UBUNTU="docker.io/library/ubuntu:24.04"
 WARMUP=3
 ITERATIONS=15
 
@@ -238,14 +239,50 @@ run_bench "po_redis_ver" $WARMUP $ITERATIONS \
     podman --events-backend=none run --rm --log-driver=none --cgroups=no-conmon --network=none "$IMAGE_REDIS" redis-server --version
 echo ""
 
-# ── Test 5: Redis PING (server startup-to-ready) ────────────────────
+# ── Test 5: ubuntu cat /etc/os-release ──────────────────────────────
+bold "── ubuntu: cat /etc/os-release (full distro load) ──"
+echo ""
+printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "min" "median" "avg" "p95" "max"
+printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "───" "──────" "───" "───" "───"
+run_bench "h_ubuntu_cat" $WARMUP $ITERATIONS $HIPPOBOX run "$IMAGE_UBUNTU" -- cat /etc/os-release
+run_bench "p_ubuntu_cat" $WARMUP $ITERATIONS podman run --rm "$IMAGE_UBUNTU" cat /etc/os-release
+run_bench "po_ubuntu_cat" $WARMUP $ITERATIONS \
+    podman --events-backend=none run --rm --log-driver=none --cgroups=no-conmon --network=none "$IMAGE_UBUNTU" cat /etc/os-release
+echo ""
+
+# ── Test 6: ubuntu directory rename ─────────────────────────────────
+bold "── ubuntu: directory rename (EXDEV stress) ──"
+echo ""
+printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "min" "median" "avg" "p95" "max"
+printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "───" "──────" "───" "───" "───"
+run_bench "h_ubuntu_rename" $WARMUP $ITERATIONS $HIPPOBOX run "$IMAGE_UBUNTU" -- \
+    sh -c 'mkdir -p /opt/a/b/c && echo x > /opt/a/b/c/f && mv /opt/a /opt/z && cat /opt/z/b/c/f'
+run_bench "p_ubuntu_rename" $WARMUP $ITERATIONS podman run --rm "$IMAGE_UBUNTU" \
+    sh -c 'mkdir -p /opt/a/b/c && echo x > /opt/a/b/c/f && mv /opt/a /opt/z && cat /opt/z/b/c/f'
+run_bench "po_ubuntu_rename" $WARMUP $ITERATIONS \
+    podman --events-backend=none run --rm --log-driver=none --cgroups=no-conmon --network=none "$IMAGE_UBUNTU" \
+    sh -c 'mkdir -p /opt/a/b/c && echo x > /opt/a/b/c/f && mv /opt/a /opt/z && cat /opt/z/b/c/f'
+echo ""
+
+# ── Test 7: ubuntu dpkg --configure ─────────────────────────────────
+bold "── ubuntu: dpkg --configure -a (package manager) ──"
+echo ""
+printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "min" "median" "avg" "p95" "max"
+printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "───" "──────" "───" "───" "───"
+run_bench "h_ubuntu_dpkg" $WARMUP $ITERATIONS $HIPPOBOX run "$IMAGE_UBUNTU" -- dpkg --configure -a
+run_bench "p_ubuntu_dpkg" $WARMUP $ITERATIONS podman run --rm "$IMAGE_UBUNTU" dpkg --configure -a
+run_bench "po_ubuntu_dpkg" $WARMUP $ITERATIONS \
+    podman --events-backend=none run --rm --log-driver=none --cgroups=no-conmon --network=none "$IMAGE_UBUNTU" dpkg --configure -a
+echo ""
+
+# ── Test 8: Redis PING (server startup-to-ready) ────────────────────
 bold "── redis: PING (full server startup-to-ready) ──"
 echo ""
 printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "min" "median" "avg" "p95" "max"
 printf "  %-22s  %8s   %8s   %8s   %8s   %8s\n" "" "───" "──────" "───" "───" "───"
-bench_redis_ping "hippobox"      "h_redis_ping"  $WARMUP $ITERATIONS
-bench_redis_ping "podman"        "p_redis_ping"  $WARMUP $ITERATIONS
-bench_redis_ping "podman_opt"    "po_redis_ping" $WARMUP $ITERATIONS
+bench_redis_ping "hippobox"      "h_redis_ping"  $WARMUP $ITERATIONS || true
+bench_redis_ping "podman"        "p_redis_ping"  $WARMUP $ITERATIONS || true
+bench_redis_ping "podman_opt"    "po_redis_ping" $WARMUP $ITERATIONS || true
 echo ""
 
 # ── Summary ──────────────────────────────────────────────────────────
@@ -279,11 +316,14 @@ summary_row() {
     printf "  %-24s %10s %12s %12s %10s %10s\n" "$name" "$hs" "$ps" "$pos" "$r1" "$r2"
 }
 
-summary_row "true"              "hippobox_med"     "podman_med"       "podman_opt_med"
-summary_row "echo"              "h_echo_med"       "p_echo_med"       "po_echo_med"
-summary_row "sh loop"           "h_sh_med"         "p_sh_med"         "po_sh_med"
-summary_row "redis --version"   "h_redis_ver_med"  "p_redis_ver_med"  "po_redis_ver_med"
-summary_row "redis PING"        "h_redis_ping_med" "p_redis_ping_med" "po_redis_ping_med"
+summary_row "true"              "hippobox_med"        "podman_med"          "podman_opt_med"
+summary_row "echo"              "h_echo_med"          "p_echo_med"          "po_echo_med"
+summary_row "sh loop"           "h_sh_med"            "p_sh_med"            "po_sh_med"
+summary_row "redis --version"   "h_redis_ver_med"     "p_redis_ver_med"     "po_redis_ver_med"
+summary_row "ubuntu cat"        "h_ubuntu_cat_med"    "p_ubuntu_cat_med"    "po_ubuntu_cat_med"
+summary_row "ubuntu dir-rename" "h_ubuntu_rename_med" "p_ubuntu_rename_med" "po_ubuntu_rename_med"
+summary_row "ubuntu dpkg"       "h_ubuntu_dpkg_med"   "p_ubuntu_dpkg_med"   "po_ubuntu_dpkg_med"
+summary_row "redis PING"        "h_redis_ping_med"    "p_redis_ping_med"    "po_redis_ping_med"
 
 echo ""
 echo "  h/p  = hippobox / podman (default)    — lower % = hippobox faster"
