@@ -7,10 +7,10 @@ use super::process::{ChildConfig, to_cstrings};
 pub fn container_init(config_fd: i32) -> Result<()> {
     let pipe_file = unsafe { std::fs::File::from_raw_fd(config_fd) };
     let mut config: ChildConfig = serde_json::from_reader(std::io::BufReader::new(pipe_file))?;
-    let needs_netns = config.network_mode == super::net::NetworkMode::None && !config.external_netns;
+    let needs_netns = config.network_mode == super::NetworkMode::None && !config.external_netns;
     super::mounts::copy_host_files_to_rootfs(Path::new(&config.rootfs))?;
     setup_namespaces_and_pivot(Path::new(&config.rootfs), config.rootless, &config.volumes, needs_netns)?;
-    if needs_netns { super::net::bring_up_loopback().context("failed to bring up loopback")?; }
+    if needs_netns { super::bring_up_loopback().context("failed to bring up loopback")?; }
     if let Some(fd) = config.ready_fd { let _ = nix::unistd::write(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }, &[1u8]); let _ = nix::unistd::close(fd); }
     super::mounts::setup_container_mounts(config.rootless)?;
 
@@ -124,7 +124,6 @@ fn apply_seccomp_filter() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn resolve_id_all_cases() {
         // Numeric IDs work even with nonexistent files
@@ -149,20 +148,14 @@ mod tests {
         assert_eq!(resolve_id("good", path2, "user").unwrap(), 42);
         assert!(resolve_id("user", path2, "user").is_err());
     }
-
     #[test]
-    fn passwd_field_by_uid_extracts_fields() {
+    fn passwd_and_rootless_user() {
         if let Some(home) = passwd_field_by_uid(0, 5) {
             assert!(home == "/root" || home.starts_with('/'), "root home should be an absolute path");
         }
         assert!(passwd_field_by_uid(99999, 5).is_none());
-    }
-
-    #[test]
-    fn setup_user_rootless_returns_none() {
         assert!(setup_user("1000", true).unwrap().is_none(), "rootless mode should skip user setup");
     }
-
     #[test]
     fn seccomp_blocked_list_is_valid() {
         use seccompiler::{SeccompAction, SeccompFilter, TargetArch};

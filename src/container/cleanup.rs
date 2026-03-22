@@ -8,22 +8,19 @@ const CGROUP_BASE: &str = "/sys/fs/cgroup/hippobox";
 fn cgroup_path(id: &str) -> String { format!("{CGROUP_BASE}/{id}") }
 
 pub(super) fn check_cgroup_v2() -> Result<()> {
-    if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
-        bail!("cgroup v2 not available (missing /sys/fs/cgroup/cgroup.controllers)");
-    }
+    if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() { bail!("cgroup v2 not available"); }
     Ok(())
 }
 pub(super) fn cgroup_create(id: &str) -> Result<()> {
-    std::fs::create_dir_all(CGROUP_BASE).with_context(|| format!("failed to create cgroup base at {CGROUP_BASE}"))?;
+    std::fs::create_dir_all(CGROUP_BASE)?;
     std::fs::create_dir_all(cgroup_path(id)).with_context(|| format!("failed to create cgroup for {id}"))
 }
 pub(super) fn cgroup_add_pid(id: &str, pid: u32) -> Result<()> {
-    let p = format!("{}/cgroup.procs", cgroup_path(id));
-    std::fs::write(&p, pid.to_string()).with_context(|| format!("failed to write PID to {p}"))
+    std::fs::write(format!("{}/cgroup.procs", cgroup_path(id)), pid.to_string()).context("failed to write PID to cgroup")
 }
-fn cgroup_cleanup(id: &str) -> Result<()> {
+fn cgroup_cleanup(id: &str) {
     let path = cgroup_path(id);
-    if !Path::new(&path).exists() { return Ok(()); }
+    if !Path::new(&path).exists() { return; }
     let kill = format!("{path}/cgroup.kill");
     if Path::new(&kill).exists() { let _ = std::fs::write(&kill, "1"); }
     else if let Ok(content) = std::fs::read_to_string(format!("{path}/cgroup.procs")) {
@@ -31,20 +28,15 @@ fn cgroup_cleanup(id: &str) -> Result<()> {
             let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
         }
     }
-    for _ in 0..10 {
-        if std::fs::remove_dir(&path).is_ok() { break; }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    for _ in 0..10 { if std::fs::remove_dir(&path).is_ok() { break; } std::thread::sleep(std::time::Duration::from_millis(10)); }
     let _ = std::fs::remove_dir(CGROUP_BASE);
-    Ok(())
 }
 
 pub(super) fn acquire_container_lock(container_dir: &Path) -> Result<Flock<File>> {
-    let lock_path = container_dir.join("hippobox.lock");
-    let lock_file = File::options().read(true).write(true).create(true).truncate(false)
-        .open(&lock_path).with_context(|| format!("failed to open lock at {}", lock_path.display()))?;
-    Flock::lock(lock_file, FlockArg::LockExclusive).map_err(|(_, e)| e)
-        .with_context(|| format!("failed to flock {}", lock_path.display()))
+    let p = container_dir.join("hippobox.lock");
+    let f = File::options().read(true).write(true).create(true).truncate(false).open(&p)
+        .with_context(|| format!("failed to open lock at {}", p.display()))?;
+    Flock::lock(f, FlockArg::LockExclusive).map_err(|(_, e)| e).with_context(|| format!("failed to flock {}", p.display()))
 }
 pub fn gc_stale_containers(base_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(base_dir.join("containers")) else { return };
@@ -55,66 +47,44 @@ pub fn gc_stale_containers(base_dir: &Path) {
             use std::os::unix::fs::MetadataExt;
             if meta.uid() != nix::unistd::getuid().as_raw() { continue; }
         }
-        if let Err(e) = gc_try_clean_container(&path) {
-            eprintln!("warning: gc failed for {}: {e}", path.file_name().unwrap_or_default().to_string_lossy());
-        }
-    }
-}
-fn gc_try_clean_container(container_dir: &Path) -> Result<()> {
-    let lock_path = container_dir.join("hippobox.lock");
-    if lock_path.exists() {
-        let lock_file = File::open(&lock_path)?;
-        match Flock::lock(lock_file, FlockArg::LockExclusiveNonblock) {
-            Ok(_) => {}
-            Err((_, nix::errno::Errno::EAGAIN)) => return Ok(()),
-            Err((_, e)) => return Err(e).context("failed to probe container lock"),
-        }
-    }
-    let merged = container_dir.join("merged");
-    if merged.exists() {
-        let _ = super::mounts::cleanup_host_device_sources(&merged);
-        match nix::mount::umount2(&merged, nix::mount::MntFlags::empty()) {
-            Ok(()) | Err(nix::errno::Errno::EINVAL | nix::errno::Errno::ENOENT | nix::errno::Errno::EPERM) => {}
-            Err(nix::errno::Errno::EBUSY) => {
-                eprintln!("warning: overlay still busy for {}, skipping",
-                    container_dir.file_name().unwrap_or_default().to_string_lossy());
-                return Ok(());
+        let lock_path = path.join("hippobox.lock");
+        if lock_path.exists() {
+            match File::open(&lock_path).and_then(|f| Flock::lock(f, FlockArg::LockExclusiveNonblock).map_err(|(_, e)| e.into())) {
+                Ok(_) => {} Err(_) => continue,
             }
-            Err(e) => return Err(e).context("failed to unmount stale overlay"),
         }
+        let merged = path.join("merged");
+        if merged.exists() {
+            let _ = super::mounts::cleanup_host_device_sources(&merged);
+            match nix::mount::umount2(&merged, nix::mount::MntFlags::empty()) {
+                Ok(()) | Err(nix::errno::Errno::EINVAL | nix::errno::Errno::ENOENT | nix::errno::Errno::EPERM) => {}
+                Err(nix::errno::Errno::EBUSY) => { eprintln!("warning: overlay still busy, skipping {}", path.display()); continue; }
+                Err(e) => { eprintln!("warning: gc unmount failed for {}: {e}", path.display()); continue; }
+            }
+        }
+        fix_overlay_workdir(&path);
+        let _ = std::fs::remove_dir_all(&path);
     }
-    fix_overlay_workdir(container_dir);
-    let _ = std::fs::remove_dir_all(container_dir);
-    Ok(())
 }
 fn fix_overlay_workdir(container_dir: &Path) {
-    let work_dir = container_dir.join("work");
-    if !work_dir.exists() { return; }
-    let mut stack = vec![work_dir];
+    let work = container_dir.join("work");
+    if !work.exists() { return; }
+    let mut stack = vec![work];
     while let Some(dir) = stack.pop() {
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
         if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() { stack.push(p); }
-            }
+            for e in entries.flatten() { if e.path().is_dir() { stack.push(e.path()); } }
         }
     }
 }
 
 pub(super) struct CleanupGuard {
-    pub id: String,
-    pub container_dir: PathBuf,
-    pub merged: PathBuf,
-    pub layer_dirs: Vec<PathBuf>,
-    pub overlay_mounted: bool,
-    pub rootless: bool,
-    pub _lock: Flock<File>,
+    pub id: String, pub container_dir: PathBuf, pub merged: PathBuf,
+    pub layer_dirs: Vec<PathBuf>, pub overlay_mounted: bool, pub rootless: bool, pub _lock: Flock<File>,
 }
-
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
-        if !self.rootless { let _ = cgroup_cleanup(&self.id); }
+        if !self.rootless { cgroup_cleanup(&self.id); }
         let can_remove = !self.overlay_mounted || {
             let _ = super::mounts::cleanup_host_device_sources(&self.merged);
             super::mounts::unmount_overlay(&self.merged).is_ok()
@@ -128,62 +98,46 @@ impl Drop for CleanupGuard {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-
-    fn mk_container(base: &Path, name: &str) -> PathBuf {
+    fn mk(base: &Path, name: &str) -> PathBuf {
         let dir = base.join("containers").join(name);
         for sub in ["merged", "upper", "work"] { std::fs::create_dir_all(dir.join(sub)).unwrap(); }
         dir
     }
-
     #[test]
     fn gc_stale_and_active() {
         let tmp = TempDir::new().unwrap();
-        // Stale (no lock) gets cleaned
-        let stale = mk_container(tmp.path(), "stale");
+        let stale = mk(tmp.path(), "stale");
         gc_stale_containers(tmp.path());
         assert!(!stale.exists());
-
-        // Active (locked) survives
-        let active = mk_container(tmp.path(), "active");
+        let active = mk(tmp.path(), "active");
         let _lock = acquire_container_lock(&active).unwrap();
         gc_stale_containers(tmp.path());
         assert!(active.exists());
-
-        // Dead (lock released) gets cleaned
-        let dead = mk_container(tmp.path(), "dead");
+        let dead = mk(tmp.path(), "dead");
         { let _lock = acquire_container_lock(&dead).unwrap(); }
         gc_stale_containers(tmp.path());
         assert!(!dead.exists());
     }
-
     #[test]
     fn gc_edge_cases() {
         let tmp = TempDir::new().unwrap();
-        gc_stale_containers(tmp.path()); // no containers dir
+        gc_stale_containers(tmp.path());
         std::fs::create_dir_all(tmp.path().join("containers")).unwrap();
-        gc_stale_containers(tmp.path()); // empty containers dir
-
-        // Multiple stale cleaned in one pass
-        let dirs: Vec<_> = (0..3).map(|i| mk_container(tmp.path(), &format!("s{i}"))).collect();
+        gc_stale_containers(tmp.path());
+        let dirs: Vec<_> = (0..3).map(|i| mk(tmp.path(), &format!("s{i}"))).collect();
         gc_stale_containers(tmp.path());
         for d in &dirs { assert!(!d.exists()); }
-
-        // Non-directory entries ignored
         std::fs::write(tmp.path().join("containers/file"), "x").unwrap();
         gc_stale_containers(tmp.path());
         assert!(tmp.path().join("containers/file").exists());
-
-        // Unreadable lock handled gracefully
-        let bad = mk_container(tmp.path(), "bad");
+        let bad = mk(tmp.path(), "bad");
         std::fs::create_dir(bad.join("hippobox.lock")).unwrap();
         gc_stale_containers(tmp.path());
     }
-
     #[test]
     fn fix_overlay_workdir_behaviour() {
         let tmp = TempDir::new().unwrap();
-        fix_overlay_workdir(tmp.path()); // noop when missing
-
+        fix_overlay_workdir(tmp.path());
         let dir = tmp.path().join("container");
         std::fs::create_dir_all(dir.join("work/deep/nested")).unwrap();
         std::fs::set_permissions(dir.join("work"), std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -191,7 +145,6 @@ mod tests {
         assert_eq!(std::fs::metadata(dir.join("work")).unwrap().permissions().mode() & 0o777, 0o700);
         let _ = std::fs::set_permissions(dir.join("work"), std::fs::Permissions::from_mode(0o755));
     }
-
     #[test]
     fn acquire_lock_is_exclusive() {
         let tmp = TempDir::new().unwrap();
@@ -200,7 +153,6 @@ mod tests {
         let _lock = acquire_container_lock(&dir).unwrap();
         assert!(Flock::lock(File::open(dir.join("hippobox.lock")).unwrap(), FlockArg::LockExclusiveNonblock).is_err());
     }
-
     #[test]
     fn cgroup_path_format() {
         let p = cgroup_path("abc");

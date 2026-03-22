@@ -22,7 +22,7 @@ pub(super) fn run_container(mut config: ChildConfig, stop_signal: &str) -> Resul
             if !config.rootless { super::cleanup::cgroup_add_pid(&config.container_id, child.as_raw() as u32)?; }
             let pasta_child = if has_ports {
                 if let Some(ready_fd) = ready_read { let _ = nix::unistd::read(&ready_fd, &mut [0u8; 1]); drop(ready_fd); }
-                Some(super::net::spawn_pasta_for_pid(child.as_raw() as u32, &config.port_mappings).context("failed to start port forwarding")?)
+                Some(super::spawn_pasta_for_pid(child.as_raw() as u32, &config.port_mappings).context("failed to start port forwarding")?)
             } else { None };
             let stop_signal = match stop_signal.trim_start_matches("SIG") {
                 "QUIT" => Signal::SIGQUIT, "INT" => Signal::SIGINT, "HUP" => Signal::SIGHUP,
@@ -75,14 +75,14 @@ pub(super) struct ChildConfig {
     pub rootfs: String, pub argv: Vec<String>, pub env_vars: Vec<String>,
     pub workdir: String, pub container_id: String, pub rootless: bool,
     pub user: Option<String>, pub volumes: Vec<super::VolumeMount>,
-    pub network_mode: super::net::NetworkMode, pub port_mappings: Vec<super::net::PortMapping>,
+    pub network_mode: super::NetworkMode, pub port_mappings: Vec<super::PortMapping>,
     pub external_netns: bool, pub ready_fd: Option<i32>,
 }
 
 pub(super) fn run_rootless_unshare(spec: super::ContainerSpec) -> Result<i32> {
     let exe = super::resolve_self_exe()?;
     let has_ports = !spec.port_mappings.is_empty();
-    let isolate_network = spec.network_mode == super::net::NetworkMode::None || has_ports;
+    let isolate_network = spec.network_mode == super::NetworkMode::None || has_ports;
     let (spec_read, spec_write) = nix::unistd::pipe().context("failed to create spec pipe")?;
     let (spec_read_raw, spec_write_raw) = (spec_read.into_raw_fd(), spec_write.as_raw_fd());
     let spec_read_str = spec_read_raw.to_string();
@@ -95,17 +95,17 @@ pub(super) fn run_rootless_unshare(spec: super::ContainerSpec) -> Result<i32> {
     };
 
     let child = if has_ports {
-        let mut cmd = std::process::Command::new(super::net::check_pasta()?);
+        let mut cmd = std::process::Command::new(super::check_pasta()?);
         unsafe { cmd.pre_exec(pre_exec_fn); }
         cmd.args(["--config-net", "--quiet", "--foreground", "--no-map-gw"]);
-        super::net::add_port_args(&mut cmd, &spec.port_mappings);
+        super::add_port_args(&mut cmd, &spec.port_mappings);
         cmd.args(["-u", "none", "-T", "none", "-U", "none", "--", "unshare", "--mount", "--uts", "--ipc", "--"]);
         cmd.arg(&exe).arg("--rootless-bootstrap").arg(&spec_read_str);
         cmd.spawn().context("failed to execute pasta")?
     } else {
         let mut args = vec!["--user", "--map-root-user", "--map-auto", "--mount", "--uts", "--ipc"];
         if isolate_network { args.push("--net"); } args.push("--");
-        let mut cmd = std::process::Command::new(super::net::which("unshare").context("unshare not found in PATH")?);
+        let mut cmd = std::process::Command::new(super::which("unshare").context("unshare not found in PATH")?);
         unsafe { cmd.pre_exec(pre_exec_fn); }
         cmd.args(&args).arg(&exe).arg("--rootless-bootstrap").arg(&spec_read_str);
         cmd.spawn().context("failed to execute unshare")?
@@ -151,8 +151,8 @@ mod tests {
             env_vars: vec!["PATH=/usr/bin".into(), "HOME=/root".into()], workdir: "/app".into(),
             container_id: "abc123def456".into(), rootless: false, user: Some("1000:1000".into()),
             volumes: vec![super::super::VolumeMount { source: "/host/data".into(), target: "/data".into(), read_only: true }],
-            network_mode: super::super::net::NetworkMode::None,
-            port_mappings: vec![super::super::net::PortMapping { host_port: 8080, container_port: 80, protocol: "tcp".into() }],
+            network_mode: super::super::NetworkMode::None,
+            port_mappings: vec![super::super::PortMapping { host_port: 8080, container_port: 80, protocol: "tcp".into() }],
             external_netns: true, ready_fd: Some(5),
         };
         let back: ChildConfig = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();

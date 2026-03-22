@@ -9,7 +9,19 @@ const DEVICES: &[&str] = &["null", "zero", "full", "random", "urandom", "tty"];
 pub(super) fn setup_container_mounts(rootless: bool) -> Result<()> {
     let noexec = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
     if !rootless { mount_fs("/proc", "proc", "proc", noexec, None::<&str>, "failed to mount /proc")?; }
-    mount_dev()?;
+    // mount /dev
+    mount_fs("/dev", "tmpfs", "tmpfs", MsFlags::MS_NOSUID, Some("mode=755"), "failed to mount tmpfs on /dev")?;
+    for &name in DEVICES {
+        let (src, tgt) = (format!("/.hippobox-dev/{name}"), format!("/dev/{name}"));
+        File::create(&tgt).with_context(|| format!("failed to create device node at {tgt}"))?;
+        mount(Some(src.as_str()), tgt.as_str(), None::<&str>, MsFlags::MS_BIND, None::<&str>)
+            .with_context(|| format!("failed to bind-mount {src} onto {tgt}"))?;
+    }
+    for (target, link) in [("/proc/self/fd/0", "/dev/stdin"), ("/proc/self/fd/1", "/dev/stdout"),
+        ("/proc/self/fd/2", "/dev/stderr"), ("/proc/self/fd", "/dev/fd")] {
+        let _ = fs::remove_file(link);
+        symlink(target, link).with_context(|| format!("failed to create symlink {link} -> {target}"))?;
+    }
     mount_fs("/dev/shm", "shm", "tmpfs", MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
         Some("mode=1777,size=65536k"), "failed to mount /dev/shm")?;
     mount_fs("/dev/pts", "devpts", "devpts", MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
@@ -60,22 +72,6 @@ pub(super) fn mask_proc_paths() -> Result<()> {
             eprintln!("warning: failed to bind {path}: {e}"); continue;
         }
         let _ = mount(None::<&str>, path, None::<&str>, ro, None::<&str>);
-    }
-    Ok(())
-}
-
-fn mount_dev() -> Result<()> {
-    mount_fs("/dev", "tmpfs", "tmpfs", MsFlags::MS_NOSUID, Some("mode=755"), "failed to mount tmpfs on /dev")?;
-    for &name in DEVICES {
-        let (src, tgt) = (format!("/.hippobox-dev/{name}"), format!("/dev/{name}"));
-        File::create(&tgt).with_context(|| format!("failed to create device node at {tgt}"))?;
-        mount(Some(src.as_str()), tgt.as_str(), None::<&str>, MsFlags::MS_BIND, None::<&str>)
-            .with_context(|| format!("failed to bind-mount {src} onto {tgt}"))?;
-    }
-    for (target, link) in [("/proc/self/fd/0", "/dev/stdin"), ("/proc/self/fd/1", "/dev/stdout"),
-        ("/proc/self/fd/2", "/dev/stderr"), ("/proc/self/fd", "/dev/fd")] {
-        let _ = fs::remove_file(link);
-        symlink(target, link).with_context(|| format!("failed to create symlink {link} -> {target}"))?;
     }
     Ok(())
 }

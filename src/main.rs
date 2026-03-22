@@ -15,10 +15,7 @@ fn hippobox_dir() -> PathBuf {
 }
 
 fn ensure_storage_dirs() -> Result<()> {
-    let base = hippobox_dir();
-    for sub in ["layers/sha256", "images", "containers"] {
-        fs::create_dir_all(base.join(sub))?;
-    }
+    for sub in ["layers/sha256", "images", "containers"] { fs::create_dir_all(hippobox_dir().join(sub))?; }
     Ok(())
 }
 
@@ -31,9 +28,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Pull {
-        image: String,
-    },
+    Pull { image: String },
     Run {
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
@@ -112,19 +107,19 @@ fn main() -> Result<()> {
                 }
             }
 
-            let port_mappings: Vec<container::net::PortMapping> = ports
-                .iter().map(|p| container::net::parse_port(p)).collect::<Result<_>>()?;
+            let port_mappings: Vec<container::PortMapping> = ports
+                .iter().map(|p| container::parse_port(p)).collect::<Result<_>>()?;
 
             let network_mode = if !port_mappings.is_empty()
                 && network == "host"
                 && !std::env::args().any(|a| a.starts_with("--network"))
             {
-                container::net::NetworkMode::None
+                container::NetworkMode::None
             } else {
-                container::net::parse_network_mode(&network)?
+                container::parse_network_mode(&network)?
             };
 
-            if !port_mappings.is_empty() && network_mode == container::net::NetworkMode::Host {
+            if !port_mappings.is_empty() && network_mode == container::NetworkMode::Host {
                 anyhow::bail!(
                     "-p requires network isolation; use --network=none (default with -p) \
                      or remove --network=host"
