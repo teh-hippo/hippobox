@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build hippobox (static musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl -p hippobox
+
+      - name: Build rename shim
+        run: cargo build --release -p rename-shim
+
+      - name: Package release
+        run: |
+          mkdir -p release
+          cp target/x86_64-unknown-linux-musl/release/hippobox release/
+          cp target/release/librename_shim.so release/
+          cd release
+          tar czf ../hippobox-${{ github.ref_name }}-x86_64-linux.tar.gz *
+          cd ..
+          sha256sum hippobox-${{ github.ref_name }}-x86_64-linux.tar.gz > checksums-sha256.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            hippobox-${{ github.ref_name }}-x86_64-linux.tar.gz
+            checksums-sha256.txt
+          generate_release_notes: true
