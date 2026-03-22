@@ -21,9 +21,7 @@ pub(super) fn extract_with_whiteouts(archive: &mut tar::Archive<impl Read>, targ
     archive.set_unpack_xattrs(false);
 
     let safe_dir = |relative: &Path| -> Result<PathBuf> {
-        if has_unsafe_components(relative) {
-            bail!("unsafe archive path component in {}", relative.display());
-        }
+        if has_unsafe_components(relative) { bail!("unsafe archive path component in {}", relative.display()); }
         let mut out = target.to_path_buf();
         for component in relative.components() {
             if let Component::Normal(part) = component {
@@ -43,20 +41,15 @@ pub(super) fn extract_with_whiteouts(archive: &mut tar::Archive<impl Read>, targ
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
-        if has_unsafe_components(&path) {
-            bail!("unsafe archive path component in {}", path.display());
-        }
+        if has_unsafe_components(&path) { bail!("unsafe archive path component in {}", path.display()); }
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
         if file_name == ".wh..wh..opq" {
             let parent = safe_dir(path.parent().unwrap_or(Path::new("")))?;
             let c_path = CString::new(parent.to_string_lossy().as_bytes())?;
-            let ret = unsafe {
-                nix::libc::setxattr(
-                    c_path.as_ptr(), c"trusted.overlay.opaque".as_ptr(),
-                    b"y".as_ptr().cast(), 1, 0,
-                )
-            };
+            let ret = unsafe { nix::libc::setxattr(
+                c_path.as_ptr(), c"trusted.overlay.opaque".as_ptr(), b"y".as_ptr().cast(), 1, 0,
+            )};
             if ret != 0 {
                 return Err(io::Error::last_os_error())
                     .with_context(|| format!("failed to set opaque xattr on {}", parent.display()));
@@ -68,17 +61,12 @@ pub(super) fn extract_with_whiteouts(archive: &mut tar::Archive<impl Read>, targ
             if deleted_name.is_empty() || deleted_name == "." || deleted_name == ".."
                 || deleted_name.contains('/') || deleted_name.contains('\\')
                 || Path::new(deleted_name).components().count() != 1
-            {
-                bail!("unsafe whiteout name: {deleted_name}");
-            }
+            { bail!("unsafe whiteout name: {deleted_name}"); }
             let parent = safe_dir(path.parent().unwrap_or(Path::new("")))?;
             let wp = parent.join(deleted_name);
             if let Ok(m) = fs::symlink_metadata(&wp) {
-                if m.file_type().is_dir() && !m.file_type().is_symlink() {
-                    fs::remove_dir_all(&wp)?;
-                } else {
-                    fs::remove_file(&wp)?;
-                }
+                if m.file_type().is_dir() && !m.file_type().is_symlink() { fs::remove_dir_all(&wp)?; }
+                else { fs::remove_file(&wp)?; }
             }
             nix::sys::stat::mknod(&wp, nix::sys::stat::SFlag::S_IFCHR,
                 nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
@@ -87,9 +75,7 @@ pub(super) fn extract_with_whiteouts(archive: &mut tar::Archive<impl Read>, targ
             continue;
         }
 
-        if !entry.unpack_in(target)? {
-            bail!("archive entry escapes target directory: {}", path.display());
-        }
+        if !entry.unpack_in(target)? { bail!("archive entry escapes target directory: {}", path.display()); }
     }
     Ok(())
 }

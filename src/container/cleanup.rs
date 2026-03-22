@@ -3,13 +3,9 @@ use nix::fcntl::{Flock, FlockArg};
 use std::fs::File;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 const CGROUP_BASE: &str = "/sys/fs/cgroup/hippobox";
-
-fn cgroup_path(container_id: &str) -> String {
-    format!("{CGROUP_BASE}/{container_id}")
-}
+fn cgroup_path(id: &str) -> String { format!("{CGROUP_BASE}/{id}") }
 
 pub(super) fn check_cgroup_v2() -> Result<()> {
     if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
@@ -17,38 +13,27 @@ pub(super) fn check_cgroup_v2() -> Result<()> {
     }
     Ok(())
 }
-
-pub(super) fn cgroup_create(container_id: &str) -> Result<()> {
-    std::fs::create_dir_all(CGROUP_BASE)
-        .with_context(|| format!("failed to create cgroup base at {CGROUP_BASE}"))?;
-    std::fs::create_dir_all(cgroup_path(container_id))
-        .with_context(|| format!("failed to create cgroup for {container_id}"))
+pub(super) fn cgroup_create(id: &str) -> Result<()> {
+    std::fs::create_dir_all(CGROUP_BASE).with_context(|| format!("failed to create cgroup base at {CGROUP_BASE}"))?;
+    std::fs::create_dir_all(cgroup_path(id)).with_context(|| format!("failed to create cgroup for {id}"))
 }
-
-pub(super) fn cgroup_add_pid(container_id: &str, pid: u32) -> Result<()> {
-    let procs_path = format!("{}/cgroup.procs", cgroup_path(container_id));
-    std::fs::write(&procs_path, pid.to_string())
-        .with_context(|| format!("failed to write PID to {procs_path}"))
+pub(super) fn cgroup_add_pid(id: &str, pid: u32) -> Result<()> {
+    let p = format!("{}/cgroup.procs", cgroup_path(id));
+    std::fs::write(&p, pid.to_string()).with_context(|| format!("failed to write PID to {p}"))
 }
-
-fn cgroup_cleanup(container_id: &str) -> Result<()> {
-    let path = cgroup_path(container_id);
+fn cgroup_cleanup(id: &str) -> Result<()> {
+    let path = cgroup_path(id);
     if !Path::new(&path).exists() { return Ok(()); }
-
-    let kill_path = format!("{path}/cgroup.kill");
-    if Path::new(&kill_path).exists() {
-        let _ = std::fs::write(&kill_path, "1");
-    } else if let Ok(content) = std::fs::read_to_string(format!("{path}/cgroup.procs")) {
-        for line in content.lines() {
-            if let Ok(pid) = line.trim().parse::<i32>() {
-                let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
-            }
+    let kill = format!("{path}/cgroup.kill");
+    if Path::new(&kill).exists() { let _ = std::fs::write(&kill, "1"); }
+    else if let Ok(content) = std::fs::read_to_string(format!("{path}/cgroup.procs")) {
+        for pid in content.lines().filter_map(|l| l.trim().parse::<i32>().ok()) {
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
         }
     }
-
     for _ in 0..10 {
         if std::fs::remove_dir(&path).is_ok() { break; }
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let _ = std::fs::remove_dir(CGROUP_BASE);
     Ok(())
@@ -61,7 +46,6 @@ pub(super) fn acquire_container_lock(container_dir: &Path) -> Result<Flock<File>
     Flock::lock(lock_file, FlockArg::LockExclusive).map_err(|(_, e)| e)
         .with_context(|| format!("failed to flock {}", lock_path.display()))
 }
-
 pub fn gc_stale_containers(base_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(base_dir.join("containers")) else { return };
     for entry in entries.flatten() {
@@ -72,29 +56,25 @@ pub fn gc_stale_containers(base_dir: &Path) {
             if meta.uid() != nix::unistd::getuid().as_raw() { continue; }
         }
         if let Err(e) = gc_try_clean_container(&path) {
-            eprintln!("warning: gc failed for {}: {e}",
-                path.file_name().unwrap_or_default().to_string_lossy());
+            eprintln!("warning: gc failed for {}: {e}", path.file_name().unwrap_or_default().to_string_lossy());
         }
     }
 }
-
 fn gc_try_clean_container(container_dir: &Path) -> Result<()> {
     let lock_path = container_dir.join("hippobox.lock");
     if lock_path.exists() {
         let lock_file = File::open(&lock_path)?;
         match Flock::lock(lock_file, FlockArg::LockExclusiveNonblock) {
-            Ok(_flock) => {} // Lock acquired — owner is dead
-            Err((_, nix::errno::Errno::EAGAIN)) => return Ok(()), // Active
+            Ok(_) => {}
+            Err((_, nix::errno::Errno::EAGAIN)) => return Ok(()),
             Err((_, e)) => return Err(e).context("failed to probe container lock"),
         }
     }
-
     let merged = container_dir.join("merged");
     if merged.exists() {
         let _ = super::mounts::cleanup_host_device_sources(&merged);
         match nix::mount::umount2(&merged, nix::mount::MntFlags::empty()) {
-            Ok(())
-            | Err(nix::errno::Errno::EINVAL | nix::errno::Errno::ENOENT | nix::errno::Errno::EPERM) => {}
+            Ok(()) | Err(nix::errno::Errno::EINVAL | nix::errno::Errno::ENOENT | nix::errno::Errno::EPERM) => {}
             Err(nix::errno::Errno::EBUSY) => {
                 eprintln!("warning: overlay still busy for {}, skipping",
                     container_dir.file_name().unwrap_or_default().to_string_lossy());
@@ -103,25 +83,23 @@ fn gc_try_clean_container(container_dir: &Path) -> Result<()> {
             Err(e) => return Err(e).context("failed to unmount stale overlay"),
         }
     }
-
     fix_overlay_workdir(container_dir);
     let _ = std::fs::remove_dir_all(container_dir);
     Ok(())
 }
-
 fn fix_overlay_workdir(container_dir: &Path) {
     let work_dir = container_dir.join("work");
     if !work_dir.exists() { return; }
-    fn fix(dir: &Path) {
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-        if let Ok(entries) = std::fs::read_dir(dir) {
+    let mut stack = vec![work_dir];
+    while let Some(dir) = stack.pop() {
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let p = entry.path();
-                if p.is_dir() { fix(&p); }
+                if p.is_dir() { stack.push(p); }
             }
         }
     }
-    fix(&work_dir);
 }
 
 pub(super) struct CleanupGuard {
@@ -136,22 +114,13 @@ pub(super) struct CleanupGuard {
 
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
-        if !self.rootless {
-            let _ = cgroup_cleanup(&self.id);
-        }
-        let can_remove = if self.overlay_mounted {
+        if !self.rootless { let _ = cgroup_cleanup(&self.id); }
+        let can_remove = !self.overlay_mounted || {
             let _ = super::mounts::cleanup_host_device_sources(&self.merged);
             super::mounts::unmount_overlay(&self.merged).is_ok()
-        } else {
-            true
         };
-        for dir in &self.layer_dirs {
-            let _ = std::fs::remove_file(dir.join(".in-use"));
-        }
-        if can_remove {
-            fix_overlay_workdir(&self.container_dir);
-            let _ = std::fs::remove_dir_all(&self.container_dir);
-        }
+        for dir in &self.layer_dirs { let _ = std::fs::remove_file(dir.join(".in-use")); }
+        if can_remove { fix_overlay_workdir(&self.container_dir); let _ = std::fs::remove_dir_all(&self.container_dir); }
     }
 }
 
@@ -162,28 +131,22 @@ mod tests {
 
     fn make_container_dir(base: &Path, name: &str) -> PathBuf {
         let dir = base.join("containers").join(name);
-        for sub in ["merged", "upper", "work"] {
-            std::fs::create_dir_all(dir.join(sub)).unwrap();
-        }
+        for sub in ["merged", "upper", "work"] { std::fs::create_dir_all(dir.join(sub)).unwrap(); }
         dir
     }
 
     #[test]
     fn gc_removes_stale_and_keeps_active() {
         let tmp = TempDir::new().unwrap();
-
-        // No lock file → removed
         let stale = make_container_dir(tmp.path(), "stale-no-lock");
         gc_stale_containers(tmp.path());
         assert!(!stale.exists());
 
-        // Held lock → kept
         let active = make_container_dir(tmp.path(), "active");
         let _lock = acquire_container_lock(&active).unwrap();
         gc_stale_containers(tmp.path());
         assert!(active.exists());
 
-        // Released lock → removed
         let dead = make_container_dir(tmp.path(), "dead-owner");
         { let _lock = acquire_container_lock(&dead).unwrap(); }
         gc_stale_containers(tmp.path());

@@ -4,7 +4,7 @@ mod registry;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use image::ref_parser::ImageRef;
+use image::ImageRef;
 use registry::RegistryClient;
 use std::fs;
 use std::os::fd::FromRawFd;
@@ -112,19 +112,19 @@ fn main() -> Result<()> {
                 }
             }
 
-            let port_mappings: Vec<container::net::PortMapping> = ports
-                .iter().map(|p| container::net::parse_port(p)).collect::<Result<_>>()?;
+            let port_mappings: Vec<container::PortMapping> = ports
+                .iter().map(|p| container::parse_port(p)).collect::<Result<_>>()?;
 
             let network_mode = if !port_mappings.is_empty()
                 && network == "host"
                 && !std::env::args().any(|a| a.starts_with("--network"))
             {
-                container::net::NetworkMode::None
+                container::NetworkMode::None
             } else {
-                container::net::parse_network_mode(&network)?
+                container::parse_network_mode(&network)?
             };
 
-            if !port_mappings.is_empty() && network_mode == container::net::NetworkMode::Host {
+            if !port_mappings.is_empty() && network_mode == container::NetworkMode::Host {
                 anyhow::bail!(
                     "-p requires network isolation; use --network=none (default with -p) \
                      or remove --network=host"
