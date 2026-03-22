@@ -12,7 +12,7 @@ pub fn container_init(config_fd: i32) -> Result<()> {
     let pipe_file = unsafe { std::fs::File::from_raw_fd(config_fd) };
     let mut config: ChildConfig = serde_json::from_reader(std::io::BufReader::new(pipe_file))?;
 
-    let needs_netns = config.network_mode == super::NetworkMode::None && !config.external_netns;
+    let needs_netns = config.network_mode == super::net::NetworkMode::None && !config.external_netns;
 
     super::mounts::copy_host_files_to_rootfs(Path::new(&config.rootfs))?;
     setup_namespaces_and_pivot(
@@ -20,7 +20,7 @@ pub fn container_init(config_fd: i32) -> Result<()> {
     )?;
 
     if needs_netns {
-        super::bring_up_loopback().context("failed to bring up loopback")?;
+        super::net::bring_up_loopback().context("failed to bring up loopback")?;
     }
     if let Some(fd) = config.ready_fd {
         let _ = nix::unistd::write(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }, &[1u8]);
