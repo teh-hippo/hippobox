@@ -1,99 +1,103 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use nix::fcntl::{Flock, FlockArg};
 use std::fs::File;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+const CGROUP_BASE: &str = "/sys/fs/cgroup/hippobox";
+
+fn cgroup_path(container_id: &str) -> String {
+    format!("{CGROUP_BASE}/{container_id}")
+}
+
+pub(super) fn check_cgroup_v2() -> Result<()> {
+    if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+        bail!("cgroup v2 not available (missing /sys/fs/cgroup/cgroup.controllers)");
+    }
+    Ok(())
+}
+
+pub(super) fn cgroup_create(container_id: &str) -> Result<()> {
+    std::fs::create_dir_all(CGROUP_BASE)
+        .with_context(|| format!("failed to create cgroup base at {CGROUP_BASE}"))?;
+    std::fs::create_dir_all(cgroup_path(container_id))
+        .with_context(|| format!("failed to create cgroup for {container_id}"))
+}
+
+pub(super) fn cgroup_add_pid(container_id: &str, pid: u32) -> Result<()> {
+    let procs_path = format!("{}/cgroup.procs", cgroup_path(container_id));
+    std::fs::write(&procs_path, pid.to_string())
+        .with_context(|| format!("failed to write PID to {procs_path}"))
+}
+
+fn cgroup_cleanup(container_id: &str) -> Result<()> {
+    let path = cgroup_path(container_id);
+    if !Path::new(&path).exists() { return Ok(()); }
+
+    let kill_path = format!("{path}/cgroup.kill");
+    if Path::new(&kill_path).exists() {
+        let _ = std::fs::write(&kill_path, "1");
+    } else if let Ok(content) = std::fs::read_to_string(format!("{path}/cgroup.procs")) {
+        for line in content.lines() {
+            if let Ok(pid) = line.trim().parse::<i32>() {
+                let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+            }
+        }
+    }
+
+    for _ in 0..10 {
+        if std::fs::remove_dir(&path).is_ok() { break; }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = std::fs::remove_dir(CGROUP_BASE);
+    Ok(())
+}
 
 pub(super) fn acquire_container_lock(container_dir: &Path) -> Result<Flock<File>> {
     let lock_path = container_dir.join("hippobox.lock");
-    let lock_file = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("failed to open lock at {}", lock_path.display()))?;
-    Flock::lock(lock_file, FlockArg::LockExclusive)
-        .map_err(|(_, e)| e)
+    let lock_file = File::options().read(true).write(true).create(true).truncate(false)
+        .open(&lock_path).with_context(|| format!("failed to open lock at {}", lock_path.display()))?;
+    Flock::lock(lock_file, FlockArg::LockExclusive).map_err(|(_, e)| e)
         .with_context(|| format!("failed to flock {}", lock_path.display()))
 }
 
-/// Clean up stale containers from previous runs that didn't get a chance to clean
-/// up (e.g. the hippobox process was killed). Best-effort: logs warnings and
-/// continues on individual failures.
 pub fn gc_stale_containers(base_dir: &Path) {
-    let containers_dir = base_dir.join("containers");
-    let entries = match std::fs::read_dir(&containers_dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-
+    let Ok(entries) = std::fs::read_dir(base_dir.join("containers")) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
-            continue;
-        }
-
-        // Skip containers we don't own (e.g. rootful containers when running rootless).
-        // Avoids wasting time on umount/remove_dir_all that will always EPERM.
+        if !entry.file_type().is_ok_and(|ft| ft.is_dir()) { continue; }
         if let Ok(meta) = std::fs::metadata(&path) {
             use std::os::unix::fs::MetadataExt;
-            if meta.uid() != nix::unistd::getuid().as_raw() {
-                continue;
-            }
+            if meta.uid() != nix::unistd::getuid().as_raw() { continue; }
         }
-
         if let Err(e) = gc_try_clean_container(&path) {
-            eprintln!(
-                "warning: gc failed for {}: {e}",
-                path.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-            );
+            eprintln!("warning: gc failed for {}: {e}",
+                path.file_name().unwrap_or_default().to_string_lossy());
         }
     }
 }
 
 fn gc_try_clean_container(container_dir: &Path) -> Result<()> {
     let lock_path = container_dir.join("hippobox.lock");
-
-    // No lock file means a legacy or partially-created container. Try to clean it.
     if lock_path.exists() {
         let lock_file = File::open(&lock_path)?;
         match Flock::lock(lock_file, FlockArg::LockExclusiveNonblock) {
-            Ok(_flock) => {
-                // Lock acquired — the owner process is dead. Proceed with cleanup.
-            }
-            Err((_, nix::errno::Errno::EAGAIN)) => {
-                // Lock held by another process — container is active.
-                return Ok(());
-            }
+            Ok(_flock) => {} // Lock acquired — owner is dead
+            Err((_, nix::errno::Errno::EAGAIN)) => return Ok(()), // Active
             Err((_, e)) => return Err(e).context("failed to probe container lock"),
         }
     }
 
     let merged = container_dir.join("merged");
     if merged.exists() {
-        // Unmount device bind mounts first (children before parent).
         let _ = super::mounts::cleanup_host_device_sources(&merged);
-
-        // Try non-detach overlay unmount.
-        // EINVAL: not mounted. ENOENT: path gone. EPERM: rootless user namespace mount.
         match nix::mount::umount2(&merged, nix::mount::MntFlags::empty()) {
-            Ok(_)
-            | Err(
-                nix::errno::Errno::EINVAL
-                | nix::errno::Errno::ENOENT
-                | nix::errno::Errno::EPERM,
-            ) => {}
+            Ok(())
+            | Err(nix::errno::Errno::EINVAL | nix::errno::Errno::ENOENT | nix::errno::Errno::EPERM) => {}
             Err(nix::errno::Errno::EBUSY) => {
-                eprintln!(
-                    "warning: overlay still busy for {}, skipping",
-                    container_dir
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                );
+                eprintln!("warning: overlay still busy for {}, skipping",
+                    container_dir.file_name().unwrap_or_default().to_string_lossy());
                 return Ok(());
             }
             Err(e) => return Err(e).context("failed to unmount stale overlay"),
@@ -105,25 +109,19 @@ fn gc_try_clean_container(container_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Overlayfs work dirs have restrictive permissions (mode 000) that prevent
-/// removal. Recursively fix permissions before cleanup.
 fn fix_overlay_workdir(container_dir: &Path) {
-    fn fix_recursive(dir: &Path) {
+    let work_dir = container_dir.join("work");
+    if !work_dir.exists() { return; }
+    fn fix(dir: &Path) {
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
-                    fix_recursive(&path);
-                }
+                let p = entry.path();
+                if p.is_dir() { fix(&p); }
             }
         }
     }
-    let work_dir = container_dir.join("work");
-    if work_dir.exists() {
-        let _ = std::fs::set_permissions(&work_dir, std::fs::Permissions::from_mode(0o700));
-        fix_recursive(&work_dir);
-    }
+    fix(&work_dir);
 }
 
 pub(super) struct CleanupGuard {
@@ -139,11 +137,11 @@ pub(super) struct CleanupGuard {
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
         if !self.rootless {
-            let _ = super::cgroups::cleanup(&self.id);
+            let _ = cgroup_cleanup(&self.id);
         }
         let can_remove = if self.overlay_mounted {
             let _ = super::mounts::cleanup_host_device_sources(&self.merged);
-            super::rootfs::unmount_overlay(&self.merged).is_ok()
+            super::mounts::unmount_overlay(&self.merged).is_ok()
         } else {
             true
         };
@@ -164,72 +162,49 @@ mod tests {
 
     fn make_container_dir(base: &Path, name: &str) -> PathBuf {
         let dir = base.join("containers").join(name);
-        std::fs::create_dir_all(dir.join("merged")).unwrap();
-        std::fs::create_dir_all(dir.join("upper")).unwrap();
-        std::fs::create_dir_all(dir.join("work")).unwrap();
+        for sub in ["merged", "upper", "work"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
         dir
     }
 
     #[test]
-    fn gc_removes_dir_with_no_lock_file() {
+    fn gc_removes_stale_and_keeps_active() {
         let tmp = TempDir::new().unwrap();
-        let container = make_container_dir(tmp.path(), "stale-no-lock");
 
+        // No lock file → removed
+        let stale = make_container_dir(tmp.path(), "stale-no-lock");
         gc_stale_containers(tmp.path());
-        assert!(!container.exists(), "stale container without lock should be removed");
+        assert!(!stale.exists());
+
+        // Held lock → kept
+        let active = make_container_dir(tmp.path(), "active");
+        let _lock = acquire_container_lock(&active).unwrap();
+        gc_stale_containers(tmp.path());
+        assert!(active.exists());
+
+        // Released lock → removed
+        let dead = make_container_dir(tmp.path(), "dead-owner");
+        { let _lock = acquire_container_lock(&dead).unwrap(); }
+        gc_stale_containers(tmp.path());
+        assert!(!dead.exists());
     }
 
     #[test]
-    fn gc_skips_container_with_held_lock() {
+    fn gc_handles_edge_cases() {
         let tmp = TempDir::new().unwrap();
-        let container = make_container_dir(tmp.path(), "active");
-        let _lock = acquire_container_lock(&container).unwrap();
-
         gc_stale_containers(tmp.path());
-        assert!(container.exists(), "active container should be kept");
-    }
-
-    #[test]
-    fn gc_removes_container_with_released_lock() {
-        let tmp = TempDir::new().unwrap();
-        let container = make_container_dir(tmp.path(), "dead-owner");
-
-        // Acquire and immediately release the lock.
-        {
-            let _lock = acquire_container_lock(&container).unwrap();
-        }
-
-        gc_stale_containers(tmp.path());
-        assert!(!container.exists(), "container with released lock should be removed");
-    }
-
-    #[test]
-    fn gc_handles_empty_containers_dir() {
-        let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("containers")).unwrap();
-
         gc_stale_containers(tmp.path());
-        // Should not panic or error.
+        let c = make_container_dir(tmp.path(), "once");
+        gc_stale_containers(tmp.path());
+        assert!(!c.exists());
+        gc_stale_containers(tmp.path());
     }
 
     #[test]
-    fn gc_handles_missing_containers_dir() {
-        let tmp = TempDir::new().unwrap();
-        // No containers/ dir at all.
-
-        gc_stale_containers(tmp.path());
-        // Should not panic or error.
-    }
-
-    #[test]
-    fn gc_is_idempotent() {
-        let tmp = TempDir::new().unwrap();
-        let container = make_container_dir(tmp.path(), "once-stale");
-
-        gc_stale_containers(tmp.path());
-        assert!(!container.exists());
-
-        // Second run should be a no-op.
-        gc_stale_containers(tmp.path());
+    fn cgroup_path_format() {
+        let path = cgroup_path("abc123");
+        assert!(path.ends_with("/abc123") && path.contains("hippobox"));
     }
 }
