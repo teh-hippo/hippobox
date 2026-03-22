@@ -1,7 +1,6 @@
 use crate::image::{Descriptor, ImageConfig, ImageRef, Manifest, StoredImage};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
@@ -130,17 +129,21 @@ fn create_extract_temp_dir(target_dir: &Path) -> Result<PathBuf> {
 
 struct HashingReader<R: Read> {
     inner: R,
-    hasher: Sha256,
+    ctx: ring::digest::Context,
 }
 
 impl<R: Read> Read for HashingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
         if n > 0 {
-            self.hasher.update(&buf[..n]);
+            self.ctx.update(&buf[..n]);
         }
         Ok(n)
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 const MAX_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
@@ -280,7 +283,7 @@ impl RegistryClient {
         let result = (|| -> Result<()> {
             let reader = HashingReader {
                 inner: resp.into_body().into_reader(),
-                hasher: Sha256::new(),
+                ctx: ring::digest::Context::new(&ring::digest::SHA256),
             };
             let mt = layer.media_type.as_deref();
             let is_gzip = mt.is_none_or(|m| m.contains("tar+gzip") || m.ends_with("diff.tar.gzip"));
@@ -301,7 +304,8 @@ impl RegistryClient {
             } else {
                 bail!("unsupported layer media type: {mt:?}")
             };
-            let computed = format!("sha256:{:x}", reader.hasher.finalize());
+            let digest = reader.ctx.finish();
+            let computed = format!("sha256:{}", hex(digest.as_ref()));
             if computed != layer.digest {
                 bail!(
                     "layer digest mismatch: expected {}, got {}",
@@ -546,10 +550,10 @@ mod tests {
             b"",
             b"The quick brown fox jumps over the lazy dog",
         ] {
-            let expected = format!("{:x}", Sha256::digest(data));
+            let expected = hex(ring::digest::digest(&ring::digest::SHA256, data).as_ref());
             let mut r = HashingReader {
                 inner: std::io::Cursor::new(data),
-                hasher: Sha256::new(),
+                ctx: ring::digest::Context::new(&ring::digest::SHA256),
             };
             let mut buf = [0u8; 5];
             let mut total = Vec::new();
@@ -561,7 +565,7 @@ mod tests {
                 total.extend_from_slice(&buf[..n]);
             }
             assert_eq!(total, data);
-            assert_eq!(format!("{:x}", r.hasher.finalize()), expected);
+            assert_eq!(hex(r.ctx.finish().as_ref()), expected);
         }
     }
     #[test]
