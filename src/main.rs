@@ -15,12 +15,18 @@ fn hippobox_dir() -> PathBuf {
 }
 
 fn ensure_storage_dirs() -> Result<()> {
-    for sub in ["layers/sha256", "images", "containers"] { fs::create_dir_all(hippobox_dir().join(sub))?; }
+    for sub in ["layers/sha256", "images", "containers"] {
+        fs::create_dir_all(hippobox_dir().join(sub))?;
+    }
     Ok(())
 }
 
 #[derive(Parser)]
-#[command(name = "hippobox", about = "Lightweight Linux container manager", version)]
+#[command(
+    name = "hippobox",
+    about = "Lightweight Linux container manager",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -28,7 +34,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Pull { image: String },
+    Pull {
+        image: String,
+    },
     Run {
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
@@ -52,7 +60,9 @@ fn main() -> Result<()> {
     if let Some(arg1) = args.next() {
         let parse_fd = |a: Option<std::ffi::OsString>, label: &str| -> i32 {
             a.unwrap_or_else(|| panic!("missing fd for {label}"))
-                .to_string_lossy().parse().unwrap_or_else(|_| panic!("invalid fd for {label}"))
+                .to_string_lossy()
+                .parse()
+                .unwrap_or_else(|_| panic!("invalid fd for {label}"))
         };
         if arg1 == "--container-init" {
             return container::container_init(parse_fd(args.next(), "container-init"));
@@ -61,8 +71,10 @@ fn main() -> Result<()> {
             let fd = parse_fd(args.next(), "rootless-bootstrap");
             container::set_pdeathsig().context("failed to set rootless PDEATHSIG")?;
             let spec: container::ContainerSpec =
-                serde_json::from_reader(std::io::BufReader::new(unsafe { std::fs::File::from_raw_fd(fd) }))
-                    .context("failed to read rootless bootstrap spec from pipe")?;
+                serde_json::from_reader(std::io::BufReader::new(unsafe {
+                    std::fs::File::from_raw_fd(fd)
+                }))
+                .context("failed to read rootless bootstrap spec from pipe")?;
             std::process::exit(container::run_prepared(spec)?);
         }
     }
@@ -78,7 +90,12 @@ fn main() -> Result<()> {
             eprintln!("pulled {image}");
         }
         Commands::Run {
-            image, cmd, env, volumes, ports, network,
+            image,
+            cmd,
+            env,
+            volumes,
+            ports,
+            network,
         } => {
             let image_ref = ImageRef::parse(&image)?;
             let base_dir = hippobox_dir();
@@ -95,20 +112,26 @@ fn main() -> Result<()> {
             let (manifest, config) = container::load_image(&image_ref, &base_dir)?;
 
             let mut volume_mounts: Vec<container::VolumeMount> = volumes
-                .iter().map(|v| container::parse_volume(v)).collect::<Result<_>>()?;
+                .iter()
+                .map(|v| container::parse_volume(v))
+                .collect::<Result<_>>()?;
 
             if let Some(image_volumes) = config.config.as_ref().and_then(|c| c.volumes.as_ref()) {
                 for vol_path in image_volumes.keys() {
                     if !volume_mounts.iter().any(|v| v.target == *vol_path) {
                         volume_mounts.push(container::VolumeMount {
-                            source: "tmpfs".into(), target: vol_path.clone(), read_only: false,
+                            source: "tmpfs".into(),
+                            target: vol_path.clone(),
+                            read_only: false,
                         });
                     }
                 }
             }
 
             let port_mappings: Vec<container::PortMapping> = ports
-                .iter().map(|p| container::parse_port(p)).collect::<Result<_>>()?;
+                .iter()
+                .map(|p| container::parse_port(p))
+                .collect::<Result<_>>()?;
 
             let network_mode = if !port_mappings.is_empty()
                 && network == "host"
@@ -126,15 +149,26 @@ fn main() -> Result<()> {
                 );
             }
 
-            let id = format!("{:x}", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or(std::time::Duration::from_secs(0))
-                .as_nanos());
+            let id = format!(
+                "{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or(std::time::Duration::from_secs(0))
+                    .as_nanos()
+            );
             let spec = container::ContainerSpec {
-                id, image_ref, manifest, config, base_dir,
-                user_cmd: cmd, user_env: env, volumes: volume_mounts,
-                network_mode, external_netns: !port_mappings.is_empty(),
-                port_mappings, rootless,
+                id,
+                image_ref,
+                manifest,
+                config,
+                base_dir,
+                user_cmd: cmd,
+                user_env: env,
+                volumes: volume_mounts,
+                network_mode,
+                external_netns: !port_mappings.is_empty(),
+                port_mappings,
+                rootless,
             };
 
             let exit_code = container::run(spec)?;
@@ -149,9 +183,14 @@ fn main() -> Result<()> {
 
 fn list_images(base_dir: &Path) -> Result<()> {
     let repos = image::walk_stored_images(&base_dir.join("images"))?;
-    if repos.is_empty() { println!("no images cached"); return Ok(()); }
+    if repos.is_empty() {
+        println!("no images cached");
+        return Ok(());
+    }
     println!("{:<60} {:<15}", "REPOSITORY", "TAG");
-    for (repo, tag, _) in repos { println!("{repo:<60} {tag:<15}"); }
+    for (repo, tag, _) in repos {
+        println!("{repo:<60} {tag:<15}");
+    }
     Ok(())
 }
 
