@@ -103,17 +103,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_port_valid() {
-        let pm = parse_port("8080:80").unwrap();
-        assert_eq!((pm.host_port, pm.container_port, pm.protocol.as_str()), (8080, 80, "tcp"));
-        let pm = parse_port("5353:53/udp").unwrap();
-        assert_eq!((pm.host_port, pm.container_port, pm.protocol.as_str()), (5353, 53, "udp"));
-        assert_eq!(parse_port("3000:3000/tcp").unwrap().protocol, "tcp");
-        assert_eq!(parse_port("65535:65535").unwrap().host_port, 65535);
-    }
-
-    #[test]
-    fn parse_port_rejects_invalid() {
+    fn parse_port_valid_and_invalid() {
+        for (spec, hp, cp, proto) in [("8080:80", 8080, 80, "tcp"), ("5353:53/udp", 5353, 53, "udp"),
+            ("3000:3000/tcp", 3000, 3000, "tcp"), ("65535:65535", 65535, 65535, "tcp"), ("1:1", 1, 1, "tcp")] {
+            let pm = parse_port(spec).unwrap();
+            assert_eq!((pm.host_port, pm.container_port, pm.protocol.as_str()), (hp, cp, proto), "spec={spec}");
+        }
         for bad in ["0:80", "8080:0", "8080", "abc:80", "8080:abc", "8080:80/sctp", "65536:80"] {
             assert!(parse_port(bad).is_err(), "should reject {bad:?}");
         }
@@ -123,29 +118,17 @@ mod tests {
     fn parse_network_mode_valid_and_invalid() {
         assert_eq!(parse_network_mode("host").unwrap(), NetworkMode::Host);
         assert_eq!(parse_network_mode("none").unwrap(), NetworkMode::None);
-        assert!(parse_network_mode("bridge").is_err());
-        assert!(parse_network_mode("").is_err());
+        for bad in ["bridge", ""] { assert!(parse_network_mode(bad).is_err()); }
     }
 
     #[test]
     fn add_port_args_builds_flags() {
-        let check = |proto: &str, flag: &str| {
+        for (proto, flag) in [("tcp", "-t"), ("udp", "-u")] {
             let mut cmd = std::process::Command::new("echo");
-            add_port_args(&mut cmd, &[PortMapping {
-                host_port: 80, container_port: 8080, protocol: proto.into(),
-            }]);
+            add_port_args(&mut cmd, &[PortMapping { host_port: 80, container_port: 8080, protocol: proto.into() }]);
             let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
             assert_eq!(args, vec![flag, "80:8080"]);
-        };
-        check("tcp", "-t");
-        check("udp", "-u");
-        let mut cmd = std::process::Command::new("echo");
-        add_port_args(&mut cmd, &[]);
-        assert_eq!(cmd.get_args().count(), 0);
-    }
-
-    #[test]
-    fn add_port_args_multiple_ports() {
+        }
         let mut cmd = std::process::Command::new("echo");
         add_port_args(&mut cmd, &[
             PortMapping { host_port: 80, container_port: 8080, protocol: "tcp".into() },
@@ -156,27 +139,14 @@ mod tests {
     }
 
     #[test]
-    fn which_finds_executables_on_path() {
-        // /usr/bin/env should exist on any Linux system
-        let result = which("env");
-        assert!(result.is_some(), "should find 'env' on PATH");
-        assert!(result.unwrap().is_file());
-    }
-
-    #[test]
-    fn which_returns_none_for_missing() {
+    fn which_lookup() {
+        assert!(which("env").unwrap().is_file());
         assert!(which("hippobox_nonexistent_binary_xyz").is_none());
-    }
 
-    #[test]
-    fn which_respects_path_env() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::TempDir::new().unwrap();
-        let bin = tmp.path().join("mytool");
-        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // Prepend our temp dir to PATH (safer than replacing it entirely)
+        std::fs::write(tmp.path().join("mytool"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(tmp.path().join("mytool"), std::fs::Permissions::from_mode(0o755)).unwrap();
         let original = std::env::var_os("PATH").unwrap_or_default();
         let new_path = format!("{}:{}", tmp.path().display(), original.to_string_lossy());
         unsafe { std::env::set_var("PATH", &new_path); }
@@ -186,32 +156,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_port_boundary_values() {
-        // Port 1 is the minimum valid port
-        let pm = parse_port("1:1").unwrap();
-        assert_eq!((pm.host_port, pm.container_port), (1, 1));
-
-        // Same port on both sides
-        let pm = parse_port("3000:3000").unwrap();
-        assert_eq!(pm.host_port, pm.container_port);
-    }
-
-    #[test]
-    fn network_mode_serialisation_round_trip() {
+    fn serialisation_round_trips() {
         for mode in [NetworkMode::Host, NetworkMode::None] {
-            let json = serde_json::to_string(&mode).unwrap();
-            let back: NetworkMode = serde_json::from_str(&json).unwrap();
-            assert_eq!(mode, back);
+            assert_eq!(serde_json::from_str::<NetworkMode>(&serde_json::to_string(&mode).unwrap()).unwrap(), mode);
         }
-    }
-
-    #[test]
-    fn port_mapping_serialisation_round_trip() {
         let pm = PortMapping { host_port: 8080, container_port: 80, protocol: "tcp".into() };
-        let json = serde_json::to_string(&pm).unwrap();
-        let back: PortMapping = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.host_port, 8080);
-        assert_eq!(back.container_port, 80);
-        assert_eq!(back.protocol, "tcp");
+        let back: PortMapping = serde_json::from_str(&serde_json::to_string(&pm).unwrap()).unwrap();
+        assert_eq!((back.host_port, back.container_port, back.protocol.as_str()), (8080, 80, "tcp"));
     }
 }

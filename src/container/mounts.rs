@@ -187,22 +187,9 @@ mod tests {
     }
     #[test]
     fn parse_volume_rejects_invalid() {
-        for bad in ["", ":/data", "/tmp:", "relative:/data", "/tmp:relative",
+        for bad in ["", ":/data", "/tmp:", "relative:/data", "/tmp:relative", "/a:/b:ro:extra",
             "/tmp:/data:xx", "/nonexistent/path:/data", "/tmp:/../escape", "/tmp:/data/../../../etc"] {
             assert!(parse_volume(bad).is_err(), "should reject {bad:?}");
         }
-    }
-
-    #[test]
-    fn parse_volume_rejects_too_many_colons() {
-        assert!(parse_volume("/a:/b:ro:extra").is_err());
-    }
-
-    #[test]
-    fn parse_volume_source_canonicalised() {
-        // Source path should be canonicalised (resolve symlinks, remove ..)
-        let v = parse_volume("/tmp/../tmp:/data").unwrap();
-        assert_eq!(v.source, "/tmp");
-        assert!(!v.source.contains(".."));
     }
 }

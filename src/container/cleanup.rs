@@ -129,131 +129,82 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn make_container_dir(base: &Path, name: &str) -> PathBuf {
+    fn mk_container(base: &Path, name: &str) -> PathBuf {
         let dir = base.join("containers").join(name);
         for sub in ["merged", "upper", "work"] { std::fs::create_dir_all(dir.join(sub)).unwrap(); }
         dir
     }
 
     #[test]
-    fn gc_removes_stale_and_keeps_active() {
+    fn gc_stale_and_active() {
         let tmp = TempDir::new().unwrap();
-        let stale = make_container_dir(tmp.path(), "stale-no-lock");
+        // Stale (no lock) gets cleaned
+        let stale = mk_container(tmp.path(), "stale");
         gc_stale_containers(tmp.path());
         assert!(!stale.exists());
 
-        let active = make_container_dir(tmp.path(), "active");
+        // Active (locked) survives
+        let active = mk_container(tmp.path(), "active");
         let _lock = acquire_container_lock(&active).unwrap();
         gc_stale_containers(tmp.path());
         assert!(active.exists());
 
-        let dead = make_container_dir(tmp.path(), "dead-owner");
+        // Dead (lock released) gets cleaned
+        let dead = mk_container(tmp.path(), "dead");
         { let _lock = acquire_container_lock(&dead).unwrap(); }
         gc_stale_containers(tmp.path());
         assert!(!dead.exists());
     }
 
     #[test]
-    fn gc_handles_edge_cases() {
+    fn gc_edge_cases() {
         let tmp = TempDir::new().unwrap();
-        gc_stale_containers(tmp.path());
+        gc_stale_containers(tmp.path()); // no containers dir
         std::fs::create_dir_all(tmp.path().join("containers")).unwrap();
+        gc_stale_containers(tmp.path()); // empty containers dir
+
+        // Multiple stale cleaned in one pass
+        let dirs: Vec<_> = (0..3).map(|i| mk_container(tmp.path(), &format!("s{i}"))).collect();
         gc_stale_containers(tmp.path());
-        let c = make_container_dir(tmp.path(), "once");
+        for d in &dirs { assert!(!d.exists()); }
+
+        // Non-directory entries ignored
+        std::fs::write(tmp.path().join("containers/file"), "x").unwrap();
         gc_stale_containers(tmp.path());
-        assert!(!c.exists());
+        assert!(tmp.path().join("containers/file").exists());
+
+        // Unreadable lock handled gracefully
+        let bad = mk_container(tmp.path(), "bad");
+        std::fs::create_dir(bad.join("hippobox.lock")).unwrap();
         gc_stale_containers(tmp.path());
     }
 
     #[test]
-    fn fix_overlay_workdir_handles_restricted_perms() {
+    fn fix_overlay_workdir_behaviour() {
         let tmp = TempDir::new().unwrap();
-        let container_dir = tmp.path().join("container");
-        let work = container_dir.join("work");
-        let nested = work.join("deep/nested/dir");
-        std::fs::create_dir_all(&nested).unwrap();
-        // Make directories restrictive (like overlayfs work dir can be)
-        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o000)).unwrap();
+        fix_overlay_workdir(tmp.path()); // noop when missing
 
-        fix_overlay_workdir(&container_dir);
-
-        // After fix, we should be able to read the work dir
-        let mode = std::fs::metadata(&work).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
-
-        // Cleanup - restore permissions so TempDir can clean up
-        let _ = std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o755));
+        let dir = tmp.path().join("container");
+        std::fs::create_dir_all(dir.join("work/deep/nested")).unwrap();
+        std::fs::set_permissions(dir.join("work"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        fix_overlay_workdir(&dir);
+        assert_eq!(std::fs::metadata(dir.join("work")).unwrap().permissions().mode() & 0o777, 0o700);
+        let _ = std::fs::set_permissions(dir.join("work"), std::fs::Permissions::from_mode(0o755));
     }
 
     #[test]
-    fn fix_overlay_workdir_noop_when_missing() {
+    fn acquire_lock_is_exclusive() {
         let tmp = TempDir::new().unwrap();
-        // Should not panic when work dir doesn't exist
-        fix_overlay_workdir(tmp.path());
-    }
-
-    #[test]
-    fn acquire_container_lock_is_exclusive() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("test-container");
+        let dir = tmp.path().join("c");
         std::fs::create_dir_all(&dir).unwrap();
-
-        let _lock1 = acquire_container_lock(&dir).unwrap();
-
-        // A non-blocking attempt should fail while locked
-        let lock_path = dir.join("hippobox.lock");
-        let lock_file = File::open(&lock_path).unwrap();
-        let result = Flock::lock(lock_file, FlockArg::LockExclusiveNonblock);
-        assert!(result.is_err(), "should fail to acquire lock while held");
+        let _lock = acquire_container_lock(&dir).unwrap();
+        assert!(Flock::lock(File::open(dir.join("hippobox.lock")).unwrap(), FlockArg::LockExclusiveNonblock).is_err());
     }
 
     #[test]
-    fn gc_skips_non_directory_entries() {
-        let tmp = TempDir::new().unwrap();
-        let containers = tmp.path().join("containers");
-        std::fs::create_dir_all(&containers).unwrap();
-        // Create a regular file in the containers dir (should be ignored)
-        std::fs::write(containers.join("not-a-container"), "junk").unwrap();
-        // Should not panic
-        gc_stale_containers(tmp.path());
-        // The file should still be there (GC only processes dirs)
-        assert!(containers.join("not-a-container").exists());
-    }
-
-    #[test]
-    fn gc_cleans_multiple_stale_containers() {
-        let tmp = TempDir::new().unwrap();
-        let c1 = make_container_dir(tmp.path(), "stale-1");
-        let c2 = make_container_dir(tmp.path(), "stale-2");
-        let c3 = make_container_dir(tmp.path(), "stale-3");
-
-        gc_stale_containers(tmp.path());
-
-        assert!(!c1.exists());
-        assert!(!c2.exists());
-        assert!(!c3.exists());
-    }
-
-    #[test]
-    fn gc_handles_unreadable_lock_file() {
-        let tmp = TempDir::new().unwrap();
-        let dir = make_container_dir(tmp.path(), "bad-lock");
-        // Create a directory where hippobox.lock should be a file
-        std::fs::create_dir(dir.join("hippobox.lock")).unwrap();
-
-        // gc should handle the error gracefully without panicking
-        gc_stale_containers(tmp.path());
-        // The container dir may or may not be cleaned (depends on error path),
-        // but it must not panic
-    }
-
-    #[test]
-    fn cgroup_path_contains_container_id() {
-        let path = cgroup_path("container-abc-123");
-        assert!(path.ends_with("/container-abc-123"));
-        assert!(path.starts_with("/sys/fs/cgroup"));
-
-        // Different IDs produce different paths
+    fn cgroup_path_format() {
+        let p = cgroup_path("abc");
+        assert!(p.ends_with("/abc") && p.starts_with("/sys/fs/cgroup"));
         assert_ne!(cgroup_path("a"), cgroup_path("b"));
     }
 }

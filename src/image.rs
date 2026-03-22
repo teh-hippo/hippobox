@@ -131,38 +131,14 @@ mod tests {
             ("docker.io/library/ubuntu:22.04", "registry-1.docker.io", "library/ubuntu", "22.04"),
             ("localhost/myimage:dev", "localhost", "myimage", "dev"),
             ("myregistry:5000/repo:tag", "myregistry:5000", "repo", "tag"),
+            ("ghcr.io/org/sub/repo:v2", "ghcr.io", "org/sub/repo", "v2"),
+            ("  nginx:latest  ", "registry-1.docker.io", "library/nginx", "latest"),
+            ("docker.io/myuser/myimage:v1", "registry-1.docker.io", "myuser/myimage", "v1"),
         ] {
             let r = ImageRef::parse(input).unwrap();
             assert_eq!((r.registry.as_str(), r.repository.as_str(), r.tag.as_str()), (reg, repo, tag), "failed for {input}");
         }
-    }
-
-    #[test]
-    fn parse_image_ref_errors() {
         for bad in ["", "  ", "ghcr.io/"] { assert!(ImageRef::parse(bad).is_err(), "should reject {bad:?}"); }
-    }
-
-    #[test]
-    fn parse_image_ref_with_nested_repo() {
-        let r = ImageRef::parse("ghcr.io/org/sub/repo:v2").unwrap();
-        assert_eq!(r.registry, "ghcr.io");
-        assert_eq!(r.repository, "org/sub/repo");
-        assert_eq!(r.tag, "v2");
-    }
-
-    #[test]
-    fn parse_image_ref_whitespace_trimmed() {
-        let r = ImageRef::parse("  nginx:latest  ").unwrap();
-        assert_eq!(r.repository, "library/nginx");
-        assert_eq!(r.tag, "latest");
-    }
-
-    #[test]
-    fn parse_image_ref_docker_io_rewrite() {
-        // docker.io should be rewritten to registry-1.docker.io
-        let r = ImageRef::parse("docker.io/myuser/myimage:v1").unwrap();
-        assert_eq!(r.registry, "registry-1.docker.io");
-        assert_eq!(r.repository, "myuser/myimage");
     }
 
     #[test]
@@ -177,8 +153,7 @@ mod tests {
         let d = Descriptor { media_type: None, digest: "sha256:abc123def456".into(), size: 100 };
         assert_eq!(d.hex(), "abc123def456");
         assert_eq!(d.layer_dir(Path::new("/hb")), Path::new("/hb/layers/sha256/abc123def456"));
-        let d = Descriptor { media_type: None, digest: "md5:abcdef".into(), size: 100 };
-        assert_eq!(d.hex(), "md5:abcdef");
+        assert_eq!(Descriptor { media_type: None, digest: "md5:abcdef".into(), size: 100 }.hex(), "md5:abcdef");
     }
 
     #[test]
