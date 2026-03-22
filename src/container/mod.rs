@@ -46,18 +46,7 @@ pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
     let stop_signal = cc.and_then(|c| c.stop_signal.as_deref()).unwrap_or("SIGTERM");
     let user = cc.and_then(|c| c.user.clone()).filter(|u| !u.is_empty());
 
-    let tail: Vec<String> = if spec.user_cmd.is_empty() {
-        cc.and_then(|c| c.cmd.clone()).unwrap_or_default()
-    } else {
-        spec.user_cmd
-    };
-    let argv: Vec<String> = match cc.and_then(|c| c.entrypoint.as_deref()) {
-        Some(ep) => ep.iter().cloned().chain(tail).collect(),
-        None => tail,
-    };
-    if argv.is_empty() {
-        bail!("no CMD or ENTRYPOINT in image config and no command provided");
-    }
+    let argv = build_argv(cc, spec.user_cmd)?;
 
     let mut env_vars = cc
         .and_then(|c| c.env.as_deref()).filter(|v| !v.is_empty()).map(|v| v.to_vec())
@@ -165,6 +154,22 @@ pub(super) fn env_find_mut<'a>(vars: &'a mut [String], key: &str) -> Option<&'a 
     vars.iter_mut().find(|v| v.split_once('=').is_some_and(|(k, _)| k == key))
 }
 
+fn build_argv(cc: Option<&crate::image::ContainerConfig>, user_cmd: Vec<String>) -> Result<Vec<String>> {
+    let tail: Vec<String> = if user_cmd.is_empty() {
+        cc.and_then(|c| c.cmd.clone()).unwrap_or_default()
+    } else {
+        user_cmd
+    };
+    let argv: Vec<String> = match cc.and_then(|c| c.entrypoint.as_deref()) {
+        Some(ep) => ep.iter().cloned().chain(tail).collect(),
+        None => tail,
+    };
+    if argv.is_empty() {
+        bail!("no CMD or ENTRYPOINT in image config and no command provided");
+    }
+    Ok(argv)
+}
+
 pub fn load_image(image_ref: &ImageRef, base_dir: &Path) -> Result<(Manifest, ImageConfig)> {
     let path = image_ref.image_metadata_path(base_dir);
     let data = std::fs::read(&path).with_context(|| {
@@ -194,5 +199,192 @@ mod tests {
 
         assert!(apply_env_overrides(vec![], &["NOEQUALS".into()]).is_err());
         assert!(apply_env_overrides(vec![], &["=value".into()]).is_err());
+    }
+
+    #[test]
+    fn env_overrides_empty_value() {
+        // KEY= with empty value is valid
+        let r = apply_env_overrides(vec![], &["EMPTY=".into()]).unwrap();
+        assert_eq!(r, vec!["EMPTY="]);
+    }
+
+    #[test]
+    fn env_overrides_multiple() {
+        let r = apply_env_overrides(
+            vec!["A=1".into(), "B=2".into(), "C=3".into()],
+            &["B=new".into(), "D=4".into(), "A=replaced".into()],
+        ).unwrap();
+        assert_eq!(r, vec!["A=replaced", "B=new", "C=3", "D=4"]);
+    }
+
+    #[test]
+    fn env_overrides_no_ops() {
+        let original = vec!["PATH=/usr/bin".into(), "HOME=/root".into()];
+        let r = apply_env_overrides(original.clone(), &[]).unwrap();
+        assert_eq!(r, original);
+    }
+
+    #[test]
+    fn env_find_mut_finds_and_misses() {
+        let mut vars = vec!["PATH=/usr/bin".into(), "HOME=/root".into(), "TERM=xterm".into()];
+        assert_eq!(env_find_mut(&mut vars, "HOME").unwrap().as_str(), "HOME=/root");
+        assert_eq!(env_find_mut(&mut vars, "PATH").unwrap().as_str(), "PATH=/usr/bin");
+        assert!(env_find_mut(&mut vars, "MISSING").is_none());
+        // Should not match partial key names
+        assert!(env_find_mut(&mut vars, "PAT").is_none());
+        assert!(env_find_mut(&mut vars, "PATHX").is_none());
+    }
+
+    #[test]
+    fn env_find_mut_empty_list() {
+        let mut vars: Vec<String> = vec![];
+        assert!(env_find_mut(&mut vars, "ANY").is_none());
+    }
+
+    #[test]
+    fn load_image_valid() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let img = crate::image::ImageRef::parse("nginx:1.25").unwrap();
+        let stored = crate::image::StoredImage {
+            manifest: crate::image::Manifest {
+                config: crate::image::Descriptor { media_type: None, digest: "sha256:cfg".into(), size: 10 },
+                layers: vec![crate::image::Descriptor { media_type: None, digest: "sha256:layer1".into(), size: 100 }],
+            },
+            config: crate::image::ImageConfig { config: None, rootfs: None },
+        };
+
+        let path = img.image_metadata_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+        let (manifest, _config) = load_image(&img, tmp.path()).unwrap();
+        assert_eq!(manifest.layers.len(), 1);
+        assert_eq!(manifest.layers[0].digest, "sha256:layer1");
+    }
+
+    #[test]
+    fn load_image_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let img = crate::image::ImageRef::parse("nonexistent:latest").unwrap();
+        let err = load_image(&img, tmp.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("image not found locally"));
+    }
+
+    #[test]
+    fn load_image_corrupt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let img = crate::image::ImageRef::parse("nginx:bad").unwrap();
+        let path = img.image_metadata_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "not json").unwrap();
+
+        let err = load_image(&img, tmp.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("failed to parse"));
+    }
+
+    #[test]
+    fn find_rename_shim_returns_none_when_missing() {
+        // Unless we're running from a build dir with librename_shim.so present,
+        // find_rename_shim should return None
+        let result = find_rename_shim();
+        // Can't assert None because CI might have it, but we can assert the type
+        if let Some(path) = result {
+            assert!(path.exists());
+            assert!(path.file_name().unwrap().to_str().unwrap().contains("rename_shim"));
+        }
+    }
+
+    #[test]
+    fn container_spec_serialisation_round_trip() {
+        let spec = ContainerSpec {
+            id: "test123".into(),
+            image_ref: crate::image::ImageRef::parse("alpine:3.19").unwrap(),
+            manifest: crate::image::Manifest {
+                config: crate::image::Descriptor { media_type: None, digest: "sha256:cfg".into(), size: 10 },
+                layers: vec![],
+            },
+            config: crate::image::ImageConfig { config: None, rootfs: None },
+            base_dir: PathBuf::from("/tmp/hb"),
+            user_cmd: vec!["sh".into()],
+            user_env: vec!["FOO=bar".into()],
+            volumes: vec![],
+            network_mode: net::NetworkMode::None,
+            port_mappings: vec![],
+            external_netns: false,
+            rootless: true,
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: ContainerSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, "test123");
+        assert!(back.rootless);
+        assert_eq!(back.network_mode, net::NetworkMode::None);
+    }
+
+    fn make_config(entrypoint: Option<Vec<String>>, cmd: Option<Vec<String>>) -> crate::image::ContainerConfig {
+        crate::image::ContainerConfig {
+            entrypoint, cmd,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn build_argv_user_cmd_overrides_image_cmd() {
+        let cc = make_config(None, Some(vec!["default-cmd".into()]));
+        let argv = build_argv(Some(&cc), vec!["custom".into()]).unwrap();
+        assert_eq!(argv, vec!["custom"]);
+    }
+
+    #[test]
+    fn build_argv_entrypoint_plus_cmd() {
+        let cc = make_config(
+            Some(vec!["/entrypoint.sh".into()]),
+            Some(vec!["arg1".into(), "arg2".into()]),
+        );
+        let argv = build_argv(Some(&cc), vec![]).unwrap();
+        assert_eq!(argv, vec!["/entrypoint.sh", "arg1", "arg2"]);
+    }
+
+    #[test]
+    fn build_argv_entrypoint_plus_user_cmd() {
+        let cc = make_config(
+            Some(vec!["/entrypoint.sh".into()]),
+            Some(vec!["default".into()]),
+        );
+        // User cmd replaces image CMD but keeps entrypoint
+        let argv = build_argv(Some(&cc), vec!["override".into()]).unwrap();
+        assert_eq!(argv, vec!["/entrypoint.sh", "override"]);
+    }
+
+    #[test]
+    fn build_argv_entrypoint_only() {
+        let cc = make_config(Some(vec!["/bin/server".into()]), None);
+        let argv = build_argv(Some(&cc), vec![]).unwrap();
+        assert_eq!(argv, vec!["/bin/server"]);
+    }
+
+    #[test]
+    fn build_argv_cmd_only() {
+        let cc = make_config(None, Some(vec!["/bin/sh".into(), "-c".into(), "echo hi".into()]));
+        let argv = build_argv(Some(&cc), vec![]).unwrap();
+        assert_eq!(argv, vec!["/bin/sh", "-c", "echo hi"]);
+    }
+
+    #[test]
+    fn build_argv_no_config_with_user_cmd() {
+        let argv = build_argv(None, vec!["/bin/bash".into()]).unwrap();
+        assert_eq!(argv, vec!["/bin/bash"]);
+    }
+
+    #[test]
+    fn build_argv_empty_everything_fails() {
+        let cc = make_config(None, None);
+        let err = build_argv(Some(&cc), vec![]).unwrap_err();
+        assert!(format!("{err}").contains("no CMD or ENTRYPOINT"));
+    }
+
+    #[test]
+    fn build_argv_no_config_no_user_cmd_fails() {
+        let err = build_argv(None, vec![]).unwrap_err();
+        assert!(format!("{err}").contains("no CMD or ENTRYPOINT"));
     }
 }

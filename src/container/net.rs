@@ -143,4 +143,75 @@ mod tests {
         add_port_args(&mut cmd, &[]);
         assert_eq!(cmd.get_args().count(), 0);
     }
+
+    #[test]
+    fn add_port_args_multiple_ports() {
+        let mut cmd = std::process::Command::new("echo");
+        add_port_args(&mut cmd, &[
+            PortMapping { host_port: 80, container_port: 8080, protocol: "tcp".into() },
+            PortMapping { host_port: 53, container_port: 5353, protocol: "udp".into() },
+        ]);
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap().to_string()).collect();
+        assert_eq!(args, vec!["-t", "80:8080", "-u", "53:5353"]);
+    }
+
+    #[test]
+    fn which_finds_executables_on_path() {
+        // /usr/bin/env should exist on any Linux system
+        let result = which("env");
+        assert!(result.is_some(), "should find 'env' on PATH");
+        assert!(result.unwrap().is_file());
+    }
+
+    #[test]
+    fn which_returns_none_for_missing() {
+        assert!(which("hippobox_nonexistent_binary_xyz").is_none());
+    }
+
+    #[test]
+    fn which_respects_path_env() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bin = tmp.path().join("mytool");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Prepend our temp dir to PATH (safer than replacing it entirely)
+        let original = std::env::var_os("PATH").unwrap_or_default();
+        let new_path = format!("{}:{}", tmp.path().display(), original.to_string_lossy());
+        unsafe { std::env::set_var("PATH", &new_path); }
+        let result = which("mytool");
+        unsafe { std::env::set_var("PATH", &original); }
+        assert_eq!(result.unwrap().file_name().unwrap(), "mytool");
+    }
+
+    #[test]
+    fn parse_port_boundary_values() {
+        // Port 1 is the minimum valid port
+        let pm = parse_port("1:1").unwrap();
+        assert_eq!((pm.host_port, pm.container_port), (1, 1));
+
+        // Same port on both sides
+        let pm = parse_port("3000:3000").unwrap();
+        assert_eq!(pm.host_port, pm.container_port);
+    }
+
+    #[test]
+    fn network_mode_serialisation_round_trip() {
+        for mode in [NetworkMode::Host, NetworkMode::None] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let back: NetworkMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(mode, back);
+        }
+    }
+
+    #[test]
+    fn port_mapping_serialisation_round_trip() {
+        let pm = PortMapping { host_port: 8080, container_port: 80, protocol: "tcp".into() };
+        let json = serde_json::to_string(&pm).unwrap();
+        let back: PortMapping = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.host_port, 8080);
+        assert_eq!(back.container_port, 80);
+        assert_eq!(back.protocol, "tcp");
+    }
 }

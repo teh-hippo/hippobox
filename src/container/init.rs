@@ -186,4 +186,77 @@ mod tests {
         assert_eq!(resolve_id("nobody", path, "user").unwrap(), 65534);
         assert!(resolve_id("nonexistent", path, "user").is_err());
     }
+
+    #[test]
+    fn resolve_id_numeric_doesnt_need_file() {
+        // Numeric IDs should work even with a nonexistent file
+        assert_eq!(resolve_id("1000", "/nonexistent/file", "user").unwrap(), 1000);
+        assert_eq!(resolve_id("0", "/nonexistent/file", "user").unwrap(), 0);
+    }
+
+    #[test]
+    fn resolve_id_rejects_named_with_missing_file() {
+        let err = resolve_id("someuser", "/nonexistent/path/passwd", "user").unwrap_err();
+        assert!(format!("{err:#}").contains("failed to read"));
+    }
+
+    #[test]
+    fn resolve_id_handles_malformed_lines() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(
+            &mut std::fs::File::create(tmp.path()).unwrap(),
+            b"short\n\nempty:::\nuser:x:notanumber:0::/home/user:/bin/bash\ngood:x:42:42:Good:/home/good:/bin/sh\n",
+        ).unwrap();
+        let path = tmp.path().to_str().unwrap();
+        assert_eq!(resolve_id("good", path, "user").unwrap(), 42);
+        assert!(resolve_id("user", path, "user").is_err()); // UID field isn't a valid number
+    }
+
+    #[test]
+    fn passwd_field_by_uid_extracts_fields() {
+        // This test relies on /etc/passwd having root at UID 0
+        if let Some(home) = passwd_field_by_uid(0, 5) {
+            assert!(home == "/root" || home.starts_with('/'), "root home should be an absolute path");
+        }
+        // UID that almost certainly doesn't exist
+        assert!(passwd_field_by_uid(99999, 5).is_none());
+    }
+
+    #[test]
+    fn setup_user_rootless_returns_none() {
+        // In rootless mode, setup_user should return None and not attempt setuid
+        let result = setup_user("1000", true).unwrap();
+        assert!(result.is_none(), "rootless mode should skip user setup");
+    }
+
+    #[test]
+    fn seccomp_blocked_list_is_valid() {
+        // Verify the seccomp BLOCKED list has expected properties
+        use seccompiler::{SeccompAction, SeccompFilter, TargetArch};
+
+        const BLOCKED: &[i64] = &[
+            101, 103, 134, 135, 136, 139, 155, 163, 164, 165, 166, 167, 168, 169,
+            172, 173, 174, 175, 176, 177, 178, 179, 180, 206, 212, 227, 237, 238,
+            239, 246, 248, 249, 250, 272, 279, 298, 304, 305, 308, 310, 311, 312,
+            313, 320, 321, 323, 425, 426, 427, 428, 429, 430, 431, 432, 434, 442,
+        ];
+
+        assert!(!BLOCKED.is_empty(), "blocked syscall list should not be empty");
+        // Verify no duplicates
+        let mut sorted = BLOCKED.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), BLOCKED.len(), "blocked syscall list should have no duplicates");
+
+        // Verify the list is already sorted (convention)
+        assert_eq!(sorted, BLOCKED.to_vec(), "blocked syscall list should be sorted");
+
+        // Verify it compiles into a valid BPF program
+        let rules: std::collections::BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
+            BLOCKED.iter().map(|&nr| (nr, vec![])).collect();
+        let filter = SeccompFilter::new(rules, SeccompAction::Allow, SeccompAction::Errno(1), TargetArch::x86_64)
+            .expect("seccomp filter should be valid");
+        let _prog: seccompiler::BpfProgram = filter.try_into()
+            .expect("BPF program should compile");
+    }
 }

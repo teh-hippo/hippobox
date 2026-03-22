@@ -143,6 +143,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_image_ref_with_nested_repo() {
+        let r = ImageRef::parse("ghcr.io/org/sub/repo:v2").unwrap();
+        assert_eq!(r.registry, "ghcr.io");
+        assert_eq!(r.repository, "org/sub/repo");
+        assert_eq!(r.tag, "v2");
+    }
+
+    #[test]
+    fn parse_image_ref_whitespace_trimmed() {
+        let r = ImageRef::parse("  nginx:latest  ").unwrap();
+        assert_eq!(r.repository, "library/nginx");
+        assert_eq!(r.tag, "latest");
+    }
+
+    #[test]
+    fn parse_image_ref_docker_io_rewrite() {
+        // docker.io should be rewritten to registry-1.docker.io
+        let r = ImageRef::parse("docker.io/myuser/myimage:v1").unwrap();
+        assert_eq!(r.registry, "registry-1.docker.io");
+        assert_eq!(r.repository, "myuser/myimage");
+    }
+
+    #[test]
     fn image_metadata_path_layout() {
         let r = ImageRef::parse("nginx").unwrap();
         assert_eq!(r.image_metadata_path(Path::new("/tmp/hb")),

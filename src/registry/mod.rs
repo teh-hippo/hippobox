@@ -189,3 +189,165 @@ fn fetch_anonymous_token(agent: &ureq::Agent, image_ref: &ImageRef) -> Result<St
 
 #[derive(Deserialize)]
 struct TokenResponse { token: Option<String>, access_token: Option<String> }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image::{Descriptor, ImageConfig, ImageRef, Manifest, StoredImage};
+    use tempfile::TempDir;
+
+    fn make_descriptor(digest: &str) -> Descriptor {
+        Descriptor { media_type: None, digest: digest.into(), size: 100 }
+    }
+
+    fn make_stored_image(digests: &[&str]) -> StoredImage {
+        StoredImage {
+            manifest: Manifest {
+                config: make_descriptor("sha256:cfg"),
+                layers: digests.iter().map(|d| make_descriptor(d)).collect(),
+            },
+            config: ImageConfig { config: None, rootfs: None },
+        }
+    }
+
+    fn setup_layer(base: &Path, digest: &str) {
+        let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+        std::fs::create_dir_all(base.join("layers/sha256").join(hex)).unwrap();
+    }
+
+    fn layer_exists(base: &Path, digest: &str) -> bool {
+        let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+        base.join("layers/sha256").join(hex).exists()
+    }
+
+    fn write_stored_image(base: &Path, registry: &str, repo: &str, tag: &str, img: &StoredImage) {
+        let dir = base.join("images").join(registry).join(repo);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{tag}.json")), serde_json::to_vec(img).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn auto_prune_removes_orphaned_layers() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        std::fs::create_dir_all(base.join("images")).unwrap();
+        let old = make_stored_image(&["sha256:aaa", "sha256:bbb"]);
+        let new = make_stored_image(&["sha256:bbb", "sha256:ccc"]);
+        setup_layer(base, "sha256:aaa");
+        setup_layer(base, "sha256:bbb");
+        setup_layer(base, "sha256:ccc");
+
+        auto_prune_layers(&old, &new, base).unwrap();
+
+        assert!(!layer_exists(base, "sha256:aaa"), "orphaned layer should be removed");
+        assert!(layer_exists(base, "sha256:bbb"), "shared layer should be kept");
+        assert!(layer_exists(base, "sha256:ccc"), "new layer should be kept");
+    }
+
+    #[test]
+    fn auto_prune_keeps_layers_referenced_by_other_images() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let old = make_stored_image(&["sha256:shared", "sha256:orphan"]);
+        let new = make_stored_image(&["sha256:newlayer"]);
+        setup_layer(base, "sha256:shared");
+        setup_layer(base, "sha256:orphan");
+
+        // Another image still references "sha256:shared"
+        let other = make_stored_image(&["sha256:shared", "sha256:other"]);
+        write_stored_image(base, "reg", "other/img", "latest", &other);
+
+        auto_prune_layers(&old, &new, base).unwrap();
+
+        assert!(layer_exists(base, "sha256:shared"), "layer referenced by other image must survive");
+        assert!(!layer_exists(base, "sha256:orphan"), "truly orphaned layer should be pruned");
+    }
+
+    #[test]
+    fn auto_prune_respects_in_use_marker() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        std::fs::create_dir_all(base.join("images")).unwrap();
+        let old = make_stored_image(&["sha256:busy"]);
+        let new = make_stored_image(&["sha256:new"]);
+        setup_layer(base, "sha256:busy");
+        // Mark as in-use (running container)
+        std::fs::write(base.join("layers/sha256/busy/.in-use"), "container-id").unwrap();
+
+        auto_prune_layers(&old, &new, base).unwrap();
+
+        assert!(layer_exists(base, "sha256:busy"), "in-use layer must not be pruned");
+    }
+
+    #[test]
+    fn auto_prune_noop_when_no_orphans() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        std::fs::create_dir_all(base.join("images")).unwrap();
+        let same = make_stored_image(&["sha256:a", "sha256:b"]);
+        setup_layer(base, "sha256:a");
+        setup_layer(base, "sha256:b");
+
+        auto_prune_layers(&same, &same, base).unwrap();
+
+        assert!(layer_exists(base, "sha256:a"));
+        assert!(layer_exists(base, "sha256:b"));
+    }
+
+    #[test]
+    fn api_url_format() {
+        let img = ImageRef::parse("ghcr.io/owner/repo:v1").unwrap();
+        assert_eq!(
+            RegistryClient::api_url(&img, "manifests", "v1"),
+            "https://ghcr.io/v2/owner/repo/manifests/v1"
+        );
+        assert_eq!(
+            RegistryClient::api_url(&img, "blobs", "sha256:abc"),
+            "https://ghcr.io/v2/owner/repo/blobs/sha256:abc"
+        );
+    }
+
+    #[test]
+    fn api_url_with_docker_hub() {
+        let img = ImageRef::parse("nginx").unwrap();
+        assert_eq!(
+            RegistryClient::api_url(&img, "manifests", "latest"),
+            "https://registry-1.docker.io/v2/library/nginx/manifests/latest"
+        );
+    }
+
+    #[test]
+    fn token_cache_returns_cached_value() {
+        // get_anonymous_token with a pre-populated cache should return the cached token
+        let img = ImageRef::parse("ghcr.io/owner/repo:v1").unwrap();
+        let mut cache = HashMap::new();
+        cache.insert("ghcr.io/owner/repo".to_string(), "cached-token-123".to_string());
+
+        let agent = ureq::Agent::new_with_defaults();
+        let token = get_anonymous_token(&mut cache, &agent, &img).unwrap();
+        assert_eq!(token, "cached-token-123");
+    }
+
+    #[test]
+    fn token_response_parses_both_fields() {
+        let json = r#"{"token": "tok123"}"#;
+        let t: TokenResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(t.token.unwrap(), "tok123");
+        assert!(t.access_token.is_none());
+
+        let json = r#"{"access_token": "at456"}"#;
+        let t: TokenResponse = serde_json::from_str(json).unwrap();
+        assert!(t.token.is_none());
+        assert_eq!(t.access_token.unwrap(), "at456");
+
+        let json = r#"{"token": "tok", "access_token": "at"}"#;
+        let t: TokenResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(t.token.unwrap(), "tok");
+        assert_eq!(t.access_token.unwrap(), "at");
+
+        // Empty response should parse fine
+        let json = r#"{}"#;
+        let t: TokenResponse = serde_json::from_str(json).unwrap();
+        assert!(t.token.is_none() && t.access_token.is_none());
+    }
+}

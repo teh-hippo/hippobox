@@ -162,4 +162,76 @@ mod tests {
         assert!(to_cstrings(&["a\0b".into()], "t").is_err());
         assert_eq!(to_cstrings(&["".into()], "t").unwrap()[0].to_bytes(), b"");
     }
+
+    #[test]
+    fn to_cstrings_special_characters() {
+        // Paths with spaces, unicode, dashes should all work
+        let inputs: Vec<String> = vec![
+            "/usr/local/bin/my-tool".into(),
+            "hello world".into(),
+            "café".into(),
+            "--flag=value".into(),
+        ];
+        let result = to_cstrings(&inputs, "args").unwrap();
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].to_str().unwrap(), "/usr/local/bin/my-tool");
+        assert_eq!(result[3].to_str().unwrap(), "--flag=value");
+    }
+
+    #[test]
+    fn to_cstrings_error_message_contains_label() {
+        let err = to_cstrings(&["bad\0value".into()], "my_label").unwrap_err();
+        assert!(format!("{err:#}").contains("my_label"), "error should mention the label");
+    }
+
+    #[test]
+    fn child_config_serialisation_round_trip() {
+        let config = ChildConfig {
+            rootfs: "/merged".into(),
+            argv: vec!["/bin/sh".into(), "-c".into(), "echo hello".into()],
+            env_vars: vec!["PATH=/usr/bin".into(), "HOME=/root".into()],
+            workdir: "/app".into(),
+            container_id: "abc123def456".into(),
+            rootless: false,
+            user: Some("1000:1000".into()),
+            volumes: vec![super::super::VolumeMount {
+                source: "/host/data".into(), target: "/data".into(), read_only: true,
+            }],
+            network_mode: super::super::net::NetworkMode::None,
+            port_mappings: vec![super::super::net::PortMapping {
+                host_port: 8080, container_port: 80, protocol: "tcp".into(),
+            }],
+            external_netns: true,
+            ready_fd: Some(5),
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let back: ChildConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.rootfs, "/merged");
+        assert_eq!(back.argv, vec!["/bin/sh", "-c", "echo hello"]);
+        assert_eq!(back.container_id, "abc123def456");
+        assert_eq!(back.user, Some("1000:1000".into()));
+        assert_eq!(back.volumes.len(), 1);
+        assert!(back.volumes[0].read_only);
+        assert_eq!(back.port_mappings.len(), 1);
+        assert_eq!(back.ready_fd, Some(5));
+    }
+
+    #[test]
+    fn pending_signal_atomic_behaviour() {
+        // Reset to known state
+        PENDING_SIGNAL.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(PENDING_SIGNAL.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Simulate signal handler being called
+        note_pending_signal(0);
+        assert_eq!(PENDING_SIGNAL.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // swap should return 1 and reset to 0
+        let val = PENDING_SIGNAL.swap(0, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(val, 1);
+        assert_eq!(PENDING_SIGNAL.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
 }
