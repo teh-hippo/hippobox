@@ -62,10 +62,13 @@ pub(super) fn acquire_container_lock(container_dir: &Path) -> Result<Flock<File>
         .map_err(|(_, e)| e)
         .with_context(|| format!("failed to flock {}", p.display()))
 }
-pub fn gc_stale_containers(base_dir: &Path) {
+/// Clean up stale containers. Returns the number of containers that were
+/// skipped because they are owned by a different user (e.g. root).
+pub fn gc_stale_containers(base_dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(base_dir.join("containers")) else {
-        return;
+        return 0;
     };
+    let mut skipped_foreign = 0usize;
     for entry in entries.flatten() {
         let path = entry.path();
         if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
@@ -74,6 +77,7 @@ pub fn gc_stale_containers(base_dir: &Path) {
         if let Ok(meta) = std::fs::metadata(&path) {
             use std::os::unix::fs::MetadataExt;
             if meta.uid() != nix::unistd::getuid().as_raw() {
+                skipped_foreign += 1;
                 continue;
             }
         }
@@ -109,6 +113,7 @@ pub fn gc_stale_containers(base_dir: &Path) {
         fix_overlay_workdir(&path);
         let _ = std::fs::remove_dir_all(&path);
     }
+    skipped_foreign
 }
 fn fix_overlay_workdir(container_dir: &Path) {
     let work = container_dir.join("work");

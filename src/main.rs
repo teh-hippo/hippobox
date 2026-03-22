@@ -2,7 +2,7 @@ mod container;
 mod image;
 mod registry;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use image::ImageRef;
 use registry::RegistryClient;
@@ -195,14 +195,36 @@ fn list_images(base_dir: &Path) -> Result<()> {
 }
 
 fn clean_all(base_dir: &Path) -> Result<()> {
-    container::gc_stale_containers(base_dir);
+    let skipped = container::gc_stale_containers(base_dir);
+    let mut had_errors = false;
     for sub in ["layers", "images", "containers"] {
         let dir = base_dir.join(sub);
-        if dir.exists() && fs::remove_dir_all(&dir).is_err() {
-            eprintln!("warning: failed to remove {}", dir.display());
+        if dir.exists()
+            && let Err(e) = fs::remove_dir_all(&dir)
+        {
+            had_errors = true;
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                eprintln!(
+                    "error: cannot remove {}: permission denied",
+                    dir.display()
+                );
+            } else {
+                eprintln!("error: cannot remove {}: {e}", dir.display());
+            }
         }
     }
     ensure_storage_dirs()?;
-    println!("removed all cached images");
+    if had_errors {
+        if skipped > 0 {
+            eprintln!(
+                "hint: {skipped} container(s) are owned by root (created with sudo).\n      \
+                 Run `sudo hippobox clean` to remove them."
+            );
+        } else {
+            eprintln!("hint: some directories could not be removed. Try `sudo hippobox clean`.");
+        }
+        bail!("clean completed with errors");
+    }
+    println!("removed all cached images and containers");
     Ok(())
 }
