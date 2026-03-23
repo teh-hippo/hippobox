@@ -72,10 +72,26 @@ If you run `hippobox` as a non-root user, it automatically switches to rootless 
 
 ## Building
 
-hippobox does not provide pre-built binaries at this time.
-
 ```bash
 cargo build --release
+```
+
+## Contributing
+
+Set up the pre-commit hook after cloning:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This runs `cargo fmt --check` and `cargo clippy` before each commit.
+
+You can also run the checks manually:
+
+```bash
+cargo fmt --check -p hippobox
+cargo clippy -p hippobox -- -D warnings
+cargo test -p hippobox
 ```
 
 ## Rootless Mode

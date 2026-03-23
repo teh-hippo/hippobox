@@ -204,10 +204,7 @@ fn clean_all(base_dir: &Path) -> Result<()> {
         {
             had_errors = true;
             if e.kind() == std::io::ErrorKind::PermissionDenied {
-                eprintln!(
-                    "error: cannot remove {}: permission denied",
-                    dir.display()
-                );
+                eprintln!("error: cannot remove {}: permission denied", dir.display());
             } else {
                 eprintln!("error: cannot remove {}: {e}", dir.display());
             }

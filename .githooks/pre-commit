@@ -1,0 +1,5 @@
+#!/bin/sh
+set -e
+
+cargo fmt --check -p hippobox
+cargo clippy -p hippobox -- -D warnings
