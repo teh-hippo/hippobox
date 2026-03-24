@@ -29,7 +29,7 @@ jobs:
 
       - name: Verify tag matches Cargo.toml version
         run: |
-          CARGO_VER="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name=="hippobox") | .version')"
+          CARGO_VER="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
           TAG_VER="${TAG#v}"
           if [ "$CARGO_VER" != "$TAG_VER" ]; then
             echo "::error::Tag ${TAG} does not match Cargo.toml version ${CARGO_VER}"
@@ -56,7 +56,7 @@ jobs:
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
           files: |
-            hippobox-${{ github.ref_name }}-x86_64-linux.tar.gz
+            hippobox-${{ env.TAG }}-x86_64-linux.tar.gz
             checksums-sha256.txt
           generate_release_notes: true
 
