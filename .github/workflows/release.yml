@@ -52,13 +52,12 @@ jobs:
           cd ..
           sha256sum "hippobox-${TAG}-x86_64-linux.tar.gz" > checksums-sha256.txt
 
-      - name: Create GitHub Release
+      - name: Upload Release Artifacts
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
           files: |
             hippobox-${{ env.TAG }}-x86_64-linux.tar.gz
             checksums-sha256.txt
-          generate_release_notes: true
 
   publish:
     needs: build
