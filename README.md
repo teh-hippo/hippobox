@@ -27,9 +27,22 @@ No runc, containerd, or other runtime wrappers involved.
 
 The release binary is around 2 MB.
 
+## Installation
+
+### From crates.io
+
+```bash
+cargo install hippobox
+```
+
+### Pre-built binary
+
+Download the latest release from the [GitHub Releases](https://github.com/teh-hippo/hippobox/releases) page.
+The binary is statically linked (musl) and has no runtime dependencies.
+
 ## Requirements
 
-- Linux (x86_64). Tested under WSL2
+- Linux (x86_64), tested under WSL2
 - Kernel 5.11+ for rootless overlayfs support
 - cgroup v2 for rootful mode
 - `unshare` from util-linux for rootless bootstrap
@@ -122,7 +135,8 @@ Limitations:
 
 ## Roadmap
 
-- [ ] Pre-built release binaries for x86_64
+- [x] Pre-built release binaries for x86_64
+- [x] Publish to [crates.io](https://crates.io/crates/hippobox)
 - [ ] Multi-architecture builds (ARM64, etc.)
 - [ ] Integration tests against release binaries in CI
 - [ ] `hippobox ps` and `hippobox exec`

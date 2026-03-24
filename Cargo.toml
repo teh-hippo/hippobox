@@ -5,11 +5,13 @@ members = [".", "shims/rename_shim"]
 name = "hippobox"
 version = "0.1.1"
 edition = "2024"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Lightweight Linux container manager using raw Linux primitives"
 repository = "https://github.com/teh-hippo/hippobox"
 keywords = ["container", "linux", "oci", "rootless", "namespaces"]
 categories = ["command-line-utilities", "os::linux-apis"]
+exclude = ["bench/", ".github/", ".githooks/", "renovate.json", ".gitignore"]
 
 [dependencies]
 anyhow = "1"
