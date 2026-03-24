@@ -35,10 +35,15 @@ The release binary is around 2 MB.
 cargo install hippobox
 ```
 
+This installs the `hippobox` binary only.
+The optional `librename_shim.so` (used for rootless EXDEV workaround) is not included.
+Use a pre-built release if you need the shim.
+
 ### Pre-built binary
 
 Download the latest release from the [GitHub Releases](https://github.com/teh-hippo/hippobox/releases) page.
-The binary is statically linked (musl) and has no runtime dependencies.
+The archive includes both the statically linked `hippobox` binary and `librename_shim.so`.
+Place them in the same directory for the rootless EXDEV workaround to be active.
 
 ## Requirements
 
