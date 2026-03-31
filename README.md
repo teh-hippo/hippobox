@@ -96,13 +96,13 @@ cargo build --release
 
 ## Contributing
 
-Set up the pre-commit hook after cloning:
+Set up the pre-push hook after cloning:
 
 ```bash
 git config core.hooksPath .githooks
 ```
 
-This runs `cargo fmt --check` and `cargo clippy` before each commit.
+This runs `cargo fmt --check` and `cargo clippy` before each push.
 
 You can also run the checks manually:
 
