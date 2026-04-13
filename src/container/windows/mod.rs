@@ -13,7 +13,6 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
         user_env,
         ..
     } = spec;
-
     let cc = config.config.as_ref();
     let argv = super::build_argv(cc, user_cmd)?;
     let env_vars = super::build_env_vars(cc, &user_env)?;
@@ -56,8 +55,6 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
         }
     }
 
-    // Build PATH: resolve each image PATH entry within the merged rootfs,
-    // then append the host PATH so Windows system tools remain available.
     let sep = if cfg!(windows) { ';' } else { ':' };
     let mut path_parts: Vec<String> = env_vars
         .iter()
@@ -81,55 +78,48 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
 
 /// Resolve a Windows path from an image config into the merged rootfs.
 ///
-/// Maps absolute Windows paths (`c:\windows\...`) and relative paths with
-/// separators to `<merged>/Files/...`. Bare command names and flags are
-/// returned as-is for PATH lookup.
+/// Strips drive letters (`C:\`) and leading separators, then maps multi-segment
+/// paths into `<merged>/Files/…`. Bare command names are returned as-is.
 fn resolve_win_path(path: &str, merged: &str) -> String {
     let sep = std::path::MAIN_SEPARATOR;
     let n = path
         .replace('/', &sep.to_string())
         .replace('\\', &sep.to_string());
 
-    // Drive-letter absolute: c:\windows\... → <merged>/Files/windows/...
-    if n.len() >= 2 && n.as_bytes()[0].is_ascii_alphabetic() && n.as_bytes()[1] == b':' {
-        let rel = n[2..].strip_prefix(sep).unwrap_or(&n[2..]);
-        return format!("{merged}{sep}Files{sep}{rel}");
+    // Strip drive letter prefix (e.g. "C:" or "c:")
+    let stripped =
+        if n.len() >= 2 && n.as_bytes()[0].is_ascii_alphabetic() && n.as_bytes()[1] == b':' {
+            &n[2..]
+        } else {
+            &n
+        };
+    let stripped = stripped.strip_prefix(sep).unwrap_or(stripped);
+
+    if stripped.contains(sep) {
+        format!("{merged}{sep}Files{sep}{stripped}")
+    } else {
+        n
     }
-    // Separator-leading multi-segment: \Windows\System32\... → <merged>/Files/...
-    if n.starts_with(sep) && n[1..].contains(sep) {
-        return format!("{merged}{sep}Files{sep}{}", &n[1..]);
-    }
-    // Relative multi-segment: Windows\System32\... → <merged>/Files/...
-    if n.contains(sep) && !n.starts_with(sep) {
-        return format!("{merged}{sep}Files{sep}{n}");
-    }
-    n
 }
 
-/// Recursively copy `src` into `dst`, preferring hardlinks for regular files.
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
     while let Some((s, d)) = stack.pop() {
-        for entry in std::fs::read_dir(&s)
-            .with_context(|| format!("failed to read layer directory: {}", s.display()))?
-        {
+        for entry in std::fs::read_dir(&s).with_context(|| format!("read dir: {}", s.display()))? {
             let entry = entry?;
-            let sp = entry.path();
-            let dp = d.join(entry.file_name());
+            let (sp, dp) = (entry.path(), d.join(entry.file_name()));
             let ft = entry.file_type()?;
             if ft.is_dir() {
                 let _ = std::fs::create_dir(&dp);
                 stack.push((sp, dp));
             } else if ft.is_symlink() {
-                let target = std::fs::read_link(&sp)?;
+                let tgt = std::fs::read_link(&sp)?;
                 let _ = std::fs::remove_file(&dp);
-                create_symlink(&target, &dp)
-                    .with_context(|| format!("symlink {} -> {}", dp.display(), target.display()))?;
+                create_symlink(&tgt, &dp)?;
             } else {
                 let _ = std::fs::remove_file(&dp);
                 if std::fs::hard_link(&sp, &dp).is_err() {
-                    std::fs::copy(&sp, &dp)
-                        .with_context(|| format!("copy {} to {}", sp.display(), dp.display()))?;
+                    std::fs::copy(&sp, &dp).with_context(|| format!("copy {}", sp.display()))?;
                 }
             }
         }
@@ -137,7 +127,6 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
     Ok(())
 }
 
-/// RAII cleanup for container directories.
 struct CleanupGuard(PathBuf);
 
 impl Drop for CleanupGuard {
@@ -151,7 +140,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn copy_dir_recursive_basic_and_symlinks() {
+    fn copy_dir_recursive_basic_and_links() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
         std::fs::create_dir_all(src.join("sub")).unwrap();
@@ -175,6 +164,11 @@ mod tests {
                     .to_str()
                     .unwrap(),
                 "a.txt"
+            );
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(src.join("a.txt")).unwrap().ino(),
+                std::fs::metadata(dst.join("a.txt")).unwrap().ino(),
             );
         }
     }
@@ -210,22 +204,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn copy_dir_recursive_uses_hardlinks() {
-        use std::os::unix::fs::MetadataExt;
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::create_dir_all(&dst).unwrap();
-        std::fs::write(src.join("file.txt"), "data").unwrap();
-        copy_dir_recursive(&src, &dst).unwrap();
-        assert_eq!(
-            std::fs::metadata(src.join("file.txt")).unwrap().ino(),
-            std::fs::metadata(dst.join("file.txt")).unwrap().ino(),
-        );
-    }
-
     #[test]
     fn cleanup_guard_removes_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -244,7 +222,8 @@ mod tests {
         let m = format!("C:{sep}Users{sep}test{sep}hippobox{sep}containers{sep}abc{sep}merged");
         let files = |rest: &str| format!("{m}{sep}Files{sep}{rest}");
         let ws = format!("windows{sep}system32{sep}cmd.exe");
-
+        let ws2 = format!("Windows{sep}System32{sep}cmd.exe");
+        let pf = format!("Program Files{sep}PowerShell{sep}7{sep}pwsh.exe");
         assert_eq!(
             resolve_win_path(r"c:\windows\system32\cmd.exe", &m),
             files(&ws)
@@ -253,12 +232,10 @@ mod tests {
             resolve_win_path("c:/windows/system32/cmd.exe", &m),
             files(&ws)
         );
-        let pf = format!("Program Files{sep}PowerShell{sep}7{sep}pwsh.exe");
         assert_eq!(
             resolve_win_path(r"C:\Program Files\PowerShell\7\pwsh.exe", &m),
             files(&pf)
         );
-        let ws2 = format!("Windows{sep}System32{sep}cmd.exe");
         assert_eq!(
             resolve_win_path(r"\Windows\System32\cmd.exe", &m),
             files(&ws2)
