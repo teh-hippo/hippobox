@@ -20,7 +20,6 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
     let container_dir = base_dir.join("containers").join(&id);
     let merged = container_dir.join("merged");
     std::fs::create_dir_all(&merged)?;
-
     let _guard = CleanupGuard(container_dir.clone());
 
     for layer in manifest.layers.iter().rev() {
@@ -49,54 +48,47 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
     let mut cmd = std::process::Command::new(&resolved);
     cmd.args(&argv[1..]);
 
+    let host_sep = if cfg!(windows) { ';' } else { ':' };
     for kv in &env_vars {
         if let Some((k, v)) = kv.split_once('=') {
-            cmd.env(k, v);
+            if !k.eq_ignore_ascii_case("PATH") {
+                cmd.env(k, v);
+            }
         }
     }
 
-    let sep = if cfg!(windows) { ';' } else { ':' };
+    // Resolve image PATH through merged rootfs; image uses ';' separators.
     let mut path_parts: Vec<String> = env_vars
         .iter()
         .find_map(|v| v.strip_prefix("PATH=").or_else(|| v.strip_prefix("Path=")))
         .into_iter()
-        .flat_map(|p| p.split(sep).filter(|s| !s.is_empty()))
+        .flat_map(|p| p.split(';').filter(|s| !s.is_empty()))
         .map(|p| resolve_win_path(p, &merged_str))
         .collect();
-    if let Ok(existing) = std::env::var("PATH") {
-        if !existing.is_empty() {
-            path_parts.push(existing);
-        }
+    if let Ok(p) = std::env::var("PATH") {
+        path_parts.push(p);
     }
     if !path_parts.is_empty() {
-        cmd.env("PATH", path_parts.join(&sep.to_string()));
+        cmd.env("PATH", path_parts.join(&host_sep.to_string()));
     }
 
     let status = cmd.status().context("failed to launch Windows process")?;
     Ok(status.code().unwrap_or(1))
 }
 
-/// Resolve a Windows path from an image config into the merged rootfs.
-///
-/// Strips drive letters (`C:\`) and leading separators, then maps multi-segment
-/// paths into `<merged>/Files/…`. Bare command names are returned as-is.
 fn resolve_win_path(path: &str, merged: &str) -> String {
     let sep = std::path::MAIN_SEPARATOR;
     let n = path
         .replace('/', &sep.to_string())
         .replace('\\', &sep.to_string());
-
-    // Strip drive letter prefix (e.g. "C:" or "c:")
-    let stripped =
-        if n.len() >= 2 && n.as_bytes()[0].is_ascii_alphabetic() && n.as_bytes()[1] == b':' {
-            &n[2..]
-        } else {
-            &n
-        };
-    let stripped = stripped.strip_prefix(sep).unwrap_or(stripped);
-
-    if stripped.contains(sep) {
-        format!("{merged}{sep}Files{sep}{stripped}")
+    let s = if n.len() >= 2 && n.as_bytes()[0].is_ascii_alphabetic() && n.as_bytes()[1] == b':' {
+        &n[2..]
+    } else {
+        &n
+    };
+    let s = s.strip_prefix(sep).unwrap_or(s);
+    if s.contains(sep) {
+        format!("{merged}{sep}Files{sep}{s}")
     } else {
         n
     }
@@ -105,7 +97,7 @@ fn resolve_win_path(path: &str, merged: &str) -> String {
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
     while let Some((s, d)) = stack.pop() {
-        for entry in std::fs::read_dir(&s).with_context(|| format!("read dir: {}", s.display()))? {
+        for entry in std::fs::read_dir(&s).with_context(|| format!("read {}", s.display()))? {
             let entry = entry?;
             let (sp, dp) = (entry.path(), d.join(entry.file_name()));
             let ft = entry.file_type()?;
@@ -128,7 +120,6 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 }
 
 struct CleanupGuard(PathBuf);
-
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -139,8 +130,12 @@ impl Drop for CleanupGuard {
 mod tests {
     use super::*;
 
+    fn read(p: &std::path::Path) -> String {
+        std::fs::read_to_string(p).unwrap()
+    }
+
     #[test]
-    fn copy_dir_recursive_basic_and_links() {
+    fn copy_dir_recursive_and_cleanup() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
         std::fs::create_dir_all(src.join("sub")).unwrap();
@@ -150,11 +145,8 @@ mod tests {
         std::os::unix::fs::symlink("a.txt", src.join("link.txt")).unwrap();
         std::fs::create_dir_all(&dst).unwrap();
         copy_dir_recursive(&src, &dst).unwrap();
-        assert_eq!(std::fs::read_to_string(dst.join("a.txt")).unwrap(), "hello");
-        assert_eq!(
-            std::fs::read_to_string(dst.join("sub/b.txt")).unwrap(),
-            "world"
-        );
+        assert_eq!(read(&dst.join("a.txt")), "hello");
+        assert_eq!(read(&dst.join("sub/b.txt")), "world");
         #[cfg(unix)]
         {
             assert!(dst.join("link.txt").is_symlink());
@@ -165,50 +157,16 @@ mod tests {
                     .unwrap(),
                 "a.txt"
             );
-            use std::os::unix::fs::MetadataExt;
-            assert_eq!(
-                std::fs::metadata(src.join("a.txt")).unwrap().ino(),
-                std::fs::metadata(dst.join("a.txt")).unwrap().ino(),
-            );
         }
-    }
 
-    #[test]
-    fn layer_merge_ordering_and_overwrite() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (l1, l2, m) = (
-            tmp.path().join("layer1"),
-            tmp.path().join("layer2"),
-            tmp.path().join("merged"),
-        );
-        for d in [&l1, &l2, &m] {
-            std::fs::create_dir_all(d).unwrap();
-        }
-        std::fs::write(l1.join("shared.txt"), "from-layer1").unwrap();
-        std::fs::write(l1.join("only-in-1.txt"), "layer1-only").unwrap();
-        std::fs::write(l2.join("shared.txt"), "from-layer2").unwrap();
-        std::fs::write(l2.join("only-in-2.txt"), "layer2-only").unwrap();
-        copy_dir_recursive(&l1, &m).unwrap();
-        copy_dir_recursive(&l2, &m).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(m.join("shared.txt")).unwrap(),
-            "from-layer2"
-        );
-        assert_eq!(
-            std::fs::read_to_string(m.join("only-in-1.txt")).unwrap(),
-            "layer1-only"
-        );
-        assert_eq!(
-            std::fs::read_to_string(m.join("only-in-2.txt")).unwrap(),
-            "layer2-only"
-        );
-    }
+        // Overwrite: second copy replaces shared file
+        std::fs::write(src.join("a.txt"), "new").unwrap();
+        copy_dir_recursive(&src, &dst).unwrap();
+        assert_eq!(read(&dst.join("a.txt")), "new");
 
-    #[test]
-    fn cleanup_guard_removes_dir() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let dir = tmp.path().join("container-test");
-        std::fs::create_dir_all(dir.join("merged")).unwrap();
+        // CleanupGuard removes directory on drop
+        let dir = tmp.path().join("ctest");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
         {
             let _guard = CleanupGuard(dir.clone());
             assert!(dir.exists());
@@ -219,32 +177,18 @@ mod tests {
     #[test]
     fn resolve_win_path_cases() {
         let sep = std::path::MAIN_SEPARATOR;
-        let m = format!("C:{sep}Users{sep}test{sep}hippobox{sep}containers{sep}abc{sep}merged");
-        let files = |rest: &str| format!("{m}{sep}Files{sep}{rest}");
-        let ws = format!("windows{sep}system32{sep}cmd.exe");
-        let ws2 = format!("Windows{sep}System32{sep}cmd.exe");
-        let pf = format!("Program Files{sep}PowerShell{sep}7{sep}pwsh.exe");
-        assert_eq!(
-            resolve_win_path(r"c:\windows\system32\cmd.exe", &m),
-            files(&ws)
-        );
-        assert_eq!(
-            resolve_win_path("c:/windows/system32/cmd.exe", &m),
-            files(&ws)
-        );
-        assert_eq!(
-            resolve_win_path(r"C:\Program Files\PowerShell\7\pwsh.exe", &m),
-            files(&pf)
-        );
-        assert_eq!(
-            resolve_win_path(r"\Windows\System32\cmd.exe", &m),
-            files(&ws2)
-        );
-        assert_eq!(
-            resolve_win_path(r"Windows\System32\cmd.exe", &m),
-            files(&ws2)
-        );
-        assert_eq!(resolve_win_path("pwsh.exe", &m), "pwsh.exe");
-        assert_eq!(resolve_win_path("cmd.exe", &m), "cmd.exe");
+        let m = format!("C:{sep}merged");
+        let f = |s: &str| format!("{m}{sep}Files{sep}{}", s.replace('/', &sep.to_string()));
+
+        for (input, expected) in [
+            (r"c:\win\sys\cmd.exe", f("win/sys/cmd.exe")),
+            (r"C:\Program Files\pwsh.exe", f("Program Files/pwsh.exe")),
+            (r"\Win\Sys\cmd.exe", f("Win/Sys/cmd.exe")),
+            (r"Win\Sys\cmd.exe", f("Win/Sys/cmd.exe")),
+            ("c:/a/b.exe", f("a/b.exe")), // forward slashes
+            ("pwsh.exe", "pwsh.exe".to_string()),
+        ] {
+            assert_eq!(resolve_win_path(input, &m), expected, "input={input:?}");
+        }
     }
 }

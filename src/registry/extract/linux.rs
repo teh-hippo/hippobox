@@ -1,10 +1,9 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::ffi::CString;
 use std::fs;
 use std::io::{self, Read};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
-/// Extract a Linux OCI layer, handling `.wh.` whiteout files and opaque dirs.
 pub fn extract_linux_layer(archive: &mut tar::Archive<impl Read>, target: &Path) -> Result<()> {
     archive.set_preserve_permissions(true);
     archive.set_unpack_xattrs(false);
@@ -13,20 +12,8 @@ pub fn extract_linux_layer(archive: &mut tar::Archive<impl Read>, target: &Path)
         if super::has_unsafe_components(relative) {
             bail!("unsafe archive path component in {}", relative.display());
         }
-        let mut out = target.to_path_buf();
-        for component in relative.components() {
-            if let Component::Normal(part) = component {
-                out.push(part);
-                match fs::symlink_metadata(&out) {
-                    Ok(m) if m.file_type().is_symlink() => bail!(
-                        "refusing to traverse symlink while extracting: {}",
-                        out.display()
-                    ),
-                    Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
-                    _ => {}
-                }
-            }
-        }
+        super::check_no_symlink_traversal(target, relative)?;
+        let out = target.join(relative);
         fs::create_dir_all(&out)?;
         Ok(out)
     };
@@ -92,44 +79,22 @@ pub fn extract_linux_layer(archive: &mut tar::Archive<impl Read>, target: &Path)
     Ok(())
 }
 
-use anyhow::Context;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::extract::tests::{tar_archive, tar_raw};
+    use tar::EntryType::*;
     use tempfile::TempDir;
 
-    fn untar_linux(data: &[u8], dir: &Path) -> Result<()> {
+    fn untar(data: &[u8], dir: &Path) -> Result<()> {
         extract_linux_layer(&mut tar::Archive::new(std::io::Cursor::new(data)), dir)
     }
 
-    fn tar_entry(path: &str, content: &[u8], mode: u32, etype: tar::EntryType) -> Vec<u8> {
-        let mut b = tar::Builder::new(Vec::new());
-        let mut h = tar::Header::new_gnu();
-        h.set_path(path).unwrap();
-        h.set_size(content.len() as u64);
-        h.set_mode(mode);
-        h.set_entry_type(etype);
-        h.set_cksum();
-        b.append(&h, content).unwrap();
-        b.into_inner().unwrap()
-    }
-
-    fn tar_raw_path(path_bytes: &[u8]) -> Vec<u8> {
-        let mut b = tar::Builder::new(Vec::new());
-        let mut h = tar::Header::new_gnu();
-        h.as_gnu_mut().unwrap().name[..path_bytes.len()].copy_from_slice(path_bytes);
-        h.as_gnu_mut().unwrap().name[path_bytes.len()] = 0;
-        h.set_size(4);
-        h.set_mode(0o644);
-        h.set_cksum();
-        b.append(&h, b"evil" as &[u8]).unwrap();
-        b.into_inner().unwrap()
-    }
-
     #[test]
-    fn path_safety() {
-        for (p, expect) in [
+    fn extract_linux_layer_test() {
+        // has_unsafe_components unit checks
+        let check = super::super::has_unsafe_components;
+        for (p, want) in [
             ("usr/bin/bash", false),
             ("./foo/bar", false),
             ("", false),
@@ -137,104 +102,48 @@ mod tests {
             ("foo/../etc", true),
             ("..", true),
         ] {
-            assert_eq!(
-                super::super::has_unsafe_components(Path::new(p)),
-                expect,
-                "path={p:?}"
-            );
+            assert_eq!(check(Path::new(p)), want, "path={p:?}");
         }
-    }
 
-    #[test]
-    fn extract_valid_and_nested() {
+        // Happy path: files and nested dirs
         let t = TempDir::new().unwrap();
-        untar_linux(
-            &tar_entry("hello.txt", b"hello", 0o644, tar::EntryType::Regular),
-            t.path(),
-        )
-        .unwrap();
+        let data = tar_archive(&[
+            ("hello.txt", b"hello", 0o644, Regular),
+            ("usr/bin/tool", b"test", 0o755, Regular),
+        ]);
+        untar(&data, t.path()).unwrap();
         assert_eq!(
-            std::fs::read_to_string(t.path().join("hello.txt")).unwrap(),
+            fs::read_to_string(t.path().join("hello.txt")).unwrap(),
             "hello"
         );
-
-        let t2 = TempDir::new().unwrap();
-        let data = {
-            let mut b = tar::Builder::new(Vec::new());
-            for (path, mode, etype, content) in [
-                (
-                    "usr/local/bin/",
-                    0o755u32,
-                    tar::EntryType::Directory,
-                    &[][..],
-                ),
-                (
-                    "usr/local/bin/tool",
-                    0o755,
-                    tar::EntryType::Regular,
-                    b"test" as &[u8],
-                ),
-            ] {
-                let mut h = tar::Header::new_gnu();
-                h.set_path(path).unwrap();
-                h.set_size(content.len() as u64);
-                h.set_mode(mode);
-                h.set_entry_type(etype);
-                h.set_cksum();
-                b.append(&h, content).unwrap();
-            }
-            b.into_inner().unwrap()
-        };
-        untar_linux(&data, t2.path()).unwrap();
         assert_eq!(
-            fs::read_to_string(t2.path().join("usr/local/bin/tool")).unwrap(),
+            fs::read_to_string(t.path().join("usr/bin/tool")).unwrap(),
             "test"
         );
-    }
 
-    #[test]
-    fn extract_security() {
+        // Unsafe paths rejected
         for p in [b"/etc/shadow" as &[u8], b"../../etc/passwd"] {
-            assert!(untar_linux(&tar_raw_path(p), &TempDir::new().unwrap().path()).is_err());
+            assert!(untar(&tar_raw(p, b"x"), &TempDir::new().unwrap().path()).is_err());
         }
 
-        let t = TempDir::new().unwrap();
-        std::os::unix::fs::symlink("/tmp", t.path().join("evil")).unwrap();
-        assert!(
-            untar_linux(
-                &tar_entry(
-                    "evil/payload.txt",
-                    b"attack",
-                    0o644,
-                    tar::EntryType::Regular
-                ),
-                t.path()
-            )
-            .is_err()
-        );
-
+        // Symlink traversal blocked
         let t2 = TempDir::new().unwrap();
-        fs::write(t2.path().join("existing.txt"), "data").unwrap();
-        let _ = untar_linux(
-            &tar_entry(".wh.existing.txt", b"", 0o644, tar::EntryType::Regular),
-            t2.path(),
+        std::os::unix::fs::symlink("/tmp", t2.path().join("evil")).unwrap();
+        assert!(untar(&tar_archive(&[("evil/a", b"x", 0o644, Regular)]), t2.path()).is_err());
+
+        // Whiteout: existing file replaced with char device
+        let t3 = TempDir::new().unwrap();
+        fs::write(t3.path().join("exist.txt"), "data").unwrap();
+        let _ = untar(
+            &tar_archive(&[(".wh.exist.txt", b"", 0o644, Regular)]),
+            t3.path(),
         );
 
+        // Whiteout: malformed names rejected
         for name in [".wh.", ".wh..", ".wh...", r".wh.foo\bar"] {
-            let mut b = tar::Builder::new(Vec::new());
-            let mut h = tar::Header::new_gnu();
-            if h.set_path(name).is_err() {
-                continue;
-            }
-            h.set_size(0);
-            h.set_mode(0o644);
-            h.set_entry_type(tar::EntryType::Regular);
-            h.set_cksum();
-            b.append(&h, &[][..]).unwrap();
-            assert!(
-                untar_linux(&b.into_inner().unwrap(), &TempDir::new().unwrap().path()).is_err(),
-                "should reject {name:?}"
-            );
+            let data = tar_archive(&[(name, b"", 0o644, Regular)]);
+            let _ = untar(&data, &TempDir::new().unwrap().path())
+                .map(|_| panic!("should reject {name:?}"));
         }
     }
 }
