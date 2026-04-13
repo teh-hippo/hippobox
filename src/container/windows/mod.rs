@@ -104,7 +104,9 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
 fn resolve_win_path(path: &str, merged: &str) -> String {
     let sep = std::path::MAIN_SEPARATOR;
     // Normalise all path separators to the platform separator
-    let normalised = path.replace('/', &sep.to_string()).replace('\\', &sep.to_string());
+    let normalised = path
+        .replace('/', &sep.to_string())
+        .replace('\\', &sep.to_string());
 
     // Absolute Windows path with drive letter: c:\windows\... → <merged>\Files\windows\...
     if normalised.len() >= 2
@@ -112,9 +114,7 @@ fn resolve_win_path(path: &str, merged: &str) -> String {
         && normalised.as_bytes()[1] == b':'
     {
         let after_drive = &normalised[2..];
-        let relative = after_drive
-            .strip_prefix(sep)
-            .unwrap_or(after_drive);
+        let relative = after_drive.strip_prefix(sep).unwrap_or(after_drive);
         return format!("{merged}{sep}Files{sep}{relative}");
     }
 
@@ -365,7 +365,8 @@ mod tests {
     #[test]
     fn resolve_win_path_cases() {
         let sep = std::path::MAIN_SEPARATOR;
-        let merged = format!("C:{sep}Users{sep}test{sep}hippobox{sep}containers{sep}abc{sep}merged");
+        let merged =
+            format!("C:{sep}Users{sep}test{sep}hippobox{sep}containers{sep}abc{sep}merged");
         // Absolute Windows path: strip drive, add Files
         assert_eq!(
             resolve_win_path(r"c:\windows\system32\cmd.exe", &merged),

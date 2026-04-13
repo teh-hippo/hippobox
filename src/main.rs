@@ -3,9 +3,9 @@ mod image;
 mod platform;
 mod registry;
 
-use anyhow::{Result, bail};
 #[cfg(unix)]
 use anyhow::Context;
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use image::ImageRef;
 use registry::RegistryClient;
@@ -37,11 +37,7 @@ fn ensure_storage_dirs() -> Result<()> {
 }
 
 #[derive(Parser)]
-#[command(
-    name = "hippobox",
-    about = "Lightweight container manager",
-    version
-)]
+#[command(name = "hippobox", about = "Lightweight container manager", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -57,7 +53,10 @@ enum Commands {
     Run {
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
-        #[cfg_attr(unix, arg(short = 'v', long = "volume", value_name = "SRC:DST[:ro|rw]"))]
+        #[cfg_attr(
+            unix,
+            arg(short = 'v', long = "volume", value_name = "SRC:DST[:ro|rw]")
+        )]
         #[cfg(unix)]
         volumes: Vec<String>,
         #[arg(short = 'p', long = "publish", value_name = "HOST:CONTAINER[/PROTO]")]
@@ -159,8 +158,7 @@ fn main() -> Result<()> {
                     .iter()
                     .map(|v| container::parse_volume(v))
                     .collect::<Result<_>>()?;
-                if let Some(image_volumes) =
-                    config.config.as_ref().and_then(|c| c.volumes.as_ref())
+                if let Some(image_volumes) = config.config.as_ref().and_then(|c| c.volumes.as_ref())
                 {
                     for vol_path in image_volumes.keys() {
                         if !vm.iter().any(|v| v.target == *vol_path) {

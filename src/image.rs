@@ -159,11 +159,14 @@ pub fn walk_stored_images(images_dir: &Path) -> Result<Vec<(String, String, Path
                 .parent()
                 .unwrap_or(&dir)
                 .strip_prefix(images_dir)
-                .map_or_else(|_| String::new(), |r| {
-                    // Normalise path separators to forward slashes for consistent
-                    // repository names across platforms (e.g. "registry/repo")
-                    r.to_string_lossy().replace('\\', "/")
-                });
+                .map_or_else(
+                    |_| String::new(),
+                    |r| {
+                        // Normalise path separators to forward slashes for consistent
+                        // repository names across platforms (e.g. "registry/repo")
+                        r.to_string_lossy().replace('\\', "/")
+                    },
+                );
             results.push((repo, tag.to_string(), path));
         }
     }
