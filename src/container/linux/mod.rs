@@ -163,8 +163,8 @@ pub(crate) fn bring_up_loopback() -> Result<()> {
             return Err(std::io::Error::last_os_error()).context("failed to create socket");
         }
         let mut ifr: nix::libc::ifreq = std::mem::zeroed();
-        ifr.ifr_name[0] = b'l' as i8;
-        ifr.ifr_name[1] = b'o' as i8;
+        ifr.ifr_name[0] = b'l' as nix::libc::c_char;
+        ifr.ifr_name[1] = b'o' as nix::libc::c_char;
         #[allow(clippy::unnecessary_cast)]
         if nix::libc::ioctl(sock, nix::libc::SIOCGIFFLAGS as _, &mut ifr) < 0 {
             let e = std::io::Error::last_os_error();
