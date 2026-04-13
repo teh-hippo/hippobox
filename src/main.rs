@@ -85,8 +85,10 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Pull { image } => {
             let image_ref = ImageRef::parse(&image)?;
+            let base_dir = hippobox_dir();
+            container::gc_stale_containers(&base_dir);
             let mut client = RegistryClient::new();
-            let _ = client.pull(&image_ref, &hippobox_dir())?;
+            let _ = client.pull(&image_ref, &base_dir)?;
             eprintln!("pulled {image}");
         }
         Commands::Run {
