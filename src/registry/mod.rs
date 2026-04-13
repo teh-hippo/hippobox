@@ -1,4 +1,5 @@
 mod extract;
+pub(crate) use extract::create_symlink;
 
 use crate::image::{Descriptor, ImageConfig, ImageRef, Manifest, StoredImage};
 use crate::platform::{Os, Target};
