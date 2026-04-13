@@ -3,7 +3,7 @@ members = [".", "shims/rename_shim"]
 
 [package]
 name = "hippobox"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
