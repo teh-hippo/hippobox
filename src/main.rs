@@ -1,17 +1,32 @@
 mod container;
 mod image;
+mod platform;
 mod registry;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
+#[cfg(unix)]
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use image::ImageRef;
 use registry::RegistryClient;
 use std::fs;
-use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 
 fn hippobox_dir() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into())).join(".hippobox")
+    if cfg!(windows) {
+        // On Windows, use %LOCALAPPDATA%\hippobox (native NTFS path)
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            return PathBuf::from(local_app_data).join("hippobox");
+        }
+        // Fallback: %USERPROFILE%\.hippobox
+        PathBuf::from(
+            std::env::var("USERPROFILE")
+                .unwrap_or_else(|_| std::env::var("HOME").unwrap_or_else(|_| "C:\\".into())),
+        )
+        .join(".hippobox")
+    } else {
+        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into())).join(".hippobox")
+    }
 }
 
 fn ensure_storage_dirs() -> Result<()> {
@@ -24,7 +39,7 @@ fn ensure_storage_dirs() -> Result<()> {
 #[derive(Parser)]
 #[command(
     name = "hippobox",
-    about = "Lightweight Linux container manager",
+    about = "Lightweight container manager",
     version
 )]
 struct Cli {
@@ -35,17 +50,22 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Pull {
+        #[arg(long = "platform", value_name = "OS/ARCH")]
+        platform: Option<String>,
         image: String,
     },
     Run {
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
-        #[arg(short = 'v', long = "volume", value_name = "SRC:DST[:ro|rw]")]
+        #[cfg_attr(unix, arg(short = 'v', long = "volume", value_name = "SRC:DST[:ro|rw]"))]
+        #[cfg(unix)]
         volumes: Vec<String>,
         #[arg(short = 'p', long = "publish", value_name = "HOST:CONTAINER[/PROTO]")]
         ports: Vec<String>,
         #[arg(long = "network", default_value = "host")]
         network: String,
+        #[arg(long = "platform", value_name = "OS/ARCH")]
+        platform: Option<String>,
         image: String,
         #[arg(trailing_var_arg = true)]
         cmd: Vec<String>,
@@ -55,27 +75,32 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    let mut args = std::env::args_os();
-    let _ = args.next();
-    if let Some(arg1) = args.next() {
-        let parse_fd = |a: Option<std::ffi::OsString>, label: &str| -> i32 {
-            a.unwrap_or_else(|| panic!("missing fd for {label}"))
-                .to_string_lossy()
-                .parse()
-                .unwrap_or_else(|_| panic!("invalid fd for {label}"))
-        };
-        if arg1 == "--container-init" {
-            return container::container_init(parse_fd(args.next(), "container-init"));
-        }
-        if arg1 == "--rootless-bootstrap" {
-            let fd = parse_fd(args.next(), "rootless-bootstrap");
-            container::set_pdeathsig().context("failed to set rootless PDEATHSIG")?;
-            let spec: container::ContainerSpec =
-                serde_json::from_reader(std::io::BufReader::new(unsafe {
-                    std::fs::File::from_raw_fd(fd)
-                }))
-                .context("failed to read rootless bootstrap spec from pipe")?;
-            std::process::exit(container::run_prepared(spec)?);
+    // Internal commands used by the Linux container runtime (fork/exec protocol)
+    #[cfg(unix)]
+    {
+        use std::os::fd::FromRawFd;
+        let mut args = std::env::args_os();
+        let _ = args.next();
+        if let Some(arg1) = args.next() {
+            let parse_fd = |a: Option<std::ffi::OsString>, label: &str| -> i32 {
+                a.unwrap_or_else(|| panic!("missing fd for {label}"))
+                    .to_string_lossy()
+                    .parse()
+                    .unwrap_or_else(|_| panic!("invalid fd for {label}"))
+            };
+            if arg1 == "--container-init" {
+                return container::container_init(parse_fd(args.next(), "container-init"));
+            }
+            if arg1 == "--rootless-bootstrap" {
+                let fd = parse_fd(args.next(), "rootless-bootstrap");
+                container::set_pdeathsig().context("failed to set rootless PDEATHSIG")?;
+                let spec: container::ContainerSpec =
+                    serde_json::from_reader(std::io::BufReader::new(unsafe {
+                        std::fs::File::from_raw_fd(fd)
+                    }))
+                    .context("failed to read rootless bootstrap spec from pipe")?;
+                std::process::exit(container::run_prepared(spec)?);
+            }
         }
     }
 
@@ -83,52 +108,74 @@ fn main() -> Result<()> {
     ensure_storage_dirs()?;
 
     match cli.command {
-        Commands::Pull { image } => {
+        Commands::Pull { image, platform } => {
             let image_ref = ImageRef::parse(&image)?;
+            let target = match platform {
+                Some(p) => platform::Target::parse(&p)?,
+                None => platform::Target::host(),
+            };
             let base_dir = hippobox_dir();
+            #[cfg(unix)]
             container::gc_stale_containers(&base_dir);
             let mut client = RegistryClient::new();
-            let _ = client.pull(&image_ref, &base_dir)?;
-            eprintln!("pulled {image}");
+            let _ = client.pull(&image_ref, &base_dir, &target)?;
+            eprintln!("pulled {image} ({target})");
         }
         Commands::Run {
             image,
             cmd,
             env,
+            #[cfg(unix)]
             volumes,
             ports,
             network,
+            platform,
         } => {
             let image_ref = ImageRef::parse(&image)?;
+            let target = match platform {
+                Some(p) => platform::Target::parse(&p)?,
+                None => platform::Target::host(),
+            };
             let base_dir = hippobox_dir();
+            #[cfg(unix)]
             let rootless = !nix::unistd::geteuid().is_root();
+            #[cfg(not(unix))]
+            let rootless = false;
 
+            #[cfg(unix)]
             container::gc_stale_containers(&base_dir);
 
-            if !image_ref.image_metadata_path(&base_dir).exists() {
+            if !image_ref.image_metadata_path(&base_dir, &target).exists() {
                 eprintln!("image not found locally, pulling...");
                 let mut client = RegistryClient::new();
-                client.pull(&image_ref, &base_dir)?;
+                client.pull(&image_ref, &base_dir, &target)?;
             }
 
-            let (manifest, config) = container::load_image(&image_ref, &base_dir)?;
+            let (manifest, config) = container::load_image(&image_ref, &base_dir, &target)?;
 
-            let mut volume_mounts: Vec<container::VolumeMount> = volumes
-                .iter()
-                .map(|v| container::parse_volume(v))
-                .collect::<Result<_>>()?;
-
-            if let Some(image_volumes) = config.config.as_ref().and_then(|c| c.volumes.as_ref()) {
-                for vol_path in image_volumes.keys() {
-                    if !volume_mounts.iter().any(|v| v.target == *vol_path) {
-                        volume_mounts.push(container::VolumeMount {
-                            source: "tmpfs".into(),
-                            target: vol_path.clone(),
-                            read_only: false,
-                        });
+            #[cfg(unix)]
+            let volume_mounts = {
+                let mut vm: Vec<container::VolumeMount> = volumes
+                    .iter()
+                    .map(|v| container::parse_volume(v))
+                    .collect::<Result<_>>()?;
+                if let Some(image_volumes) =
+                    config.config.as_ref().and_then(|c| c.volumes.as_ref())
+                {
+                    for vol_path in image_volumes.keys() {
+                        if !vm.iter().any(|v| v.target == *vol_path) {
+                            vm.push(container::VolumeMount {
+                                source: "tmpfs".into(),
+                                target: vol_path.clone(),
+                                read_only: false,
+                            });
+                        }
                     }
                 }
-            }
+                vm
+            };
+            #[cfg(not(unix))]
+            let volume_mounts = Vec::new();
 
             let port_mappings: Vec<container::PortMapping> = ports
                 .iter()
@@ -171,6 +218,7 @@ fn main() -> Result<()> {
                 external_netns: !port_mappings.is_empty(),
                 port_mappings,
                 rootless,
+                target,
             };
 
             let exit_code = container::run(spec)?;
@@ -197,6 +245,7 @@ fn list_images(base_dir: &Path) -> Result<()> {
 }
 
 fn clean_all(base_dir: &Path) -> Result<()> {
+    #[cfg(unix)]
     let skipped = container::gc_stale_containers(base_dir);
     let mut had_errors = false;
     for sub in ["layers", "images", "containers"] {
@@ -214,6 +263,7 @@ fn clean_all(base_dir: &Path) -> Result<()> {
     }
     ensure_storage_dirs()?;
     if had_errors {
+        #[cfg(unix)]
         if skipped > 0 {
             eprintln!(
                 "hint: {skipped} container(s) are owned by root (created with sudo).\n      \
@@ -222,6 +272,8 @@ fn clean_all(base_dir: &Path) -> Result<()> {
         } else {
             eprintln!("hint: some directories could not be removed. Try `sudo hippobox clean`.");
         }
+        #[cfg(not(unix))]
+        eprintln!("hint: some directories could not be removed. Try running as administrator.");
         bail!("clean completed with errors");
     }
     println!("removed all cached images and containers");

@@ -257,7 +257,7 @@ pub(super) fn unmount_overlay(merged: &Path) -> Result<()> {
     umount2(merged, MntFlags::MNT_DETACH).context("failed to unmount overlayfs")
 }
 
-pub fn parse_volume(spec: &str) -> Result<super::VolumeMount> {
+pub fn parse_volume(spec: &str) -> Result<super::super::VolumeMount> {
     let parts: Vec<&str> = spec.split(':').collect();
     let (source, target, read_only) = match parts.len() {
         2 => (parts[0], parts[1], false),
@@ -286,7 +286,7 @@ pub fn parse_volume(spec: &str) -> Result<super::VolumeMount> {
     if !Path::new(source).exists() {
         bail!("volume source does not exist: {source:?}");
     }
-    Ok(super::VolumeMount {
+    Ok(super::super::VolumeMount {
         source: Path::new(source)
             .canonicalize()
             .with_context(|| format!("failed to resolve volume source {source:?}"))?
@@ -297,7 +297,7 @@ pub fn parse_volume(spec: &str) -> Result<super::VolumeMount> {
     })
 }
 
-pub(super) fn mount_volumes(merged: &Path, volumes: &[super::VolumeMount]) -> Result<()> {
+pub(super) fn mount_volumes(merged: &Path, volumes: &[super::super::VolumeMount]) -> Result<()> {
     for vol in volumes {
         let target = merged.join(vol.target.trim_start_matches('/'));
         if !target.starts_with(merged) {

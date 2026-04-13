@@ -147,17 +147,17 @@ pub(super) struct ChildConfig {
     pub container_id: String,
     pub rootless: bool,
     pub user: Option<String>,
-    pub volumes: Vec<super::VolumeMount>,
-    pub network_mode: super::NetworkMode,
-    pub port_mappings: Vec<super::PortMapping>,
+    pub volumes: Vec<super::super::VolumeMount>,
+    pub network_mode: super::super::NetworkMode,
+    pub port_mappings: Vec<super::super::PortMapping>,
     pub external_netns: bool,
     pub ready_fd: Option<i32>,
 }
 
-pub(super) fn run_rootless_unshare(spec: super::ContainerSpec) -> Result<i32> {
+pub(super) fn run_rootless_unshare(spec: super::super::ContainerSpec) -> Result<i32> {
     let exe = super::resolve_self_exe()?;
     let has_ports = !spec.port_mappings.is_empty();
-    let isolate_network = spec.network_mode == super::NetworkMode::None || has_ports;
+    let isolate_network = spec.network_mode == super::super::NetworkMode::None || has_ports;
     let (spec_read, spec_write) = nix::unistd::pipe().context("failed to create spec pipe")?;
     let (spec_read_raw, spec_write_raw) = (spec_read.into_raw_fd(), spec_write.as_raw_fd());
     let spec_read_str = spec_read_raw.to_string();
@@ -200,7 +200,7 @@ pub(super) fn run_rootless_unshare(spec: super::ContainerSpec) -> Result<i32> {
         }
         args.push("--");
         let mut cmd = std::process::Command::new(
-            super::which("unshare").context("unshare not found in PATH")?,
+            super::super::which("unshare").context("unshare not found in PATH")?,
         );
         unsafe {
             cmd.pre_exec(pre_exec_fn);
@@ -260,6 +260,7 @@ mod tests {
     }
     #[test]
     fn child_config_serialisation_round_trip() {
+        use crate::container::{NetworkMode, PortMapping, VolumeMount};
         let config = ChildConfig {
             rootfs: "/merged".into(),
             argv: vec!["/bin/sh".into(), "-c".into(), "echo hello".into()],
@@ -268,13 +269,13 @@ mod tests {
             container_id: "abc123def456".into(),
             rootless: false,
             user: Some("1000:1000".into()),
-            volumes: vec![super::super::VolumeMount {
+            volumes: vec![VolumeMount {
                 source: "/host/data".into(),
                 target: "/data".into(),
                 read_only: true,
             }],
-            network_mode: super::super::NetworkMode::None,
-            port_mappings: vec![super::super::PortMapping {
+            network_mode: NetworkMode::None,
+            port_mappings: vec![PortMapping {
                 host_port: 8080,
                 container_port: 80,
                 protocol: "tcp".into(),

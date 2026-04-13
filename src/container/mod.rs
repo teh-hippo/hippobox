@@ -1,16 +1,19 @@
-mod cleanup;
-mod init;
-mod mounts;
-mod process;
+#[cfg(unix)]
+mod linux;
+mod windows;
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 use crate::image::{ImageConfig, ImageRef, Manifest, StoredImage};
+use crate::platform::{Os, Target};
 
-pub use cleanup::gc_stale_containers;
-pub(crate) use init::container_init;
-pub use mounts::parse_volume;
+#[cfg(unix)]
+pub(crate) use linux::container_init;
+#[cfg(unix)]
+pub use linux::gc_stale_containers;
+#[cfg(unix)]
+pub use linux::parse_volume;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VolumeMount {
@@ -43,164 +46,31 @@ pub struct ContainerSpec {
     pub port_mappings: Vec<PortMapping>,
     pub external_netns: bool,
     pub rootless: bool,
+    #[serde(default)]
+    pub target: Target,
 }
 
 pub fn run(spec: ContainerSpec) -> Result<i32> {
-    if spec.rootless {
-        process::run_rootless_unshare(spec)
-    } else {
-        run_prepared(spec)
+    match spec.target.os {
+        #[cfg(unix)]
+        Os::Linux => linux::run(spec),
+        #[cfg(not(unix))]
+        Os::Linux => bail!("Linux containers are not supported on this platform"),
+        Os::Windows => windows::run(spec),
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
-    let cc = spec.config.config.as_ref();
-    let workdir = cc.and_then(|c| c.working_dir.as_deref()).unwrap_or("/");
-    let stop_signal = cc
-        .and_then(|c| c.stop_signal.as_deref())
-        .unwrap_or("SIGTERM");
-    let user = cc.and_then(|c| c.user.clone()).filter(|u| !u.is_empty());
-
-    let argv = build_argv(cc, spec.user_cmd)?;
-
-    let mut env_vars = cc
-        .and_then(|c| c.env.as_deref())
-        .filter(|v| !v.is_empty())
-        .map(|v| v.to_vec())
-        .unwrap_or_else(|| {
-            vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()]
-        });
-    for (key, default) in [("HOME", "/root"), ("TERM", "xterm")] {
-        if env_find_mut(&mut env_vars, key).is_none() {
-            env_vars.push(format!("{key}={default}"));
-        }
+    match spec.target.os {
+        Os::Linux => linux::run_prepared(spec),
+        Os::Windows => windows::run(spec),
     }
-    let mut env_vars = apply_env_overrides(env_vars, &spec.user_env)?;
-    let container_dir = spec.base_dir.join("containers").join(&spec.id);
-    let (upper, work, merged) = (
-        container_dir.join("upper"),
-        container_dir.join("work"),
-        container_dir.join("merged"),
-    );
-    std::fs::create_dir_all(&container_dir)?;
-    for dir in [&upper, &work, &merged] {
-        std::fs::create_dir(dir)?;
-    }
-    let lock_file = cleanup::acquire_container_lock(&container_dir)?;
-    let mut guard = cleanup::CleanupGuard {
-        id: spec.id.clone(),
-        container_dir,
-        merged: merged.clone(),
-        layer_dirs: Vec::new(),
-        overlay_mounted: false,
-        rootless: spec.rootless,
-        _lock: lock_file,
-    };
-    let layer_dirs: Vec<PathBuf> = spec
-        .manifest
-        .layers
-        .iter()
-        .rev()
-        .map(|layer| layer.layer_dir(&spec.base_dir))
-        .collect();
-    for dir in &layer_dirs {
-        if !dir.exists() {
-            bail!(
-                "layer directory missing: {} — image may need re-pulling",
-                dir.display()
-            );
-        }
-        let _ = std::fs::write(dir.join(".in-use"), spec.id.as_bytes());
-    }
-
-    mounts::mount_overlay(&layer_dirs, &upper, &work, &merged, spec.rootless).with_context(
-        || {
-            if spec.rootless {
-                "overlay mount failed; Linux 5.11+ with unprivileged overlayfs support is required"
-            } else {
-                "overlay mount failed"
-            }
-        },
-    )?;
-    guard.layer_dirs = layer_dirs;
-    guard.overlay_mounted = true;
-
-    if spec.rootless
-        && let Some(shim) = find_rename_shim()
-    {
-        let dest = merged.join(".hippobox");
-        let _ = std::fs::create_dir(&dest);
-        if std::fs::copy(&shim, dest.join("rename_shim.so")).is_ok() {
-            env_vars.push("LD_PRELOAD=/.hippobox/rename_shim.so".into());
-        }
-    }
-
-    mounts::prepare_host_device_sources(&merged)?;
-    let img = &spec.image_ref;
-    eprintln!(
-        "starting container {} ({}/{}/{})",
-        &spec.id[..12],
-        img.registry,
-        img.repository,
-        img.tag
-    );
-    eprintln!("  cmd: {:?}", argv);
-
-    process::run_container(
-        process::ChildConfig {
-            rootfs: merged.to_string_lossy().into_owned(),
-            argv,
-            env_vars,
-            workdir: workdir.to_string(),
-            container_id: spec.id,
-            rootless: spec.rootless,
-            user,
-            volumes: spec.volumes,
-            network_mode: spec.network_mode,
-            port_mappings: spec.port_mappings,
-            external_netns: spec.external_netns,
-            ready_fd: None,
-        },
-        stop_signal,
-    )
-    .context("container execution failed")
 }
 
-pub(crate) fn resolve_self_exe() -> Result<PathBuf> {
-    std::fs::read_link("/proc/self/exe")
-        .or_else(|_| std::env::current_exe())
-        .context("failed to locate current executable")
-}
-
+#[cfg(unix)]
 pub(crate) fn set_pdeathsig() -> std::io::Result<()> {
-    let ret = unsafe {
-        nix::libc::prctl(
-            nix::libc::PR_SET_PDEATHSIG,
-            nix::libc::SIGTERM as nix::libc::c_ulong,
-            0,
-            0,
-            0,
-        )
-    };
-    if ret != 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-pub(crate) fn set_pdeathsig_with_race_check() -> Result<()> {
-    let ppid_before = nix::unistd::getppid();
-    set_pdeathsig().context("failed to set PR_SET_PDEATHSIG")?;
-    if nix::unistd::getppid() != ppid_before {
-        std::process::exit(1);
-    }
-    Ok(())
-}
-
-fn find_rename_shim() -> Option<PathBuf> {
-    let shim = resolve_self_exe().ok()?.parent()?.join("librename_shim.so");
-    shim.exists().then_some(shim)
+    linux::set_pdeathsig()
 }
 
 fn apply_env_overrides(mut vars: Vec<String>, overrides: &[String]) -> Result<Vec<String>> {
@@ -243,8 +113,31 @@ fn build_argv(
     Ok(argv)
 }
 
-pub fn load_image(image_ref: &ImageRef, base_dir: &Path) -> Result<(Manifest, ImageConfig)> {
-    let path = image_ref.image_metadata_path(base_dir);
+fn build_env_vars(
+    cc: Option<&crate::image::ContainerConfig>,
+    user_env: &[String],
+) -> Result<Vec<String>> {
+    let mut env_vars = cc
+        .and_then(|c| c.env.as_deref())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_vec())
+        .unwrap_or_else(|| {
+            vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()]
+        });
+    for (key, default) in [("HOME", "/root"), ("TERM", "xterm")] {
+        if env_find_mut(&mut env_vars, key).is_none() {
+            env_vars.push(format!("{key}={default}"));
+        }
+    }
+    apply_env_overrides(env_vars, user_env)
+}
+
+pub fn load_image(
+    image_ref: &ImageRef,
+    base_dir: &Path,
+    target: &Target,
+) -> Result<(Manifest, ImageConfig)> {
+    let path = image_ref.image_metadata_path(base_dir, target);
     let data = std::fs::read(&path).with_context(|| {
         format!(
             "image not found locally: {}/{}/{}",
@@ -255,6 +148,7 @@ pub fn load_image(image_ref: &ImageRef, base_dir: &Path) -> Result<(Manifest, Im
         .with_context(|| format!("failed to parse stored image metadata: {}", path.display()))?;
     Ok((stored.manifest, stored.config))
 }
+
 pub fn parse_port(spec: &str) -> Result<PortMapping> {
     let (port_part, protocol) = match spec.rsplit_once('/') {
         Some((p, proto)) if proto == "tcp" || proto == "udp" => (p, proto.to_string()),
@@ -279,6 +173,7 @@ pub fn parse_port(spec: &str) -> Result<PortMapping> {
         protocol,
     })
 }
+
 pub fn parse_network_mode(s: &str) -> Result<NetworkMode> {
     match s {
         "host" => Ok(NetworkMode::Host),
@@ -286,77 +181,21 @@ pub fn parse_network_mode(s: &str) -> Result<NetworkMode> {
         _ => bail!("invalid network mode {s:?}, expected 'host' or 'none'"),
     }
 }
-/// Bring up the loopback network interface via ioctl.
-fn bring_up_loopback() -> Result<()> {
-    unsafe {
-        let sock = nix::libc::socket(nix::libc::AF_INET, nix::libc::SOCK_DGRAM, 0);
-        if sock < 0 {
-            return Err(std::io::Error::last_os_error()).context("failed to create socket");
-        }
-        let mut ifr: nix::libc::ifreq = std::mem::zeroed();
-        ifr.ifr_name[0] = b'l' as i8;
-        ifr.ifr_name[1] = b'o' as i8;
-        #[allow(clippy::unnecessary_cast)]
-        if nix::libc::ioctl(sock, nix::libc::SIOCGIFFLAGS as _, &mut ifr) < 0 {
-            let e = std::io::Error::last_os_error();
-            nix::libc::close(sock);
-            return Err(e).context("failed to get loopback flags");
-        }
-        ifr.ifr_ifru.ifru_flags |= nix::libc::IFF_UP as i16;
-        #[allow(clippy::unnecessary_cast)]
-        if nix::libc::ioctl(sock, nix::libc::SIOCSIFFLAGS as _, &ifr) < 0 {
-            let e = std::io::Error::last_os_error();
-            nix::libc::close(sock);
-            return Err(e).context("failed to bring up loopback");
-        }
-        nix::libc::close(sock);
-    }
-    Ok(())
-}
-fn check_pasta() -> Result<PathBuf> {
-    which("pasta").context(
-        "pasta not found; required for port mapping (-p)\n\
-         install: apt install passt  (Debian/Ubuntu)\n\
-         install: dnf install passt  (Fedora)\n\
-         install: pacman -S passt    (Arch)",
-    )
-}
+
+#[allow(dead_code)]
 fn which(name: &str) -> Option<PathBuf> {
+    let separator = if cfg!(windows) { ';' } else { ':' };
     std::env::var_os("PATH")?
         .to_str()?
-        .split(':')
+        .split(separator)
         .map(|dir| PathBuf::from(dir).join(name))
         .find(|p| p.is_file())
 }
-fn spawn_pasta_for_pid(pid: u32, ports: &[PortMapping]) -> Result<std::process::Child> {
-    let mut cmd = std::process::Command::new(check_pasta()?);
-    cmd.args(["--config-net", "--quiet", "--foreground", "--no-map-gw"]);
-    add_port_args(&mut cmd, ports);
-    cmd.args([
-        "-u",
-        "none",
-        "-T",
-        "none",
-        "-U",
-        "none",
-        "--netns",
-        &format!("/proc/{pid}/ns/net"),
-    ]);
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit());
-    cmd.spawn()
-        .context("failed to start pasta for port forwarding")
-}
-fn add_port_args(cmd: &mut std::process::Command, ports: &[PortMapping]) {
-    for pm in ports {
-        let flag = if pm.protocol == "udp" { "-u" } else { "-t" };
-        cmd.args([flag, &format!("{}:{}", pm.host_port, pm.container_port)]);
-    }
-}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn env_overrides_all_cases() {
         let ov = apply_env_overrides;
@@ -390,6 +229,7 @@ mod tests {
         assert!(ov(vec![], &["NOEQUALS".into()]).is_err());
         assert!(ov(vec![], &["=value".into()]).is_err());
     }
+
     #[test]
     fn env_find_mut_cases() {
         let mut vars = vec![
@@ -410,9 +250,11 @@ mod tests {
         }
         assert!(env_find_mut(&mut Vec::<String>::new(), "ANY").is_none());
     }
+
     #[test]
     fn load_image_valid_missing_and_corrupt() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let target = crate::platform::Target::host();
         let desc = |d: &str, s| crate::image::Descriptor {
             media_type: None,
             digest: d.into(),
@@ -428,39 +270,34 @@ mod tests {
                 config: None,
                 rootfs: None,
             },
+            target,
         };
-        let path = img.image_metadata_path(tmp.path());
+        let path = img.image_metadata_path(tmp.path(), &target);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
-        let (m, _) = load_image(&img, tmp.path()).unwrap();
+        let (m, _) = load_image(&img, tmp.path(), &target).unwrap();
         assert_eq!(m.layers[0].digest, "sha256:layer1");
         let missing = crate::image::ImageRef::parse("nonexistent:latest").unwrap();
         assert!(
-            format!("{:#}", load_image(&missing, tmp.path()).unwrap_err())
-                .contains("image not found locally")
+            format!(
+                "{:#}",
+                load_image(&missing, tmp.path(), &target).unwrap_err()
+            )
+            .contains("image not found locally")
         );
         let corrupt = crate::image::ImageRef::parse("nginx:bad").unwrap();
-        let cp = corrupt.image_metadata_path(tmp.path());
+        let cp = corrupt.image_metadata_path(tmp.path(), &target);
         std::fs::create_dir_all(cp.parent().unwrap()).unwrap();
         std::fs::write(&cp, "not json").unwrap();
         assert!(
-            format!("{:#}", load_image(&corrupt, tmp.path()).unwrap_err())
-                .contains("failed to parse")
+            format!(
+                "{:#}",
+                load_image(&corrupt, tmp.path(), &target).unwrap_err()
+            )
+            .contains("failed to parse")
         );
     }
-    #[test]
-    fn find_rename_shim_returns_none_when_missing() {
-        if let Some(p) = find_rename_shim() {
-            assert!(
-                p.exists()
-                    && p.file_name()
-                        .unwrap()
-                        .to_str()
-                        .unwrap()
-                        .contains("rename_shim")
-            );
-        }
-    }
+
     #[test]
     fn container_spec_serialisation_round_trip() {
         let desc = |d: &str, s| crate::image::Descriptor {
@@ -487,6 +324,7 @@ mod tests {
             port_mappings: vec![],
             external_netns: false,
             rootless: true,
+            target: crate::platform::Target::host(),
         };
         let back: ContainerSpec =
             serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
@@ -494,6 +332,7 @@ mod tests {
         assert!(back.rootless);
         assert_eq!(back.network_mode, NetworkMode::None);
     }
+
     #[test]
     fn build_argv_success_cases() {
         let mk = |ep, cmd| crate::image::ContainerConfig {
@@ -534,6 +373,7 @@ mod tests {
             ["/bin/bash"]
         );
     }
+
     #[test]
     fn build_argv_error_cases() {
         let cc = crate::image::ContainerConfig::default();
@@ -544,6 +384,7 @@ mod tests {
             assert!(format!("{e}").contains("no CMD or ENTRYPOINT"));
         }
     }
+
     #[test]
     fn parse_port_valid_and_invalid() {
         for (spec, hp, cp, proto) in [
@@ -572,6 +413,7 @@ mod tests {
             assert!(parse_port(bad).is_err(), "should reject {bad:?}");
         }
     }
+
     #[test]
     fn parse_network_mode_valid_and_invalid() {
         assert_eq!(parse_network_mode("host").unwrap(), NetworkMode::Host);
@@ -580,44 +422,9 @@ mod tests {
             assert!(parse_network_mode(bad).is_err());
         }
     }
+
     #[test]
-    fn add_port_args_builds_flags() {
-        for (proto, flag) in [("tcp", "-t"), ("udp", "-u")] {
-            let mut cmd = std::process::Command::new("echo");
-            add_port_args(
-                &mut cmd,
-                &[PortMapping {
-                    host_port: 80,
-                    container_port: 8080,
-                    protocol: proto.into(),
-                }],
-            );
-            let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
-            assert_eq!(args, vec![flag, "80:8080"]);
-        }
-        let mut cmd = std::process::Command::new("echo");
-        add_port_args(
-            &mut cmd,
-            &[
-                PortMapping {
-                    host_port: 80,
-                    container_port: 8080,
-                    protocol: "tcp".into(),
-                },
-                PortMapping {
-                    host_port: 53,
-                    container_port: 5353,
-                    protocol: "udp".into(),
-                },
-            ],
-        );
-        let args: Vec<_> = cmd
-            .get_args()
-            .map(|a| a.to_str().unwrap().to_string())
-            .collect();
-        assert_eq!(args, vec!["-t", "80:8080", "-u", "53:5353"]);
-    }
-    #[test]
+    #[cfg(unix)]
     fn which_lookup() {
         assert!(which("env").unwrap().is_file());
         assert!(which("hippobox_nonexistent_binary_xyz").is_none());
@@ -640,6 +447,7 @@ mod tests {
         }
         assert_eq!(result.unwrap().file_name().unwrap(), "mytool");
     }
+
     #[test]
     fn serialisation_round_trips() {
         for mode in [NetworkMode::Host, NetworkMode::None] {
@@ -658,6 +466,59 @@ mod tests {
         assert_eq!(
             (back.host_port, back.container_port, back.protocol.as_str()),
             (8080, 80, "tcp")
+        );
+    }
+
+    #[test]
+    fn build_env_vars_defaults() {
+        // No image config — should get default PATH, HOME, and TERM
+        let vars = build_env_vars(None, &[]).unwrap();
+        assert!(vars.iter().any(|v| v.starts_with("PATH=")));
+        assert!(vars.iter().any(|v| v == "HOME=/root"));
+        assert!(vars.iter().any(|v| v == "TERM=xterm"));
+    }
+
+    #[test]
+    fn build_env_vars_preserves_image_env() {
+        let cc = crate::image::ContainerConfig {
+            env: Some(vec![
+                "PATH=/custom/bin".into(),
+                "HOME=/app".into(),
+                "APP_MODE=production".into(),
+            ]),
+            ..Default::default()
+        };
+        let vars = build_env_vars(Some(&cc), &[]).unwrap();
+        assert!(vars.iter().any(|v| v == "PATH=/custom/bin"));
+        assert!(vars.iter().any(|v| v == "HOME=/app"));
+        assert!(vars.iter().any(|v| v == "APP_MODE=production"));
+        // TERM should be injected since image didn't set it
+        assert!(vars.iter().any(|v| v == "TERM=xterm"));
+    }
+
+    #[test]
+    fn build_env_vars_user_overrides() {
+        let cc = crate::image::ContainerConfig {
+            env: Some(vec!["PATH=/usr/bin".into(), "FOO=old".into()]),
+            ..Default::default()
+        };
+        let vars = build_env_vars(Some(&cc), &["FOO=new".into(), "BAR=added".into()]).unwrap();
+        assert!(vars.iter().any(|v| v == "FOO=new"));
+        assert!(vars.iter().any(|v| v == "BAR=added"));
+        assert!(!vars.iter().any(|v| v == "FOO=old"));
+    }
+
+    #[test]
+    fn build_env_vars_empty_image_env() {
+        // Empty vec should trigger default PATH
+        let cc = crate::image::ContainerConfig {
+            env: Some(vec![]),
+            ..Default::default()
+        };
+        let vars = build_env_vars(Some(&cc), &[]).unwrap();
+        assert!(
+            vars.iter()
+                .any(|v| v == "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
         );
     }
 }

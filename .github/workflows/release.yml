@@ -9,23 +9,49 @@ permissions: {}
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            artifact: hippobox
+            os_label: linux
+            archive: tar.gz
+            use-cross: false
+          - target: aarch64-unknown-linux-musl
+            artifact: hippobox
+            os_label: linux
+            archive: tar.gz
+            use-cross: true
+          - target: x86_64-pc-windows-gnu
+            artifact: hippobox.exe
+            os_label: windows
+            archive: zip
+            use-cross: false
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     env:
       TAG: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
 
       - name: Install musl tools
+        if: contains(matrix.target, 'musl') && !matrix.use-cross
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install mingw tools
+        if: contains(matrix.target, 'windows-gnu')
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
 
       - name: Verify tag matches Cargo.toml version
         run: |
@@ -36,44 +62,59 @@ jobs:
             exit 1
           fi
 
-      - name: Build hippobox (static musl)
-        run: cargo build --release --target x86_64-unknown-linux-musl -p hippobox
+      - name: Build hippobox
+        run: |
+          if [ "${{ matrix.use-cross }}" = "true" ]; then
+            cargo install cross --locked
+            cross build --release --target ${{ matrix.target }} -p hippobox
+          else
+            cargo build --release --target ${{ matrix.target }} -p hippobox
+          fi
 
       - name: Build rename shim
+        if: contains(matrix.target, 'linux') && !matrix.use-cross
         run: cargo build --release -p rename-shim
 
       - name: Package release
         run: |
+          ARCH="${{ matrix.target }}"
+          ARCH="${ARCH%%-unknown-*}"
+          ARCH="${ARCH%%-pc-*}"
           mkdir -p release
-          cp target/x86_64-unknown-linux-musl/release/hippobox release/
-          cp target/release/librename_shim.so release/
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} release/
+          if [ -f target/release/librename_shim.so ]; then
+            cp target/release/librename_shim.so release/
+          fi
           cd release
-          tar czf "../hippobox-${TAG}-x86_64-linux.tar.gz" *
+          ARCHIVE_NAME="hippobox-${TAG}-${ARCH}-${{ matrix.os_label }}"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            zip "../${ARCHIVE_NAME}.zip" *
+          else
+            tar czf "../${ARCHIVE_NAME}.tar.gz" *
+          fi
           cd ..
-          sha256sum "hippobox-${TAG}-x86_64-linux.tar.gz" > checksums-sha256.txt
+          sha256sum "${ARCHIVE_NAME}."* >> checksums-sha256.txt
 
       - name: Upload Release Artifacts
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        uses: softprops/action-gh-release@v2
         with:
           files: |
-            hippobox-${{ env.TAG }}-x86_64-linux.tar.gz
+            hippobox-${{ env.TAG }}-*
             checksums-sha256.txt
 
   publish:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: crates-io
     permissions:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
-        with:
-          toolchain: stable
+      - uses: dtolnay/rust-toolchain@stable
 
-      - uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
+      - uses: rust-lang/crates-io-auth-action@v1
         id: auth
 
       - name: Publish to crates.io

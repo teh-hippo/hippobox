@@ -9,43 +9,51 @@ permissions:
   contents: read
 
 jobs:
-  fmt:
-    runs-on: ubuntu-latest
+  check:
+    strategy:
+      matrix:
+        include:
+          - { name: fmt,     cmd: "cargo fmt --check -p hippobox" }
+          - { name: clippy,  cmd: "cargo clippy -p hippobox -- -D warnings" }
+          - { name: test,    cmd: "cargo test -p hippobox" }
+          - { name: publish, cmd: "cargo publish -p hippobox --dry-run --locked" }
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          components: rustfmt
-      - run: cargo fmt --check -p hippobox
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: ${{ matrix.cmd }}
 
-  clippy:
-    runs-on: ubuntu-latest
+  cross-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-unknown-linux-gnu, use-cross: true }
+          - { target: x86_64-pc-windows-gnu,    use-cross: false }
+    name: cross (${{ matrix.target }})
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo clippy -p hippobox -- -D warnings
-
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test -p hippobox
-
-  publish-dry-run:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo publish -p hippobox --dry-run --locked
+          key: ${{ matrix.target }}
+      - name: Install cross-compilation tools
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
+            sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+          fi
+      - name: Check
+        run: |
+          if [ "${{ matrix.use-cross }}" = "true" ]; then
+            cargo install cross --locked
+            cross check -p hippobox --target ${{ matrix.target }}
+          else
+            cargo check -p hippobox --target ${{ matrix.target }}
+          fi

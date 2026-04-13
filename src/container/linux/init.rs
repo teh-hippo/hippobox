@@ -11,7 +11,8 @@ use super::process::{ChildConfig, to_cstrings};
 pub fn container_init(config_fd: i32) -> Result<()> {
     let pipe_file = unsafe { std::fs::File::from_raw_fd(config_fd) };
     let mut config: ChildConfig = serde_json::from_reader(std::io::BufReader::new(pipe_file))?;
-    let needs_netns = config.network_mode == super::NetworkMode::None && !config.external_netns;
+    let needs_netns =
+        config.network_mode == super::super::NetworkMode::None && !config.external_netns;
     super::mounts::copy_host_files_to_rootfs(Path::new(&config.rootfs))?;
     setup_namespaces_and_pivot(
         Path::new(&config.rootfs),
@@ -67,7 +68,7 @@ pub fn container_init(config_fd: i32) -> Result<()> {
         && let Some(home) = setup_user(user_str, config.rootless)?
     {
         let entry = format!("HOME={home}");
-        match super::env_find_mut(&mut config.env_vars, "HOME") {
+        match super::super::env_find_mut(&mut config.env_vars, "HOME") {
             Some(e) => *e = entry,
             None => config.env_vars.push(entry),
         }
@@ -157,7 +158,7 @@ fn passwd_field_by_uid(uid: u32, idx: usize) -> Option<String> {
 fn setup_namespaces_and_pivot(
     new_root: &Path,
     rootless: bool,
-    volumes: &[super::VolumeMount],
+    volumes: &[super::super::VolumeMount],
     isolate_network: bool,
 ) -> Result<()> {
     use nix::mount::mount;

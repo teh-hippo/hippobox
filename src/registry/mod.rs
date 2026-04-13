@@ -1,112 +1,13 @@
+mod extract;
+
 use crate::image::{Descriptor, ImageConfig, ImageRef, Manifest, StoredImage};
+use crate::platform::{Os, Target};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::fs;
 use std::io::{self, Read};
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Component, Path, PathBuf};
-
-fn has_unsafe_components(path: &Path) -> bool {
-    path.is_absolute()
-        || path.components().any(|c| {
-            matches!(
-                c,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-}
-
-fn extract_with_whiteouts(archive: &mut tar::Archive<impl Read>, target: &Path) -> Result<()> {
-    archive.set_preserve_permissions(true);
-    archive.set_unpack_xattrs(false);
-
-    let safe_dir = |relative: &Path| -> Result<PathBuf> {
-        if has_unsafe_components(relative) {
-            bail!("unsafe archive path component in {}", relative.display());
-        }
-        let mut out = target.to_path_buf();
-        for component in relative.components() {
-            if let Component::Normal(part) = component {
-                out.push(part);
-                match fs::symlink_metadata(&out) {
-                    Ok(m) if m.file_type().is_symlink() => bail!(
-                        "refusing to traverse symlink while extracting: {}",
-                        out.display()
-                    ),
-                    Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
-                    _ => {}
-                }
-            }
-        }
-        fs::create_dir_all(&out)?;
-        Ok(out)
-    };
-
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.into_owned();
-        if has_unsafe_components(&path) {
-            bail!("unsafe archive path component in {}", path.display());
-        }
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-        if file_name == ".wh..wh..opq" {
-            let parent = safe_dir(path.parent().unwrap_or(Path::new("")))?;
-            let c_path = CString::new(parent.to_string_lossy().as_bytes())?;
-            let ret = unsafe {
-                nix::libc::setxattr(
-                    c_path.as_ptr(),
-                    c"trusted.overlay.opaque".as_ptr(),
-                    b"y".as_ptr().cast(),
-                    1,
-                    0,
-                )
-            };
-            if ret != 0 {
-                return Err(io::Error::last_os_error()).with_context(|| {
-                    format!("failed to set opaque xattr on {}", parent.display())
-                });
-            }
-            continue;
-        }
-
-        if let Some(deleted_name) = file_name.strip_prefix(".wh.") {
-            if deleted_name.is_empty()
-                || deleted_name == "."
-                || deleted_name == ".."
-                || deleted_name.contains('/')
-                || deleted_name.contains('\\')
-                || Path::new(deleted_name).components().count() != 1
-            {
-                bail!("unsafe whiteout name: {deleted_name}");
-            }
-            let parent = safe_dir(path.parent().unwrap_or(Path::new("")))?;
-            let wp = parent.join(deleted_name);
-            if let Ok(m) = fs::symlink_metadata(&wp) {
-                if m.file_type().is_dir() && !m.file_type().is_symlink() {
-                    fs::remove_dir_all(&wp)?;
-                } else {
-                    fs::remove_file(&wp)?;
-                }
-            }
-            nix::sys::stat::mknod(
-                &wp,
-                nix::sys::stat::SFlag::S_IFCHR,
-                nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
-                nix::sys::stat::makedev(0, 0),
-            )
-            .with_context(|| format!("failed to create whiteout at {}", wp.display()))?;
-            continue;
-        }
-
-        if !entry.unpack_in(target)? {
-            bail!("archive entry escapes target directory: {}", path.display());
-        }
-    }
-    Ok(())
-}
+use std::path::{Path, PathBuf};
 
 fn create_extract_temp_dir(target_dir: &Path) -> Result<PathBuf> {
     let pid = std::process::id();
@@ -114,7 +15,11 @@ fn create_extract_temp_dir(target_dir: &Path) -> Result<PathBuf> {
         let tmp = target_dir.with_extension(format!("tmp-{pid}-{nonce}"));
         match fs::create_dir(&tmp) {
             Ok(()) => {
-                fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700))?;
+                }
                 return Ok(tmp);
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -158,12 +63,17 @@ impl RegistryClient {
             token_cache: HashMap::new(),
         }
     }
-    pub fn pull(&mut self, image_ref: &ImageRef, base_dir: &Path) -> Result<StoredImage> {
-        let config_path = image_ref.image_metadata_path(base_dir);
+    pub fn pull(
+        &mut self,
+        image_ref: &ImageRef,
+        base_dir: &Path,
+        target: &Target,
+    ) -> Result<StoredImage> {
+        let config_path = image_ref.image_metadata_path(base_dir, target);
         let old_stored: Option<StoredImage> = fs::read(&config_path)
             .ok()
             .and_then(|data| serde_json::from_slice(&data).ok());
-        let manifest = self.fetch_manifest(image_ref)?;
+        let manifest = self.fetch_manifest(image_ref, target)?;
         let config = self.fetch_config(image_ref, &manifest)?;
         for layer in &manifest.layers {
             let (hex, layer_dir) = (layer.hex(), layer.layer_dir(base_dir));
@@ -172,9 +82,13 @@ impl RegistryClient {
                 continue;
             }
             eprintln!("  pulling layer {}...", &hex[..12]);
-            self.download_and_extract_layer(image_ref, layer, &layer_dir)?;
+            self.download_and_extract_layer(image_ref, layer, &layer_dir, target)?;
         }
-        let stored = StoredImage { manifest, config };
+        let stored = StoredImage {
+            manifest,
+            config,
+            target: *target,
+        };
         fs::create_dir_all(
             config_path
                 .parent()
@@ -192,7 +106,7 @@ impl RegistryClient {
             image_ref.registry, image_ref.repository
         )
     }
-    fn fetch_manifest(&mut self, image_ref: &ImageRef) -> Result<Manifest> {
+    fn fetch_manifest(&mut self, image_ref: &ImageRef, target: &Target) -> Result<Manifest> {
         let url = Self::api_url(image_ref, "manifests", &image_ref.tag);
         let accept = "application/vnd.oci.image.index.v1+json, \
             application/vnd.oci.image.manifest.v1+json, \
@@ -210,11 +124,11 @@ impl RegistryClient {
                 .iter()
                 .find_map(|entry| {
                     let p = entry.get("platform")?;
-                    (p.get("os")?.as_str()? == "linux"
-                        && p.get("architecture")?.as_str()? == "amd64")
-                        .then(|| entry.get("digest")?.as_str())?
+                    (p.get("os")?.as_str()? == target.os.as_oci_str()
+                        && p.get("architecture")?.as_str()? == target.arch.as_oci_str())
+                    .then(|| entry.get("digest")?.as_str())?
                 })
-                .context("no linux/amd64 platform found in manifest index")?;
+                .with_context(|| format!("no {target} platform found in manifest index"))?;
             let url = Self::api_url(image_ref, "manifests", digest);
             let accept = "application/vnd.oci.image.manifest.v1+json, \
                 application/vnd.docker.distribution.manifest.v2+json";
@@ -244,6 +158,7 @@ impl RegistryClient {
         image_ref: &ImageRef,
         layer: &Descriptor,
         target_dir: &Path,
+        target: &Target,
     ) -> Result<()> {
         let url = Self::api_url(image_ref, "blobs", &layer.digest);
         let token = get_anonymous_token(&mut self.token_cache, &self.agent, image_ref)?;
@@ -286,20 +201,37 @@ impl RegistryClient {
                 ctx: ring::digest::Context::new(&ring::digest::SHA256),
             };
             let mt = layer.media_type.as_deref();
-            let is_gzip = mt.is_none_or(|m| m.contains("tar+gzip") || m.ends_with("diff.tar.gzip"));
+            let is_gzip = mt.is_none_or(|m| {
+                m.contains("tar+gzip")
+                    || m.ends_with("diff.tar.gzip")
+                    || m.contains("foreign.diff.tar.gzip")
+            });
             let reader = if is_gzip {
                 let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(reader));
-                extract_with_whiteouts(&mut ar, &tmp_dir)?;
+                match target.os {
+                    #[cfg(unix)]
+                    Os::Linux => extract::extract_linux_layer(&mut ar, &tmp_dir)?,
+                    #[cfg(not(unix))]
+                    Os::Linux => bail!("Linux layer extraction is not supported on this platform"),
+                    Os::Windows => extract::extract_windows_layer(&mut ar, &tmp_dir)?,
+                }
                 ar.into_inner().into_inner()
             } else if matches!(
                 mt,
                 Some(
                     "application/vnd.oci.image.layer.v1.tar"
                         | "application/vnd.docker.image.rootfs.diff.tar"
+                        | "application/vnd.docker.image.rootfs.foreign.diff.tar"
                 )
             ) {
                 let mut ar = tar::Archive::new(reader);
-                extract_with_whiteouts(&mut ar, &tmp_dir)?;
+                match target.os {
+                    #[cfg(unix)]
+                    Os::Linux => extract::extract_linux_layer(&mut ar, &tmp_dir)?,
+                    #[cfg(not(unix))]
+                    Os::Linux => bail!("Linux layer extraction is not supported on this platform"),
+                    Os::Windows => extract::extract_windows_layer(&mut ar, &tmp_dir)?,
+                }
                 ar.into_inner()
             } else {
                 bail!("unsupported layer media type: {mt:?}")
@@ -473,76 +405,6 @@ mod tests {
     use crate::image::{Descriptor, ImageConfig, ImageRef, Manifest, StoredImage};
     use tempfile::TempDir;
 
-    fn tar_entry(path: &str, content: &[u8], mode: u32, etype: tar::EntryType) -> Vec<u8> {
-        let mut b = tar::Builder::new(Vec::new());
-        let mut h = tar::Header::new_gnu();
-        h.set_path(path).unwrap();
-        h.set_size(content.len() as u64);
-        h.set_mode(mode);
-        h.set_entry_type(etype);
-        h.set_cksum();
-        b.append(&h, content).unwrap();
-        b.into_inner().unwrap()
-    }
-    fn tar_raw_path(path_bytes: &[u8]) -> Vec<u8> {
-        let mut b = tar::Builder::new(Vec::new());
-        let mut h = tar::Header::new_gnu();
-        h.as_gnu_mut().unwrap().name[..path_bytes.len()].copy_from_slice(path_bytes);
-        h.as_gnu_mut().unwrap().name[path_bytes.len()] = 0;
-        h.set_size(4);
-        h.set_mode(0o644);
-        h.set_cksum();
-        b.append(&h, b"evil" as &[u8]).unwrap();
-        b.into_inner().unwrap()
-    }
-    fn untar(data: &[u8], dir: &Path) -> Result<()> {
-        extract_with_whiteouts(&mut tar::Archive::new(std::io::Cursor::new(data)), dir)
-    }
-    fn desc(d: &str) -> Descriptor {
-        Descriptor {
-            media_type: None,
-            digest: d.into(),
-            size: 100,
-        }
-    }
-    fn stored(digests: &[&str]) -> StoredImage {
-        StoredImage {
-            manifest: Manifest {
-                config: desc("sha256:cfg"),
-                layers: digests.iter().map(|d| desc(d)).collect(),
-            },
-            config: ImageConfig {
-                config: None,
-                rootfs: None,
-            },
-        }
-    }
-    fn mk_layer(b: &Path, d: &str) {
-        std::fs::create_dir_all(
-            b.join("layers/sha256")
-                .join(d.strip_prefix("sha256:").unwrap_or(d)),
-        )
-        .unwrap();
-    }
-    fn has_layer(b: &Path, d: &str) -> bool {
-        b.join("layers/sha256")
-            .join(d.strip_prefix("sha256:").unwrap_or(d))
-            .exists()
-    }
-
-    #[test]
-    fn path_safety() {
-        for (p, expect) in [
-            ("usr/bin/bash", false),
-            ("./foo/bar", false),
-            ("", false),
-            ("/etc/passwd", true),
-            ("foo/../etc", true),
-            ("..", true),
-        ] {
-            assert_eq!(has_unsafe_components(Path::new(p)), expect, "path={p:?}");
-        }
-    }
     #[test]
     fn hashing_reader() {
         for data in [
@@ -568,81 +430,40 @@ mod tests {
             assert_eq!(hex(r.ctx.finish().as_ref()), expected);
         }
     }
-    #[test]
-    fn extract_valid_and_nested() {
-        let t = TempDir::new().unwrap();
-        untar(
-            &tar_entry("hello.txt", b"hello", 0o644, tar::EntryType::Regular),
-            t.path(),
+
+    fn desc(d: &str) -> Descriptor {
+        Descriptor {
+            media_type: None,
+            digest: d.into(),
+            size: 100,
+        }
+    }
+    fn stored(digests: &[&str]) -> StoredImage {
+        StoredImage {
+            manifest: Manifest {
+                config: desc("sha256:cfg"),
+                layers: digests.iter().map(|d| desc(d)).collect(),
+            },
+            config: ImageConfig {
+                config: None,
+                rootfs: None,
+            },
+            target: crate::platform::Target::host(),
+        }
+    }
+    fn mk_layer(b: &Path, d: &str) {
+        std::fs::create_dir_all(
+            b.join("layers/sha256")
+                .join(d.strip_prefix("sha256:").unwrap_or(d)),
         )
         .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(t.path().join("hello.txt")).unwrap(),
-            "hello"
-        );
-        let t2 = TempDir::new().unwrap();
-        let mut b = tar::Builder::new(Vec::new());
-        let mut dh = tar::Header::new_gnu();
-        dh.set_path("usr/local/bin/").unwrap();
-        dh.set_size(0);
-        dh.set_mode(0o755);
-        dh.set_entry_type(tar::EntryType::Directory);
-        dh.set_cksum();
-        b.append(&dh, &[][..]).unwrap();
-        let mut fh = tar::Header::new_gnu();
-        fh.set_path("usr/local/bin/tool").unwrap();
-        fh.set_size(4);
-        fh.set_mode(0o755);
-        fh.set_cksum();
-        b.append(&fh, b"test" as &[u8]).unwrap();
-        untar(&b.into_inner().unwrap(), t2.path()).unwrap();
-        assert_eq!(
-            fs::read_to_string(t2.path().join("usr/local/bin/tool")).unwrap(),
-            "test"
-        );
     }
-    #[test]
-    fn extract_security() {
-        for p in [b"/etc/shadow" as &[u8], b"../../etc/passwd"] {
-            assert!(untar(&tar_raw_path(p), &TempDir::new().unwrap().path()).is_err());
-        }
-        let t = TempDir::new().unwrap();
-        std::os::unix::fs::symlink("/tmp", t.path().join("evil")).unwrap();
-        assert!(
-            untar(
-                &tar_entry(
-                    "evil/payload.txt",
-                    b"attack",
-                    0o644,
-                    tar::EntryType::Regular
-                ),
-                t.path()
-            )
-            .is_err()
-        );
-        let t2 = TempDir::new().unwrap();
-        fs::write(t2.path().join("existing.txt"), "data").unwrap();
-        let _ = untar(
-            &tar_entry(".wh.existing.txt", b"", 0o644, tar::EntryType::Regular),
-            t2.path(),
-        );
-        for name in [".wh.", ".wh..", ".wh...", r".wh.foo\bar"] {
-            let mut b = tar::Builder::new(Vec::new());
-            let mut h = tar::Header::new_gnu();
-            if h.set_path(name).is_err() {
-                continue;
-            }
-            h.set_size(0);
-            h.set_mode(0o644);
-            h.set_entry_type(tar::EntryType::Regular);
-            h.set_cksum();
-            b.append(&h, &[][..]).unwrap();
-            assert!(
-                untar(&b.into_inner().unwrap(), &TempDir::new().unwrap().path()).is_err(),
-                "should reject {name:?}"
-            );
-        }
+    fn has_layer(b: &Path, d: &str) -> bool {
+        b.join("layers/sha256")
+            .join(d.strip_prefix("sha256:").unwrap_or(d))
+            .exists()
     }
+
     #[test]
     fn temp_dir_unique() {
         let t = TempDir::new().unwrap();
@@ -653,7 +474,9 @@ mod tests {
             create_extract_temp_dir(&target).unwrap(),
         );
         assert_ne!(d1, d2);
+        #[cfg(unix)]
         for d in [&d1, &d2] {
+            use std::os::unix::fs::PermissionsExt;
             assert_eq!(fs::metadata(d).unwrap().permissions().mode() & 0o777, 0o700);
         }
     }
@@ -674,7 +497,6 @@ mod tests {
         assert!(
             !has_layer(b, "sha256:aaa") && has_layer(b, "sha256:bbb") && has_layer(b, "sha256:ccc")
         );
-        // Referenced by other image
         for d in ["sha256:shared", "sha256:orphan"] {
             mk_layer(b, d);
         }
@@ -689,12 +511,10 @@ mod tests {
         )
         .unwrap();
         assert!(has_layer(b, "sha256:shared") && !has_layer(b, "sha256:orphan"));
-        // In-use marker
         mk_layer(b, "sha256:busy");
         std::fs::write(b.join("layers/sha256/busy/.in-use"), "cid").unwrap();
         auto_prune_layers(&stored(&["sha256:busy"]), &stored(&["sha256:x"]), b).unwrap();
         assert!(has_layer(b, "sha256:busy"));
-        // Noop
         mk_layer(b, "sha256:a2");
         mk_layer(b, "sha256:b3");
         auto_prune_layers(

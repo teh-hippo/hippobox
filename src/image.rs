@@ -2,6 +2,8 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::platform::Target;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageRef {
     pub registry: String,
@@ -49,12 +51,27 @@ impl ImageRef {
             tag: tag.to_string(),
         })
     }
-    pub fn image_metadata_path(&self, base_dir: &Path) -> PathBuf {
-        base_dir
+    pub fn image_metadata_path(&self, base_dir: &Path, target: &Target) -> PathBuf {
+        let platformed = base_dir
             .join("images")
             .join(&self.registry)
             .join(&self.repository)
-            .join(format!("{}.json", self.tag))
+            .join(target.slug())
+            .join(format!("{}.json", self.tag));
+        if platformed.exists() {
+            return platformed;
+        }
+        // Fallback: check the legacy (non-platformed) path for backward compat.
+        let legacy = base_dir
+            .join("images")
+            .join(&self.registry)
+            .join(&self.repository)
+            .join(format!("{}.json", self.tag));
+        if legacy.exists() {
+            return legacy;
+        }
+        // Neither exists — return the new platformed path for creation.
+        platformed
     }
 }
 
@@ -111,6 +128,8 @@ pub struct RootFs {
 pub struct StoredImage {
     pub manifest: Manifest,
     pub config: ImageConfig,
+    #[serde(default)]
+    pub target: Target,
 }
 
 pub fn walk_stored_images(images_dir: &Path) -> Result<Vec<(String, String, PathBuf)>> {
@@ -140,7 +159,11 @@ pub fn walk_stored_images(images_dir: &Path) -> Result<Vec<(String, String, Path
                 .parent()
                 .unwrap_or(&dir)
                 .strip_prefix(images_dir)
-                .map_or_else(|_| String::new(), |r| r.to_string_lossy().to_string());
+                .map_or_else(|_| String::new(), |r| {
+                    // Normalise path separators to forward slashes for consistent
+                    // repository names across platforms (e.g. "registry/repo")
+                    r.to_string_lossy().replace('\\', "/")
+                });
             results.push((repo, tag.to_string(), path));
         }
     }
@@ -201,8 +224,8 @@ mod tests {
         assert_eq!(
             ImageRef::parse("nginx")
                 .unwrap()
-                .image_metadata_path(Path::new("/hb")),
-            PathBuf::from("/hb/images/registry-1.docker.io/library/nginx/latest.json")
+                .image_metadata_path(Path::new("/hb"), &Target::host()),
+            PathBuf::from("/hb/images/registry-1.docker.io/library/nginx/linux-amd64/latest.json")
         );
     }
     #[test]
