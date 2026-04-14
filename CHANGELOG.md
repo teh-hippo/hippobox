@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0](https://github.com/teh-hippo/hippobox/compare/v0.3.3...v0.4.0) (2026-04-14)
+
+
+### Features
+
+* add Windows CI, Job Objects, GC locking, and cross-platform test fixes ([4858a4e](https://github.com/teh-hippo/hippobox/commit/4858a4e3bb2cc347a182f5e12f4f3be7b5de57fe))
+
+
+### Bug Fixes
+
+* prevent layer cache corruption and add Windows signal forwarding ([ce56653](https://github.com/teh-hippo/hippobox/commit/ce566532c2b8b767fb3e0b0e3af62511a53c6d2a))
+
 ## [0.3.3](https://github.com/teh-hippo/hippobox/compare/v0.3.2...v0.3.3) (2026-04-14)
 
 
