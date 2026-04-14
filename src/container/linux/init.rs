@@ -203,14 +203,14 @@ fn setup_namespaces_and_pivot(
     Ok(())
 }
 
+const BLOCKED: &[i64] = &[
+    101, 103, 134, 135, 136, 139, 155, 163, 164, 165, 166, 167, 168, 169, 172, 173, 174, 175, 176,
+    177, 178, 179, 180, 206, 212, 227, 237, 238, 239, 246, 248, 249, 250, 272, 279, 298, 304, 305,
+    308, 310, 311, 312, 313, 320, 321, 323, 425, 426, 427, 428, 429, 430, 431, 432, 434, 442,
+];
+
 fn apply_seccomp_filter() -> Result<()> {
     use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
-    const BLOCKED: &[i64] = &[
-        101, 103, 134, 135, 136, 139, 155, 163, 164, 165, 166, 167, 168, 169, 172, 173, 174, 175,
-        176, 177, 178, 179, 180, 206, 212, 227, 237, 238, 239, 246, 248, 249, 250, 272, 279, 298,
-        304, 305, 308, 310, 311, 312, 313, 320, 321, 323, 425, 426, 427, 428, 429, 430, 431, 432,
-        434, 442,
-    ];
     let rules: std::collections::BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
         BLOCKED.iter().map(|&nr| (nr, vec![])).collect();
     let filter = SeccompFilter::new(
@@ -228,7 +228,7 @@ fn apply_seccomp_filter() -> Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn resolve_id_all_cases() {
+    fn resolve_id_and_user_setup() {
         // Numeric IDs work even with nonexistent files
         assert_eq!(resolve_id("0", "/nonexistent/file", "user").unwrap(), 0);
         assert_eq!(
@@ -236,14 +236,11 @@ mod tests {
             1000
         );
         assert_eq!(resolve_id("65534", "/etc/group", "group").unwrap(), 65534);
-        // Named lookup from file
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::io::Write::write_all(&mut std::fs::File::create(tmp.path()).unwrap(),
-            b"root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534:Nobody:/nonexistent:/usr/sbin/nologin\n").unwrap();
+        std::fs::write(tmp.path(), b"root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534:Nobody:/nonexistent:/usr/sbin/nologin\n").unwrap();
         let path = tmp.path().to_str().unwrap();
         assert_eq!(resolve_id("nobody", path, "user").unwrap(), 65534);
         assert!(resolve_id("nonexistent", path, "user").is_err());
-        // Named with missing file fails
         assert!(
             format!(
                 "{:#}",
@@ -251,16 +248,13 @@ mod tests {
             )
             .contains("failed to read")
         );
-        // Malformed lines handled gracefully
         let tmp2 = tempfile::NamedTempFile::new().unwrap();
-        std::io::Write::write_all(&mut std::fs::File::create(tmp2.path()).unwrap(),
-            b"short\n\nempty:::\nuser:x:notanumber:0::/home/user:/bin/bash\ngood:x:42:42:Good:/home/good:/bin/sh\n").unwrap();
+        std::fs::write(tmp2.path(), b"short\n\nempty:::\nuser:x:notanumber:0::/home/user:/bin/bash\ngood:x:42:42:Good:/home/good:/bin/sh\n").unwrap();
         let path2 = tmp2.path().to_str().unwrap();
         assert_eq!(resolve_id("good", path2, "user").unwrap(), 42);
         assert!(resolve_id("user", path2, "user").is_err());
-    }
-    #[test]
-    fn passwd_and_rootless_user() {
+
+        // passwd_field_by_uid
         if let Some(home) = passwd_field_by_uid(0, 5) {
             assert!(
                 home == "/root" || home.starts_with('/'),
@@ -268,6 +262,7 @@ mod tests {
             );
         }
         assert!(passwd_field_by_uid(99999, 5).is_none());
+        // Rootless mode skips user setup
         assert!(
             setup_user("1000", true).unwrap().is_none(),
             "rootless mode should skip user setup"
@@ -276,12 +271,6 @@ mod tests {
     #[test]
     fn seccomp_blocked_list_is_valid() {
         use seccompiler::{SeccompAction, SeccompFilter, TargetArch};
-        const BLOCKED: &[i64] = &[
-            101, 103, 134, 135, 136, 139, 155, 163, 164, 165, 166, 167, 168, 169, 172, 173, 174,
-            175, 176, 177, 178, 179, 180, 206, 212, 227, 237, 238, 239, 246, 248, 249, 250, 272,
-            279, 298, 304, 305, 308, 310, 311, 312, 313, 320, 321, 323, 425, 426, 427, 428, 429,
-            430, 431, 432, 434, 442,
-        ];
         let mut sorted = BLOCKED.to_vec();
         sorted.sort();
         sorted.dedup();

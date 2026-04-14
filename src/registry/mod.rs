@@ -64,6 +64,21 @@ impl RegistryClient {
             token_cache: HashMap::new(),
         }
     }
+    fn fetch_json<T: serde::de::DeserializeOwned>(
+        &mut self,
+        image_ref: &ImageRef,
+        url: &str,
+        accept: &str,
+        context: &'static str,
+    ) -> Result<T> {
+        serde_json::from_reader(
+            self.authenticated_get(image_ref, url, accept)?
+                .into_body()
+                .into_reader()
+                .take(MAX_RESPONSE_BYTES),
+        )
+        .context(context)
+    }
     pub fn pull(
         &mut self,
         image_ref: &ImageRef,
@@ -113,13 +128,8 @@ impl RegistryClient {
             application/vnd.oci.image.manifest.v1+json, \
             application/vnd.docker.distribution.manifest.list.v2+json, \
             application/vnd.docker.distribution.manifest.v2+json";
-        let response: serde_json::Value = serde_json::from_reader(
-            self.authenticated_get(image_ref, &url, accept)?
-                .into_body()
-                .into_reader()
-                .take(MAX_RESPONSE_BYTES),
-        )
-        .context("failed to parse manifest response")?;
+        let response: serde_json::Value =
+            self.fetch_json(image_ref, &url, accept, "failed to parse manifest response")?;
         if let Some(manifests) = response.get("manifests").and_then(|v| v.as_array()) {
             let digest = manifests
                 .iter()
@@ -138,26 +148,19 @@ impl RegistryClient {
             let url = Self::api_url(image_ref, "manifests", digest);
             let accept = "application/vnd.oci.image.manifest.v1+json, \
                 application/vnd.docker.distribution.manifest.v2+json";
-            return serde_json::from_reader(
-                self.authenticated_get(image_ref, &url, accept)?
-                    .into_body()
-                    .into_reader()
-                    .take(MAX_RESPONSE_BYTES),
-            )
-            .context("failed to parse platform manifest");
+            return self.fetch_json(image_ref, &url, accept, "failed to parse platform manifest");
         }
         serde_json::from_value(response).context("failed to parse manifest response")
     }
 
     fn fetch_config(&mut self, image_ref: &ImageRef, manifest: &Manifest) -> Result<ImageConfig> {
         let url = Self::api_url(image_ref, "blobs", &manifest.config.digest);
-        serde_json::from_reader(
-            self.authenticated_get(image_ref, &url, "application/json")?
-                .into_body()
-                .into_reader()
-                .take(MAX_RESPONSE_BYTES),
+        self.fetch_json(
+            image_ref,
+            &url,
+            "application/json",
+            "failed to parse image config",
         )
-        .context("failed to parse image config")
     }
     fn download_and_extract_layer(
         &mut self,
@@ -214,20 +217,7 @@ impl RegistryClient {
             });
             let reader = if is_gzip {
                 let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(reader));
-                match target.os {
-                    #[cfg(unix)]
-                    Os::Linux | Os::Darwin => extract::extract_linux_layer(&mut ar, &tmp_dir)?,
-                    #[cfg(not(unix))]
-                    Os::Linux | Os::Darwin => {
-                        bail!("Linux/Darwin layer extraction is not supported on this platform")
-                    }
-                    #[cfg(not(unix))]
-                    Os::Windows => extract::extract_windows_layer(&mut ar, &tmp_dir)?,
-                    #[cfg(unix)]
-                    Os::Windows => {
-                        bail!("Windows layer extraction is not supported on this host")
-                    }
-                }
+                dispatch_extract(&mut ar, &tmp_dir, target)?;
                 ar.into_inner().into_inner()
             } else if matches!(
                 mt,
@@ -238,20 +228,7 @@ impl RegistryClient {
                 )
             ) {
                 let mut ar = tar::Archive::new(reader);
-                match target.os {
-                    #[cfg(unix)]
-                    Os::Linux | Os::Darwin => extract::extract_linux_layer(&mut ar, &tmp_dir)?,
-                    #[cfg(not(unix))]
-                    Os::Linux | Os::Darwin => {
-                        bail!("Linux/Darwin layer extraction is not supported on this platform")
-                    }
-                    #[cfg(not(unix))]
-                    Os::Windows => extract::extract_windows_layer(&mut ar, &tmp_dir)?,
-                    #[cfg(unix)]
-                    Os::Windows => {
-                        bail!("Windows layer extraction is not supported on this host")
-                    }
-                }
+                dispatch_extract(&mut ar, &tmp_dir, target)?;
                 ar.into_inner()
             } else {
                 bail!("unsupported layer media type: {mt:?}")
@@ -291,6 +268,25 @@ impl RegistryClient {
             bail!("HTTP {} for {}", resp.status(), url);
         }
         Ok(resp)
+    }
+}
+
+fn dispatch_extract<R: io::Read>(
+    ar: &mut tar::Archive<R>,
+    dir: &Path,
+    target: &Target,
+) -> Result<()> {
+    match target.os {
+        #[cfg(unix)]
+        Os::Linux | Os::Darwin => extract::extract_linux_layer(ar, dir),
+        #[cfg(not(unix))]
+        Os::Linux | Os::Darwin => {
+            bail!("Linux/Darwin layer extraction is not supported on this platform")
+        }
+        #[cfg(not(unix))]
+        Os::Windows => extract::extract_windows_layer(ar, dir),
+        #[cfg(unix)]
+        Os::Windows => bail!("Windows layer extraction is not supported on this host"),
     }
 }
 
@@ -546,7 +542,8 @@ mod tests {
         assert!(has_layer(b, "sha256:a2") && has_layer(b, "sha256:b3"));
     }
     #[test]
-    fn api_url_format() {
+    fn api_url_and_token_handling() {
+        // API URL construction
         let ghcr = ImageRef::parse("ghcr.io/owner/repo:v1").unwrap();
         assert_eq!(
             RegistryClient::api_url(&ghcr, "manifests", "v1"),
@@ -561,9 +558,8 @@ mod tests {
             RegistryClient::api_url(&hub, "manifests", "latest"),
             "https://registry-1.docker.io/v2/library/nginx/manifests/latest"
         );
-    }
-    #[test]
-    fn token_cache_and_parsing() {
+
+        // Token cache returns cached value
         let img = ImageRef::parse("ghcr.io/owner/repo:v1").unwrap();
         let mut cache = HashMap::new();
         cache.insert("ghcr.io/owner/repo".to_string(), "cached-123".to_string());
@@ -571,6 +567,7 @@ mod tests {
             get_anonymous_token(&mut cache, &ureq::Agent::new_with_defaults(), &img).unwrap(),
             "cached-123"
         );
+        // TokenResponse parsing
         for (json, tok, at) in [
             (r#"{"token":"t1"}"#, Some("t1"), None),
             (r#"{"access_token":"a1"}"#, None, Some("a1")),

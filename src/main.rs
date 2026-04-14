@@ -68,6 +68,17 @@ enum Commands {
     Clean,
 }
 
+fn resolve_target(platform: Option<String>) -> Result<platform::Target> {
+    match platform {
+        Some(p) => {
+            let t = platform::Target::parse(&p)?;
+            t.validate_host_os()?;
+            Ok(t)
+        }
+        None => Ok(platform::Target::host()),
+    }
+}
+
 fn main() -> Result<()> {
     // Internal commands used by the Linux container runtime (fork/exec protocol)
     #[cfg(target_os = "linux")]
@@ -105,14 +116,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Pull { image, platform } => {
             let image_ref = ImageRef::parse(&image)?;
-            let target = match platform {
-                Some(p) => {
-                    let t = platform::Target::parse(&p)?;
-                    t.validate_host_os()?;
-                    t
-                }
-                None => platform::Target::host(),
-            };
+            let target = resolve_target(platform)?;
             let base_dir = hippobox_dir();
             container::gc_stale_containers(&base_dir);
             let mut client = RegistryClient::new();
@@ -129,14 +133,7 @@ fn main() -> Result<()> {
             platform,
         } => {
             let image_ref = ImageRef::parse(&image)?;
-            let target = match platform {
-                Some(p) => {
-                    let t = platform::Target::parse(&p)?;
-                    t.validate_host_os()?;
-                    t
-                }
-                None => platform::Target::host(),
-            };
+            let target = resolve_target(platform)?;
             let base_dir = hippobox_dir();
             #[cfg(target_os = "linux")]
             let rootless = !nix::unistd::geteuid().is_root();

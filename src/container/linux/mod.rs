@@ -224,7 +224,16 @@ pub(crate) fn add_port_args(cmd: &mut std::process::Command, ports: &[super::Por
 
 #[cfg(test)]
 mod tests {
+    use super::super::PortMapping;
     use super::*;
+
+    fn pm(host_port: u16, container_port: u16, protocol: &str) -> PortMapping {
+        PortMapping {
+            host_port,
+            container_port,
+            protocol: protocol.into(),
+        }
+    }
 
     #[test]
     fn find_rename_shim_returns_none_when_missing() {
@@ -244,33 +253,12 @@ mod tests {
     fn add_port_args_builds_flags() {
         for (proto, flag) in [("tcp", "-t"), ("udp", "-u")] {
             let mut cmd = std::process::Command::new("echo");
-            add_port_args(
-                &mut cmd,
-                &[super::super::PortMapping {
-                    host_port: 80,
-                    container_port: 8080,
-                    protocol: proto.into(),
-                }],
-            );
+            add_port_args(&mut cmd, &[pm(80, 8080, proto)]);
             let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
             assert_eq!(args, vec![flag, "80:8080"]);
         }
         let mut cmd = std::process::Command::new("echo");
-        add_port_args(
-            &mut cmd,
-            &[
-                super::super::PortMapping {
-                    host_port: 80,
-                    container_port: 8080,
-                    protocol: "tcp".into(),
-                },
-                super::super::PortMapping {
-                    host_port: 53,
-                    container_port: 5353,
-                    protocol: "udp".into(),
-                },
-            ],
-        );
+        add_port_args(&mut cmd, &[pm(80, 8080, "tcp"), pm(53, 5353, "udp")]);
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_str().unwrap().to_string())

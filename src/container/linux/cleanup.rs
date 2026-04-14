@@ -173,39 +173,47 @@ mod tests {
         dir
     }
     #[test]
-    fn gc_stale_and_active() {
+    fn gc_stale_active_and_edge_cases() {
+        // Stale container is removed
         let tmp = TempDir::new().unwrap();
         let stale = mk(tmp.path(), "stale");
         gc_stale_containers(tmp.path());
         assert!(!stale.exists());
+
+        // Active (locked) container is preserved
         let active = mk(tmp.path(), "active");
         let _lock = acquire_container_lock(&active).unwrap();
         gc_stale_containers(tmp.path());
         assert!(active.exists());
+
+        // Dead (lock released) container is removed
         let dead = mk(tmp.path(), "dead");
         {
             let _lock = acquire_container_lock(&dead).unwrap();
         }
         gc_stale_containers(tmp.path());
         assert!(!dead.exists());
-    }
-    #[test]
-    fn gc_edge_cases() {
-        let tmp = TempDir::new().unwrap();
-        gc_stale_containers(tmp.path());
-        std::fs::create_dir_all(tmp.path().join("containers")).unwrap();
-        gc_stale_containers(tmp.path());
-        let dirs: Vec<_> = (0..3).map(|i| mk(tmp.path(), &format!("s{i}"))).collect();
-        gc_stale_containers(tmp.path());
+
+        // Edge: no containers dir, empty containers dir, multiple stale
+        let tmp2 = TempDir::new().unwrap();
+        gc_stale_containers(tmp2.path());
+        std::fs::create_dir_all(tmp2.path().join("containers")).unwrap();
+        gc_stale_containers(tmp2.path());
+        let dirs: Vec<_> = (0..3).map(|i| mk(tmp2.path(), &format!("s{i}"))).collect();
+        gc_stale_containers(tmp2.path());
         for d in &dirs {
             assert!(!d.exists());
         }
-        std::fs::write(tmp.path().join("containers/file"), "x").unwrap();
-        gc_stale_containers(tmp.path());
-        assert!(tmp.path().join("containers/file").exists());
-        let bad = mk(tmp.path(), "bad");
+
+        // Non-directory entries are left alone
+        std::fs::write(tmp2.path().join("containers/file"), "x").unwrap();
+        gc_stale_containers(tmp2.path());
+        assert!(tmp2.path().join("containers/file").exists());
+
+        // Bad lock file (is a directory) doesn't panic
+        let bad = mk(tmp2.path(), "bad");
         std::fs::create_dir(bad.join("hippobox.lock")).unwrap();
-        gc_stale_containers(tmp.path());
+        gc_stale_containers(tmp2.path());
     }
     #[test]
     fn fix_overlay_workdir_behaviour() {
@@ -215,14 +223,12 @@ mod tests {
         std::fs::create_dir_all(dir.join("work/deep/nested")).unwrap();
         std::fs::set_permissions(dir.join("work"), std::fs::Permissions::from_mode(0o000)).unwrap();
         fix_overlay_workdir(&dir);
-        assert_eq!(
-            std::fs::metadata(dir.join("work"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
+        let mode = std::fs::metadata(dir.join("work"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
         let _ = std::fs::set_permissions(dir.join("work"), std::fs::Permissions::from_mode(0o755));
     }
     #[test]

@@ -52,26 +52,17 @@ impl ImageRef {
         })
     }
     pub fn image_metadata_path(&self, base_dir: &Path, target: &Target) -> PathBuf {
-        let platformed = base_dir
+        let base = base_dir
             .join("images")
             .join(&self.registry)
-            .join(&self.repository)
-            .join(target.slug())
-            .join(format!("{}.json", self.tag));
+            .join(&self.repository);
+        let platformed = base.join(target.slug()).join(format!("{}.json", self.tag));
         if platformed.exists() {
             return platformed;
         }
         // Fallback: check the legacy (non-platformed) path for backward compat.
-        let legacy = base_dir
-            .join("images")
-            .join(&self.registry)
-            .join(&self.repository)
-            .join(format!("{}.json", self.tag));
-        if legacy.exists() {
-            return legacy;
-        }
-        // Neither exists — return the new platformed path for creation.
-        platformed
+        let legacy = base.join(format!("{}.json", self.tag));
+        if legacy.exists() { legacy } else { platformed }
     }
 }
 
@@ -159,14 +150,8 @@ pub fn walk_stored_images(images_dir: &Path) -> Result<Vec<(String, String, Path
                 .parent()
                 .unwrap_or(&dir)
                 .strip_prefix(images_dir)
-                .map_or_else(
-                    |_| String::new(),
-                    |r| {
-                        // Normalise path separators to forward slashes for consistent
-                        // repository names across platforms (e.g. "registry/repo")
-                        r.to_string_lossy().replace('\\', "/")
-                    },
-                );
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
             results.push((repo, tag.to_string(), path));
         }
     }
@@ -177,7 +162,7 @@ pub fn walk_stored_images(images_dir: &Path) -> Result<Vec<(String, String, Path
 mod tests {
     use super::*;
     #[test]
-    fn parse_image_refs() {
+    fn parse_image_refs_and_descriptors() {
         for (input, reg, repo, tag) in [
             ("nginx", "registry-1.docker.io", "library/nginx", "latest"),
             (
@@ -234,9 +219,8 @@ mod tests {
                 host.slug()
             ))
         );
-    }
-    #[test]
-    fn descriptor_helpers() {
+
+        // Descriptor helpers
         let d = Descriptor {
             media_type: None,
             digest: "sha256:abc123".into(),

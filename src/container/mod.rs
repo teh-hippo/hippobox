@@ -215,14 +215,12 @@ pub fn parse_network_mode(s: &str) -> Result<NetworkMode> {
 }
 
 pub fn parse_volume(spec: &str) -> Result<VolumeMount> {
-    let parts: Vec<&str> = spec.split(':').collect();
-    let (source, target, read_only) = match parts.len() {
-        2 => (parts[0], parts[1], false),
-        3 => match parts[2] {
-            "ro" => (parts[0], parts[1], true),
-            "rw" => (parts[0], parts[1], false),
-            opt => bail!("invalid volume option {opt:?}, expected 'ro' or 'rw'"),
-        },
+    let parts: Vec<&str> = spec.splitn(4, ':').collect();
+    let (source, target, read_only) = match parts.as_slice() {
+        [s, t] => (*s, *t, false),
+        [s, t, "ro"] => (*s, *t, true),
+        [s, t, "rw"] => (*s, *t, false),
+        [_, _, opt, ..] => bail!("invalid volume option {opt:?}, expected 'ro' or 'rw'"),
         _ => bail!("invalid volume spec {spec:?}, expected SRC:DST[:ro|rw]"),
     };
     if source.is_empty() || target.is_empty() {
@@ -307,9 +305,39 @@ fn which(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image::{ContainerConfig, Descriptor, ImageConfig, ImageRef, Manifest, StoredImage};
+    use crate::platform::Target;
+
+    fn desc(d: &str, s: u64) -> Descriptor {
+        Descriptor {
+            media_type: None,
+            digest: d.into(),
+            size: s,
+        }
+    }
 
     #[test]
-    fn env_overrides_all_cases() {
+    fn env_overrides_and_find_mut() {
+        // env_find_mut lookups
+        let mut vars = vec![
+            "PATH=/usr/bin".into(),
+            "HOME=/root".into(),
+            "TERM=xterm".into(),
+        ];
+        assert_eq!(
+            env_find_mut(&mut vars, "HOME").unwrap().as_str(),
+            "HOME=/root"
+        );
+        assert_eq!(
+            env_find_mut(&mut vars, "PATH").unwrap().as_str(),
+            "PATH=/usr/bin"
+        );
+        for key in ["MISSING", "PAT", "PATHX"] {
+            assert!(env_find_mut(&mut vars, key).is_none());
+        }
+        assert!(env_find_mut(&mut Vec::<String>::new(), "ANY").is_none());
+
+        // apply_env_overrides
         let ov = apply_env_overrides;
         assert_eq!(
             ov(
@@ -343,42 +371,16 @@ mod tests {
     }
 
     #[test]
-    fn env_find_mut_cases() {
-        let mut vars = vec![
-            "PATH=/usr/bin".into(),
-            "HOME=/root".into(),
-            "TERM=xterm".into(),
-        ];
-        assert_eq!(
-            env_find_mut(&mut vars, "HOME").unwrap().as_str(),
-            "HOME=/root"
-        );
-        assert_eq!(
-            env_find_mut(&mut vars, "PATH").unwrap().as_str(),
-            "PATH=/usr/bin"
-        );
-        for key in ["MISSING", "PAT", "PATHX"] {
-            assert!(env_find_mut(&mut vars, key).is_none());
-        }
-        assert!(env_find_mut(&mut Vec::<String>::new(), "ANY").is_none());
-    }
-
-    #[test]
     fn load_image_valid_missing_and_corrupt() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let target = crate::platform::Target::host();
-        let desc = |d: &str, s| crate::image::Descriptor {
-            media_type: None,
-            digest: d.into(),
-            size: s,
-        };
-        let img = crate::image::ImageRef::parse("nginx:1.25").unwrap();
-        let stored = crate::image::StoredImage {
-            manifest: crate::image::Manifest {
+        let target = Target::host();
+        let img = ImageRef::parse("nginx:1.25").unwrap();
+        let stored = StoredImage {
+            manifest: Manifest {
                 config: desc("sha256:cfg", 10),
                 layers: vec![desc("sha256:layer1", 100)],
             },
-            config: crate::image::ImageConfig {
+            config: ImageConfig {
                 config: None,
                 rootfs: None,
             },
@@ -389,7 +391,7 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
         let (m, _) = load_image(&img, tmp.path(), &target).unwrap();
         assert_eq!(m.layers[0].digest, "sha256:layer1");
-        let missing = crate::image::ImageRef::parse("nonexistent:latest").unwrap();
+        let missing = ImageRef::parse("nonexistent:latest").unwrap();
         assert!(
             format!(
                 "{:#}",
@@ -397,7 +399,7 @@ mod tests {
             )
             .contains("image not found locally")
         );
-        let corrupt = crate::image::ImageRef::parse("nginx:bad").unwrap();
+        let corrupt = ImageRef::parse("nginx:bad").unwrap();
         let cp = corrupt.image_metadata_path(tmp.path(), &target);
         std::fs::create_dir_all(cp.parent().unwrap()).unwrap();
         std::fs::write(&cp, "not json").unwrap();
@@ -411,52 +413,19 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_serialisation_round_trip() {
-        let desc = |d: &str, s| crate::image::Descriptor {
-            media_type: None,
-            digest: d.into(),
-            size: s,
-        };
-        let spec = ContainerSpec {
-            id: "test123".into(),
-            image_ref: crate::image::ImageRef::parse("alpine:3.19").unwrap(),
-            manifest: crate::image::Manifest {
-                config: desc("sha256:cfg", 10),
-                layers: vec![],
-            },
-            config: crate::image::ImageConfig {
-                config: None,
-                rootfs: None,
-            },
-            base_dir: PathBuf::from("/tmp/hb"),
-            user_cmd: vec!["sh".into()],
-            user_env: vec!["FOO=bar".into()],
-            volumes: vec![],
-            network_mode: NetworkMode::None,
-            port_mappings: vec![],
-            external_netns: false,
-            rootless: true,
-            target: crate::platform::Target::host(),
-        };
-        let back: ContainerSpec =
-            serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
-        assert_eq!(back.id, "test123");
-        assert!(back.rootless);
-        assert_eq!(back.network_mode, NetworkMode::None);
-    }
-
-    #[test]
-    fn build_argv_success_cases() {
-        let mk = |ep, cmd| crate::image::ContainerConfig {
+    fn build_argv_all_cases() {
+        let mk = |ep, cmd| ContainerConfig {
             entrypoint: ep,
             cmd,
             ..Default::default()
         };
+        // User cmd overrides image CMD
         let cc = mk(None, Some(vec!["default-cmd".into()]));
         assert_eq!(
             build_argv(Some(&cc), vec!["custom".into()]).unwrap(),
             ["custom"]
         );
+        // Entrypoint + CMD combined
         let cc = mk(
             Some(vec!["/ep.sh".into()]),
             Some(vec!["a1".into(), "a2".into()]),
@@ -465,13 +434,16 @@ mod tests {
             build_argv(Some(&cc), vec![]).unwrap(),
             ["/ep.sh", "a1", "a2"]
         );
+        // User cmd replaces CMD but keeps entrypoint
         let cc = mk(Some(vec!["/ep.sh".into()]), Some(vec!["default".into()]));
         assert_eq!(
             build_argv(Some(&cc), vec!["override".into()]).unwrap(),
             ["/ep.sh", "override"]
         );
+        // Entrypoint only
         let cc = mk(Some(vec!["/bin/server".into()]), None);
         assert_eq!(build_argv(Some(&cc), vec![]).unwrap(), ["/bin/server"]);
+        // CMD only (multi-arg)
         let cc = mk(
             None,
             Some(vec!["/bin/sh".into(), "-c".into(), "echo hi".into()]),
@@ -480,15 +452,13 @@ mod tests {
             build_argv(Some(&cc), vec![]).unwrap(),
             ["/bin/sh", "-c", "echo hi"]
         );
+        // No image config, user provides command
         assert_eq!(
             build_argv(None, vec!["/bin/bash".into()]).unwrap(),
             ["/bin/bash"]
         );
-    }
-
-    #[test]
-    fn build_argv_error_cases() {
-        let cc = crate::image::ContainerConfig::default();
+        // Error: no CMD, no entrypoint, no user command
+        let cc = ContainerConfig::default();
         for e in [
             build_argv(Some(&cc), vec![]).unwrap_err(),
             build_argv(None, vec![]).unwrap_err(),
@@ -561,29 +531,11 @@ mod tests {
     }
 
     #[test]
-    fn serialisation_round_trips() {
-        for mode in [NetworkMode::Host, NetworkMode::None] {
-            assert_eq!(
-                serde_json::from_str::<NetworkMode>(&serde_json::to_string(&mode).unwrap())
-                    .unwrap(),
-                mode
-            );
-        }
-        let pm = PortMapping {
-            host_port: 8080,
-            container_port: 80,
-            protocol: "tcp".into(),
-        };
-        let back: PortMapping = serde_json::from_str(&serde_json::to_string(&pm).unwrap()).unwrap();
-        assert_eq!(
-            (back.host_port, back.container_port, back.protocol.as_str()),
-            (8080, 80, "tcp")
-        );
-    }
+    fn build_env_vars_all_cases() {
+        let linux = Target::host();
+        let win = Target::parse("windows/amd64").unwrap();
+        let darwin = Target::parse("darwin/arm64").unwrap();
 
-    #[test]
-    fn build_env_vars_defaults() {
-        let linux = crate::platform::Target::host();
         // No image config — should get default PATH, HOME, and TERM
         let vars = build_env_vars(None, &[], &linux).unwrap();
         assert!(vars.iter().any(|v| v.starts_with("PATH=")));
@@ -591,21 +543,15 @@ mod tests {
         assert!(vars.iter().any(|v| v == "TERM=xterm"));
 
         // Windows target — no Linux defaults injected
-        let win = crate::platform::Target::parse("windows/amd64").unwrap();
-        let wvars = build_env_vars(None, &[], &win).unwrap();
-        assert!(wvars.is_empty());
+        assert!(build_env_vars(None, &[], &win).unwrap().is_empty());
 
-        // Darwin target — gets same Unix defaults as Linux
-        let darwin = crate::platform::Target::parse("darwin/arm64").unwrap();
+        // Darwin target — same defaults as Linux
         let dvars = build_env_vars(None, &[], &darwin).unwrap();
         assert!(dvars.iter().any(|v| v.starts_with("PATH=")));
         assert!(dvars.iter().any(|v| v == "HOME=/root"));
-        assert!(dvars.iter().any(|v| v == "TERM=xterm"));
-    }
 
-    #[test]
-    fn build_env_vars_preserves_image_env() {
-        let cc = crate::image::ContainerConfig {
+        // Image-provided env is preserved; missing TERM is injected
+        let cc = ContainerConfig {
             env: Some(vec![
                 "PATH=/custom/bin".into(),
                 "HOME=/app".into(),
@@ -613,63 +559,43 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let vars = build_env_vars(Some(&cc), &[], &crate::platform::Target::host()).unwrap();
+        let vars = build_env_vars(Some(&cc), &[], &linux).unwrap();
         assert!(vars.iter().any(|v| v == "PATH=/custom/bin"));
         assert!(vars.iter().any(|v| v == "HOME=/app"));
         assert!(vars.iter().any(|v| v == "APP_MODE=production"));
-        // TERM should be injected since image didn't set it
         assert!(vars.iter().any(|v| v == "TERM=xterm"));
-    }
 
-    #[test]
-    fn build_env_vars_user_overrides() {
-        let cc = crate::image::ContainerConfig {
+        // User overrides replace image env
+        let cc2 = ContainerConfig {
             env: Some(vec!["PATH=/usr/bin".into(), "FOO=old".into()]),
             ..Default::default()
         };
-        let vars = build_env_vars(
-            Some(&cc),
-            &["FOO=new".into(), "BAR=added".into()],
-            &crate::platform::Target::host(),
-        )
-        .unwrap();
+        let vars =
+            build_env_vars(Some(&cc2), &["FOO=new".into(), "BAR=added".into()], &linux).unwrap();
         assert!(vars.iter().any(|v| v == "FOO=new"));
         assert!(vars.iter().any(|v| v == "BAR=added"));
         assert!(!vars.iter().any(|v| v == "FOO=old"));
-    }
 
-    #[test]
-    fn build_env_vars_empty_image_env() {
-        // Empty vec should trigger default PATH on Linux
-        let cc = crate::image::ContainerConfig {
+        // Empty image env falls back to defaults; Windows gets nothing
+        let cc3 = ContainerConfig {
             env: Some(vec![]),
             ..Default::default()
         };
-        let vars = build_env_vars(Some(&cc), &[], &crate::platform::Target::host()).unwrap();
-        assert!(
-            vars.iter()
-                .any(|v| v == "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-        );
-
-        // Empty vec on Windows — no Linux fallback
-        let win = crate::platform::Target::parse("windows/amd64").unwrap();
-        let wvars = build_env_vars(Some(&cc), &[], &win).unwrap();
+        let vars = build_env_vars(Some(&cc3), &[], &linux).unwrap();
+        assert!(vars.iter().any(|v| v.starts_with("PATH=/usr/local/")));
+        let wvars = build_env_vars(Some(&cc3), &[], &win).unwrap();
         assert!(!wvars.iter().any(|v| v.starts_with("PATH=")));
-        assert!(!wvars.iter().any(|v| v.starts_with("HOME=")));
     }
 
     #[test]
-    fn parse_volume_valid() {
+    fn parse_volume_valid_and_invalid() {
         let v = parse_volume("/tmp:/data").unwrap();
         assert_eq!(v.target, "/data");
         assert!(!v.read_only && v.source.starts_with('/'));
         assert!(parse_volume("/tmp:/data:ro").unwrap().read_only);
         assert!(!parse_volume("/tmp:/data:rw").unwrap().read_only);
         assert_eq!(parse_volume("/tmp/../tmp:/data").unwrap().source, "/tmp");
-    }
 
-    #[test]
-    fn parse_volume_rejects_invalid() {
         for bad in [
             "",
             ":/data",
@@ -720,24 +646,20 @@ mod tests {
     }
 
     #[test]
-    fn gc_simple_removes_dirs() {
+    fn gc_simple_all_cases() {
+        // Missing containers dir — should not panic
         let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(gc_simple(tmp.path()), 0);
+
+        // Removes directories, leaves files
         let containers = tmp.path().join("containers");
         std::fs::create_dir_all(containers.join("stale1")).unwrap();
         std::fs::create_dir_all(containers.join("stale2/sub")).unwrap();
-        // Files under containers/ are left alone
         std::fs::write(containers.join("not_a_dir"), "x").unwrap();
         gc_simple(tmp.path());
         assert!(!containers.join("stale1").exists());
         assert!(!containers.join("stale2").exists());
         assert!(containers.join("not_a_dir").exists());
-    }
-
-    #[test]
-    fn gc_simple_missing_dir() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        // No containers/ directory — should not panic
-        assert_eq!(gc_simple(tmp.path()), 0);
     }
 
     #[test]

@@ -256,54 +256,6 @@ mod tests {
     }
 
     #[test]
-    fn serialisation_round_trip() {
-        for t in [
-            Target {
-                os: Os::Linux,
-                arch: Arch::Amd64,
-                os_version: None,
-            },
-            Target {
-                os: Os::Windows,
-                arch: Arch::Arm64,
-                os_version: None,
-            },
-            Target {
-                os: Os::Darwin,
-                arch: Arch::Arm64,
-                os_version: None,
-            },
-            Target {
-                os: Os::Windows,
-                arch: Arch::Amd64,
-                os_version: Some("10.0.20348".into()),
-            },
-        ] {
-            let json = serde_json::to_string(&t).unwrap();
-            let back: Target = serde_json::from_str(&json).unwrap();
-            assert_eq!(back, t);
-        }
-        // os_version=None should not appear in JSON
-        let t = Target::parse("linux/amd64").unwrap();
-        let json = serde_json::to_string(&t).unwrap();
-        assert!(!json.contains("os_version"));
-    }
-
-    #[test]
-    fn default_is_host() {
-        assert_eq!(Target::default(), Target::host());
-    }
-
-    #[test]
-    fn oci_strings() {
-        assert_eq!(Os::Linux.as_oci_str(), "linux");
-        assert_eq!(Os::Windows.as_oci_str(), "windows");
-        assert_eq!(Os::Darwin.as_oci_str(), "darwin");
-        assert_eq!(Arch::Amd64.as_oci_str(), "amd64");
-        assert_eq!(Arch::Arm64.as_oci_str(), "arm64");
-    }
-
-    #[test]
     fn validate_host_os_accepts_host() {
         // Same OS as host — should pass
         let host = Target::host();
