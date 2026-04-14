@@ -23,9 +23,7 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
     let _ = rootless;
     let _ = external_netns;
     if !port_mappings.is_empty() {
-        eprintln!(
-            "  warning: port mappings are not supported on Windows (host network shared)"
-        );
+        eprintln!("  warning: port mappings are not supported on Windows (host network shared)");
     }
 
     let cc = config.config.as_ref();
@@ -196,9 +194,9 @@ impl JobObjectGuard {
     fn new() -> Result<Self> {
         use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
         use windows_sys::Win32::System::JobObjects::{
-            CreateJobObjectW, JobObjectExtendedLimitInformation,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, SetInformationJobObject,
+            CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
         };
 
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -209,8 +207,8 @@ impl JobObjectGuard {
         }
 
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+        info.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
 
         let ok = unsafe {
             SetInformationJobObject(
@@ -236,13 +234,11 @@ impl JobObjectGuard {
         use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
 
         let process_handle = child.as_raw_handle();
-        let ok =
-            unsafe { AssignProcessToJobObject(self.handle, process_handle as _) };
+        let ok = unsafe { AssignProcessToJobObject(self.handle, process_handle as _) };
         if ok == 0 {
-            anyhow::bail!(
-                "AssignProcessToJobObject failed: error {}",
-                unsafe { GetLastError() }
-            );
+            anyhow::bail!("AssignProcessToJobObject failed: error {}", unsafe {
+                GetLastError()
+            });
         }
         Ok(())
     }
