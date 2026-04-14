@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2](https://github.com/teh-hippo/hippobox/compare/v0.3.1...v0.3.2) (2026-04-14)
+
+
+### Bug Fixes
+
+* remove dead cfg!(windows) branch in Windows-only module ([15d9330](https://github.com/teh-hippo/hippobox/commit/15d9330e1ba27f6334a40fd9f3eec03d9fa725c2))
+* Windows container platform handling and os.version manifest matching ([f018d8a](https://github.com/teh-hippo/hippobox/commit/f018d8ad376c8ce026cc884da6860e863deb0c31))
+
 ## [0.3.1](https://github.com/teh-hippo/hippobox/compare/v0.3.0...v0.3.1) (2026-04-13)
 
 
