@@ -11,20 +11,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn hippobox_dir() -> PathBuf {
-    if cfg!(windows) {
+    #[cfg(windows)]
+    {
         // On Windows, use %LOCALAPPDATA%\hippobox (native NTFS path)
         if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
             return PathBuf::from(local_app_data).join("hippobox");
         }
         // Fallback: %USERPROFILE%\.hippobox
-        PathBuf::from(
+        return PathBuf::from(
             std::env::var("USERPROFILE")
                 .unwrap_or_else(|_| std::env::var("HOME").unwrap_or_else(|_| "C:\\".into())),
         )
-        .join(".hippobox")
-    } else {
-        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into())).join(".hippobox")
+        .join(".hippobox");
     }
+    #[allow(unreachable_code)]
+    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into())).join(".hippobox")
 }
 
 fn ensure_storage_dirs() -> Result<()> {
@@ -69,7 +70,7 @@ enum Commands {
 
 fn main() -> Result<()> {
     // Internal commands used by the Linux container runtime (fork/exec protocol)
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use anyhow::Context;
         use std::os::fd::FromRawFd;
@@ -105,7 +106,11 @@ fn main() -> Result<()> {
         Commands::Pull { image, platform } => {
             let image_ref = ImageRef::parse(&image)?;
             let target = match platform {
-                Some(p) => platform::Target::parse(&p)?,
+                Some(p) => {
+                    let t = platform::Target::parse(&p)?;
+                    t.validate_host_os()?;
+                    t
+                }
                 None => platform::Target::host(),
             };
             let base_dir = hippobox_dir();
@@ -125,13 +130,17 @@ fn main() -> Result<()> {
         } => {
             let image_ref = ImageRef::parse(&image)?;
             let target = match platform {
-                Some(p) => platform::Target::parse(&p)?,
+                Some(p) => {
+                    let t = platform::Target::parse(&p)?;
+                    t.validate_host_os()?;
+                    t
+                }
                 None => platform::Target::host(),
             };
             let base_dir = hippobox_dir();
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             let rootless = !nix::unistd::geteuid().is_root();
-            #[cfg(not(unix))]
+            #[cfg(not(target_os = "linux"))]
             let rootless = false;
 
             container::gc_stale_containers(&base_dir);
@@ -255,11 +264,10 @@ fn clean_all(base_dir: &Path) -> Result<()> {
                  Run `sudo hippobox clean` to remove them."
             );
         } else {
-            let suggestion = if cfg!(windows) {
-                "Try running as administrator."
-            } else {
-                "Try `sudo hippobox clean`."
-            };
+            #[cfg(windows)]
+            let suggestion = "Try running as administrator.";
+            #[cfg(not(windows))]
+            let suggestion = "Try `sudo hippobox clean`.";
             eprintln!("hint: some directories could not be removed. {suggestion}");
         }
         bail!("clean completed with errors");

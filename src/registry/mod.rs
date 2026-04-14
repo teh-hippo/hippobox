@@ -216,10 +216,17 @@ impl RegistryClient {
                 let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(reader));
                 match target.os {
                     #[cfg(unix)]
-                    Os::Linux => extract::extract_linux_layer(&mut ar, &tmp_dir)?,
+                    Os::Linux | Os::Darwin => extract::extract_linux_layer(&mut ar, &tmp_dir)?,
                     #[cfg(not(unix))]
-                    Os::Linux => bail!("Linux layer extraction is not supported on this platform"),
+                    Os::Linux | Os::Darwin => {
+                        bail!("Linux/Darwin layer extraction is not supported on this platform")
+                    }
+                    #[cfg(not(unix))]
                     Os::Windows => extract::extract_windows_layer(&mut ar, &tmp_dir)?,
+                    #[cfg(unix)]
+                    Os::Windows => {
+                        bail!("Windows layer extraction is not supported on this host")
+                    }
                 }
                 ar.into_inner().into_inner()
             } else if matches!(
@@ -233,10 +240,17 @@ impl RegistryClient {
                 let mut ar = tar::Archive::new(reader);
                 match target.os {
                     #[cfg(unix)]
-                    Os::Linux => extract::extract_linux_layer(&mut ar, &tmp_dir)?,
+                    Os::Linux | Os::Darwin => extract::extract_linux_layer(&mut ar, &tmp_dir)?,
                     #[cfg(not(unix))]
-                    Os::Linux => bail!("Linux layer extraction is not supported on this platform"),
+                    Os::Linux | Os::Darwin => {
+                        bail!("Linux/Darwin layer extraction is not supported on this platform")
+                    }
+                    #[cfg(not(unix))]
                     Os::Windows => extract::extract_windows_layer(&mut ar, &tmp_dir)?,
+                    #[cfg(unix)]
+                    Os::Windows => {
+                        bail!("Windows layer extraction is not supported on this host")
+                    }
                 }
                 ar.into_inner()
             } else {

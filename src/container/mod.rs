@@ -1,5 +1,6 @@
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod linux;
+#[cfg(not(unix))]
 mod windows;
 
 use anyhow::{Context, Result, bail};
@@ -8,18 +9,33 @@ use std::path::{Path, PathBuf};
 use crate::image::{ImageConfig, ImageRef, Manifest, StoredImage};
 use crate::platform::{Os, Target};
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) use linux::container_init;
 
 pub fn gc_stale_containers(base_dir: &Path) -> usize {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         linux::gc_stale_containers(base_dir)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     {
-        windows::gc_stale_containers(base_dir)
+        gc_simple(base_dir)
     }
+}
+
+/// Simple GC for non-Linux hosts: walk containers/, remove_dir_all each subdir.
+/// Used by Windows (and future macOS) where there are no overlayfs mounts or flocks.
+#[allow(dead_code)] // called from #[cfg(not(target_os = "linux"))] branch + tests
+fn gc_simple(base_dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(base_dir.join("containers")) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+    0
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -59,23 +75,28 @@ pub struct ContainerSpec {
 
 pub fn run(spec: ContainerSpec) -> Result<i32> {
     match spec.target.os {
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         Os::Linux => linux::run(spec),
+        #[cfg(not(target_os = "linux"))]
+        Os::Linux => bail!("Linux containers require a Linux host"),
         #[cfg(not(unix))]
-        Os::Linux => bail!("Linux containers are not supported on this platform"),
         Os::Windows => windows::run(spec),
+        #[cfg(unix)]
+        Os::Windows => bail!("Windows containers require a Windows host"),
+        Os::Darwin => bail!("Darwin containers are not yet supported"),
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) fn run_prepared(spec: ContainerSpec) -> Result<i32> {
     match spec.target.os {
         Os::Linux => linux::run_prepared(spec),
-        Os::Windows => windows::run(spec),
+        Os::Windows => bail!("Windows containers require a Windows host"),
+        Os::Darwin => bail!("Darwin containers are not yet supported"),
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) fn set_pdeathsig() -> std::io::Result<()> {
     linux::set_pdeathsig()
 }
@@ -233,6 +254,7 @@ pub fn parse_volume(spec: &str) -> Result<VolumeMount> {
     })
 }
 
+#[allow(dead_code)] // used by #[cfg(not(unix))] Windows module + tests
 pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
     while let Some((s, d)) = stack.pop() {
@@ -258,9 +280,23 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Simple cleanup guard for non-Linux runtimes (Windows, future macOS).
+/// Removes the container directory on drop. The Linux runtime has its own
+/// CleanupGuard with overlay unmount and cgroup cleanup.
+#[allow(dead_code)] // used by #[cfg(not(unix))] Windows module + tests
+pub(crate) struct SimpleCleanupGuard(pub PathBuf);
+impl Drop for SimpleCleanupGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[allow(dead_code)]
 fn which(name: &str) -> Option<PathBuf> {
-    let separator = if cfg!(windows) { ';' } else { ':' };
+    #[cfg(windows)]
+    let separator = ';';
+    #[cfg(not(windows))]
+    let separator = ':';
     std::env::var_os("PATH")?
         .to_str()?
         .split(separator)
@@ -558,6 +594,13 @@ mod tests {
         let win = crate::platform::Target::parse("windows/amd64").unwrap();
         let wvars = build_env_vars(None, &[], &win).unwrap();
         assert!(wvars.is_empty());
+
+        // Darwin target — gets same Unix defaults as Linux
+        let darwin = crate::platform::Target::parse("darwin/arm64").unwrap();
+        let dvars = build_env_vars(None, &[], &darwin).unwrap();
+        assert!(dvars.iter().any(|v| v.starts_with("PATH=")));
+        assert!(dvars.iter().any(|v| v == "HOME=/root"));
+        assert!(dvars.iter().any(|v| v == "TERM=xterm"));
     }
 
     #[test]
@@ -641,5 +684,71 @@ mod tests {
         ] {
             assert!(parse_volume(bad).is_err(), "should reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn copy_dir_recursive_basic() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), "hello").unwrap();
+        std::fs::write(src.join("sub/b.txt"), "world").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("a.txt", src.join("link.txt")).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        copy_dir_recursive(&src, &dst).unwrap();
+        assert_eq!(std::fs::read_to_string(dst.join("a.txt")).unwrap(), "hello");
+        assert_eq!(
+            std::fs::read_to_string(dst.join("sub/b.txt")).unwrap(),
+            "world"
+        );
+        #[cfg(unix)]
+        {
+            assert!(dst.join("link.txt").is_symlink());
+            assert_eq!(
+                std::fs::read_link(dst.join("link.txt"))
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "a.txt"
+            );
+        }
+        // Overwrite: second copy replaces shared file
+        std::fs::write(src.join("a.txt"), "new").unwrap();
+        copy_dir_recursive(&src, &dst).unwrap();
+        assert_eq!(std::fs::read_to_string(dst.join("a.txt")).unwrap(), "new");
+    }
+
+    #[test]
+    fn gc_simple_removes_dirs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let containers = tmp.path().join("containers");
+        std::fs::create_dir_all(containers.join("stale1")).unwrap();
+        std::fs::create_dir_all(containers.join("stale2/sub")).unwrap();
+        // Files under containers/ are left alone
+        std::fs::write(containers.join("not_a_dir"), "x").unwrap();
+        gc_simple(tmp.path());
+        assert!(!containers.join("stale1").exists());
+        assert!(!containers.join("stale2").exists());
+        assert!(containers.join("not_a_dir").exists());
+    }
+
+    #[test]
+    fn gc_simple_missing_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No containers/ directory — should not panic
+        assert_eq!(gc_simple(tmp.path()), 0);
+    }
+
+    #[test]
+    fn simple_cleanup_guard_removes_on_drop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("ctest");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        {
+            let _guard = SimpleCleanupGuard(dir.clone());
+            assert!(dir.exists());
+        }
+        assert!(!dir.exists());
     }
 }

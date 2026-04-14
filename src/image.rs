@@ -224,11 +224,15 @@ mod tests {
         for bad in ["", "  ", "ghcr.io/"] {
             assert!(ImageRef::parse(bad).is_err(), "should reject {bad:?}");
         }
+        let host = Target::host();
         assert_eq!(
             ImageRef::parse("nginx")
                 .unwrap()
-                .image_metadata_path(Path::new("/hb"), &Target::host()),
-            PathBuf::from("/hb/images/registry-1.docker.io/library/nginx/linux-amd64/latest.json")
+                .image_metadata_path(Path::new("/hb"), &host),
+            PathBuf::from(format!(
+                "/hb/images/registry-1.docker.io/library/nginx/{}/latest.json",
+                host.slug()
+            ))
         );
     }
     #[test]

@@ -7,10 +7,10 @@ version = "0.3.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-description = "Lightweight Linux container manager using raw Linux primitives"
+description = "Lightweight OCI container manager"
 repository = "https://github.com/teh-hippo/hippobox"
-keywords = ["container", "linux", "oci", "rootless", "namespaces"]
-categories = ["command-line-utilities", "os::linux-apis"]
+keywords = ["container", "oci", "rootless", "namespaces", "windows"]
+categories = ["command-line-utilities"]
 exclude = ["bench/", ".github/", ".githooks/", "renovate.json", ".gitignore"]
 
 [dependencies]
@@ -25,6 +25,8 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["mount", "sched", "signal", "process", "hostname", "fs", "user"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = "0.5.0"
 
 [profile.release]

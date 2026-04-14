@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
 
 pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
     let super::ContainerSpec {
@@ -21,7 +20,7 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
     let container_dir = base_dir.join("containers").join(&id);
     let merged = container_dir.join("merged");
     std::fs::create_dir_all(&merged)?;
-    let _guard = CleanupGuard(container_dir.clone());
+    let _guard = super::SimpleCleanupGuard(container_dir.clone());
 
     for layer in manifest.layers.iter().rev() {
         let layer_dir = layer.layer_dir(&base_dir);
@@ -127,73 +126,9 @@ fn resolve_win_path(path: &str, merged: &str) -> String {
     }
 }
 
-struct CleanupGuard(PathBuf);
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-#[cfg(not(unix))]
-pub(crate) fn gc_stale_containers(base_dir: &std::path::Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(base_dir.join("containers")) else {
-        return 0;
-    };
-    for entry in entries.flatten() {
-        if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
-    }
-    0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn read(p: &std::path::Path) -> String {
-        std::fs::read_to_string(p).unwrap()
-    }
-
-    #[test]
-    fn copy_dir_recursive_and_cleanup() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
-        std::fs::create_dir_all(src.join("sub")).unwrap();
-        std::fs::write(src.join("a.txt"), "hello").unwrap();
-        std::fs::write(src.join("sub/b.txt"), "world").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("a.txt", src.join("link.txt")).unwrap();
-        std::fs::create_dir_all(&dst).unwrap();
-        crate::container::copy_dir_recursive(&src, &dst).unwrap();
-        assert_eq!(read(&dst.join("a.txt")), "hello");
-        assert_eq!(read(&dst.join("sub/b.txt")), "world");
-        #[cfg(unix)]
-        {
-            assert!(dst.join("link.txt").is_symlink());
-            assert_eq!(
-                std::fs::read_link(dst.join("link.txt"))
-                    .unwrap()
-                    .to_str()
-                    .unwrap(),
-                "a.txt"
-            );
-        }
-
-        // Overwrite: second copy replaces shared file
-        std::fs::write(src.join("a.txt"), "new").unwrap();
-        crate::container::copy_dir_recursive(&src, &dst).unwrap();
-        assert_eq!(read(&dst.join("a.txt")), "new");
-
-        // CleanupGuard removes directory on drop
-        let dir = tmp.path().join("ctest");
-        std::fs::create_dir_all(dir.join("sub")).unwrap();
-        {
-            let _guard = CleanupGuard(dir.clone());
-            assert!(dir.exists());
-        }
-        assert!(!dir.exists());
-    }
 
     #[test]
     fn resolve_win_path_cases() {
@@ -211,26 +146,5 @@ mod tests {
         ] {
             assert_eq!(resolve_win_path(input, &m), expected, "input={input:?}");
         }
-    }
-
-    #[test]
-    fn gc_stale_containers_removes_dirs() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let containers = tmp.path().join("containers");
-        std::fs::create_dir_all(containers.join("stale1")).unwrap();
-        std::fs::create_dir_all(containers.join("stale2/sub")).unwrap();
-        // Files under containers/ are left alone
-        std::fs::write(containers.join("not_a_dir"), "x").unwrap();
-        crate::container::gc_stale_containers(tmp.path());
-        assert!(!containers.join("stale1").exists());
-        assert!(!containers.join("stale2").exists());
-        assert!(containers.join("not_a_dir").exists());
-    }
-
-    #[test]
-    fn gc_stale_containers_missing_dir() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        // No containers/ directory — should not panic
-        assert_eq!(crate::container::gc_stale_containers(tmp.path()), 0);
     }
 }

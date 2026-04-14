@@ -3,10 +3,15 @@ mod linux;
 #[cfg(unix)]
 pub use linux::extract_linux_layer;
 
-use anyhow::{Context, Result, bail};
+#[cfg(not(unix))]
+use anyhow::Context;
+use anyhow::{Result, bail};
 use std::fs;
+#[cfg(not(unix))]
 use std::io::{self, Read};
-use std::path::{Component, Path, PathBuf};
+#[cfg(not(unix))]
+use std::path::PathBuf;
+use std::path::{Component, Path};
 
 pub(super) fn has_unsafe_components(path: &Path) -> bool {
     path.is_absolute()
@@ -31,6 +36,7 @@ pub(super) fn check_no_symlink_traversal(target: &Path, relative: &Path) -> Resu
     Ok(())
 }
 
+#[cfg(not(unix))]
 fn should_skip_windows_entry(path: &str) -> bool {
     path.contains(':')
         || path
@@ -40,6 +46,7 @@ fn should_skip_windows_entry(path: &str) -> bool {
 }
 
 /// Extract a Windows OCI layer, skipping UtilityVM and ADS entries.
+#[cfg(not(unix))]
 pub fn extract_windows_layer(archive: &mut tar::Archive<impl Read>, target: &Path) -> Result<()> {
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -84,6 +91,7 @@ pub fn extract_windows_layer(archive: &mut tar::Archive<impl Read>, target: &Pat
 }
 
 #[cfg(unix)]
+#[allow(dead_code)] // only caller is extract_windows_layer, gated #[cfg(not(unix))]
 fn fix_permissions(path: &Path, normalised: Option<&Path>) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let executable = ["exe", "dll", "cmd", "bat", "ps1", "com"];
@@ -148,10 +156,12 @@ pub(super) mod tests {
         b.into_inner().unwrap()
     }
 
+    #[cfg(not(unix))]
     fn untar(data: &[u8], dir: &Path) -> Result<()> {
         extract_windows_layer(&mut tar::Archive::new(std::io::Cursor::new(data)), dir)
     }
 
+    #[cfg(not(unix))]
     #[test]
     fn extract_windows_layer_test() {
         use tar::EntryType::*;

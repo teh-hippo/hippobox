@@ -7,6 +7,7 @@ use std::fmt;
 pub enum Os {
     Linux,
     Windows,
+    Darwin,
 }
 
 impl Os {
@@ -14,13 +15,15 @@ impl Os {
         match self {
             Os::Linux => "linux",
             Os::Windows => "windows",
+            Os::Darwin => "darwin",
         }
     }
     fn parse(s: &str) -> Result<Self> {
         match s {
             "linux" => Ok(Os::Linux),
             "windows" => Ok(Os::Windows),
-            _ => bail!("unsupported OS: {s:?} (supported: linux, windows)"),
+            "darwin" | "macos" => Ok(Os::Darwin),
+            _ => bail!("unsupported OS: {s:?} (supported: linux, windows, darwin)"),
         }
     }
 }
@@ -70,10 +73,9 @@ pub struct Target {
 
 impl Target {
     /// Returns the target matching the current host.
-    /// hippobox only runs on Linux (including WSL2), so OS is always Linux.
     pub fn host() -> Self {
         Self {
-            os: Os::Linux,
+            os: host_os(),
             arch: host_arch(),
             os_version: None,
         }
@@ -105,6 +107,20 @@ impl Target {
             None => format!("{}-{}", self.os.as_oci_str(), self.arch.as_oci_str()),
         }
     }
+
+    /// Validates that this target's OS matches the host OS.
+    /// Rejects cross-OS operations (e.g., pulling Windows images on Linux).
+    pub fn validate_host_os(&self) -> Result<()> {
+        let host = host_os();
+        if self.os != host {
+            bail!(
+                "{} images are not supported on this host ({})",
+                self.os,
+                host
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for Target {
@@ -121,6 +137,23 @@ impl fmt::Display for Target {
         }
         Ok(())
     }
+}
+
+fn host_os() -> Os {
+    #[cfg(target_os = "linux")]
+    {
+        return Os::Linux;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return Os::Windows;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return Os::Darwin;
+    }
+    #[allow(unreachable_code)]
+    Os::Linux
 }
 
 fn host_arch() -> Arch {
@@ -145,6 +178,9 @@ mod tests {
             ("windows/arm64", Os::Windows, Arch::Arm64, None),
             ("linux/x86_64", Os::Linux, Arch::Amd64, None),
             ("linux/aarch64", Os::Linux, Arch::Arm64, None),
+            ("darwin/amd64", Os::Darwin, Arch::Amd64, None),
+            ("darwin/arm64", Os::Darwin, Arch::Arm64, None),
+            ("macos/arm64", Os::Darwin, Arch::Arm64, None),
             (
                 "windows/amd64/10.0.20348",
                 Os::Windows,
@@ -167,14 +203,7 @@ mod tests {
 
     #[test]
     fn parse_invalid_targets() {
-        for bad in [
-            "",
-            "linux",
-            "linux/sparc",
-            "darwin/amd64",
-            "amd64/linux",
-            "foo/bar",
-        ] {
+        for bad in ["", "linux", "linux/sparc", "amd64/linux", "foo/bar"] {
             assert!(Target::parse(bad).is_err(), "should reject {bad:?}");
         }
     }
@@ -186,6 +215,8 @@ mod tests {
             "linux/arm64",
             "windows/amd64",
             "windows/arm64",
+            "darwin/amd64",
+            "darwin/arm64",
             "windows/amd64/10.0.20348",
         ] {
             let t = Target::parse(s).unwrap();
@@ -201,6 +232,10 @@ mod tests {
             "windows-arm64"
         );
         assert_eq!(
+            Target::parse("darwin/arm64").unwrap().slug(),
+            "darwin-arm64"
+        );
+        assert_eq!(
             Target::parse("windows/amd64/10.0.20348").unwrap().slug(),
             "windows-amd64-10.0.20348"
         );
@@ -209,7 +244,12 @@ mod tests {
     #[test]
     fn host_default() {
         let t = Target::host();
+        #[cfg(target_os = "linux")]
         assert_eq!(t.os, Os::Linux);
+        #[cfg(target_os = "windows")]
+        assert_eq!(t.os, Os::Windows);
+        #[cfg(target_os = "macos")]
+        assert_eq!(t.os, Os::Darwin);
         // Arch depends on host — just verify it parses back
         let s = t.to_string();
         assert_eq!(Target::parse(&s).unwrap(), t);
@@ -225,6 +265,11 @@ mod tests {
             },
             Target {
                 os: Os::Windows,
+                arch: Arch::Arm64,
+                os_version: None,
+            },
+            Target {
+                os: Os::Darwin,
                 arch: Arch::Arm64,
                 os_version: None,
             },
@@ -253,7 +298,48 @@ mod tests {
     fn oci_strings() {
         assert_eq!(Os::Linux.as_oci_str(), "linux");
         assert_eq!(Os::Windows.as_oci_str(), "windows");
+        assert_eq!(Os::Darwin.as_oci_str(), "darwin");
         assert_eq!(Arch::Amd64.as_oci_str(), "amd64");
         assert_eq!(Arch::Arm64.as_oci_str(), "arm64");
+    }
+
+    #[test]
+    fn validate_host_os_accepts_host() {
+        // Same OS as host — should pass
+        let host = Target::host();
+        host.validate_host_os().unwrap();
+
+        // Cross-arch with same OS — should pass
+        let cross_arch = Target {
+            os: host.os,
+            arch: if host.arch == Arch::Amd64 {
+                Arch::Arm64
+            } else {
+                Arch::Amd64
+            },
+            os_version: None,
+        };
+        cross_arch.validate_host_os().unwrap();
+    }
+
+    #[test]
+    fn validate_host_os_rejects_foreign() {
+        let host_os = Target::host().os;
+        // Pick an OS different from the host
+        let foreign = if host_os == Os::Windows {
+            Os::Linux
+        } else {
+            Os::Windows
+        };
+        let t = Target {
+            os: foreign,
+            arch: Arch::Amd64,
+            os_version: None,
+        };
+        let err = t.validate_host_os().unwrap_err();
+        assert!(
+            format!("{err}").contains("not supported on this host"),
+            "unexpected error: {err}"
+        );
     }
 }
