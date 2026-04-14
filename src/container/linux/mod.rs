@@ -27,7 +27,7 @@ pub(crate) fn run_prepared(spec: super::ContainerSpec) -> Result<i32> {
     let user = cc.and_then(|c| c.user.clone()).filter(|u| !u.is_empty());
 
     let argv = super::build_argv(cc, spec.user_cmd)?;
-    let mut env_vars = super::build_env_vars(cc, &spec.user_env)?;
+    let mut env_vars = super::build_env_vars(cc, &spec.user_env, &spec.target)?;
     let container_dir = spec.base_dir.join("containers").join(&spec.id);
     let (upper, work, merged) = (
         container_dir.join("upper"),

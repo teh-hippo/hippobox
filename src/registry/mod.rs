@@ -88,7 +88,7 @@ impl RegistryClient {
         let stored = StoredImage {
             manifest,
             config,
-            target: *target,
+            target: target.clone(),
         };
         fs::create_dir_all(
             config_path
@@ -125,9 +125,14 @@ impl RegistryClient {
                 .iter()
                 .find_map(|entry| {
                     let p = entry.get("platform")?;
-                    (p.get("os")?.as_str()? == target.os.as_oci_str()
-                        && p.get("architecture")?.as_str()? == target.arch.as_oci_str())
-                    .then(|| entry.get("digest")?.as_str())?
+                    let os_match = p.get("os")?.as_str()? == target.os.as_oci_str();
+                    let arch_match = p.get("architecture")?.as_str()? == target.arch.as_oci_str();
+                    let ver_match = target.os_version.as_deref().is_none_or(|want| {
+                        p.get("os.version")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|v| v.starts_with(want))
+                    });
+                    (os_match && arch_match && ver_match).then(|| entry.get("digest")?.as_str())?
                 })
                 .with_context(|| format!("no {target} platform found in manifest index"))?;
             let url = Self::api_url(image_ref, "manifests", digest);

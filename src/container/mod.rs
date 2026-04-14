@@ -116,17 +116,21 @@ fn build_argv(
 fn build_env_vars(
     cc: Option<&crate::image::ContainerConfig>,
     user_env: &[String],
+    target: &Target,
 ) -> Result<Vec<String>> {
     let mut env_vars = cc
         .and_then(|c| c.env.as_deref())
         .filter(|v| !v.is_empty())
         .map(|v| v.to_vec())
-        .unwrap_or_else(|| {
-            vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()]
+        .unwrap_or_else(|| match target.os {
+            Os::Windows => vec![],
+            _ => vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()],
         });
-    for (key, default) in [("HOME", "/root"), ("TERM", "xterm")] {
-        if env_find_mut(&mut env_vars, key).is_none() {
-            env_vars.push(format!("{key}={default}"));
+    if target.os != Os::Windows {
+        for (key, default) in [("HOME", "/root"), ("TERM", "xterm")] {
+            if env_find_mut(&mut env_vars, key).is_none() {
+                env_vars.push(format!("{key}={default}"));
+            }
         }
     }
     apply_env_overrides(env_vars, user_env)
@@ -270,7 +274,7 @@ mod tests {
                 config: None,
                 rootfs: None,
             },
-            target,
+            target: target.clone(),
         };
         let path = img.image_metadata_path(tmp.path(), &target);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -471,11 +475,17 @@ mod tests {
 
     #[test]
     fn build_env_vars_defaults() {
+        let linux = crate::platform::Target::host();
         // No image config — should get default PATH, HOME, and TERM
-        let vars = build_env_vars(None, &[]).unwrap();
+        let vars = build_env_vars(None, &[], &linux).unwrap();
         assert!(vars.iter().any(|v| v.starts_with("PATH=")));
         assert!(vars.iter().any(|v| v == "HOME=/root"));
         assert!(vars.iter().any(|v| v == "TERM=xterm"));
+
+        // Windows target — no Linux defaults injected
+        let win = crate::platform::Target::parse("windows/amd64").unwrap();
+        let wvars = build_env_vars(None, &[], &win).unwrap();
+        assert!(wvars.is_empty());
     }
 
     #[test]
@@ -488,7 +498,7 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let vars = build_env_vars(Some(&cc), &[]).unwrap();
+        let vars = build_env_vars(Some(&cc), &[], &crate::platform::Target::host()).unwrap();
         assert!(vars.iter().any(|v| v == "PATH=/custom/bin"));
         assert!(vars.iter().any(|v| v == "HOME=/app"));
         assert!(vars.iter().any(|v| v == "APP_MODE=production"));
@@ -502,7 +512,12 @@ mod tests {
             env: Some(vec!["PATH=/usr/bin".into(), "FOO=old".into()]),
             ..Default::default()
         };
-        let vars = build_env_vars(Some(&cc), &["FOO=new".into(), "BAR=added".into()]).unwrap();
+        let vars = build_env_vars(
+            Some(&cc),
+            &["FOO=new".into(), "BAR=added".into()],
+            &crate::platform::Target::host(),
+        )
+        .unwrap();
         assert!(vars.iter().any(|v| v == "FOO=new"));
         assert!(vars.iter().any(|v| v == "BAR=added"));
         assert!(!vars.iter().any(|v| v == "FOO=old"));
@@ -510,15 +525,21 @@ mod tests {
 
     #[test]
     fn build_env_vars_empty_image_env() {
-        // Empty vec should trigger default PATH
+        // Empty vec should trigger default PATH on Linux
         let cc = crate::image::ContainerConfig {
             env: Some(vec![]),
             ..Default::default()
         };
-        let vars = build_env_vars(Some(&cc), &[]).unwrap();
+        let vars = build_env_vars(Some(&cc), &[], &crate::platform::Target::host()).unwrap();
         assert!(
             vars.iter()
                 .any(|v| v == "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
         );
+
+        // Empty vec on Windows — no Linux fallback
+        let win = crate::platform::Target::parse("windows/amd64").unwrap();
+        let wvars = build_env_vars(Some(&cc), &[], &win).unwrap();
+        assert!(!wvars.iter().any(|v| v.starts_with("PATH=")));
+        assert!(!wvars.iter().any(|v| v.starts_with("HOME=")));
     }
 }

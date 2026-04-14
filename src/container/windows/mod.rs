@@ -11,11 +11,12 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
         base_dir,
         user_cmd,
         user_env,
+        target,
         ..
     } = spec;
     let cc = config.config.as_ref();
     let argv = super::build_argv(cc, user_cmd)?;
-    let env_vars = super::build_env_vars(cc, &user_env)?;
+    let env_vars = super::build_env_vars(cc, &user_env, &target)?;
 
     let container_dir = base_dir.join("containers").join(&id);
     let merged = container_dir.join("merged");
@@ -66,7 +67,11 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
         .map(|p| resolve_win_path(p, &merged_str))
         .collect();
     if let Ok(p) = std::env::var("PATH") {
-        path_parts.push(p);
+        path_parts.extend(
+            p.split(host_sep)
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+        );
     }
     if !path_parts.is_empty() {
         cmd.env("PATH", path_parts.join(&host_sep.to_string()));
