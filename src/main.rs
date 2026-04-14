@@ -3,8 +3,6 @@ mod image;
 mod platform;
 mod registry;
 
-#[cfg(unix)]
-use anyhow::Context;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use image::ImageRef;
@@ -53,11 +51,7 @@ enum Commands {
     Run {
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
-        #[cfg_attr(
-            unix,
-            arg(short = 'v', long = "volume", value_name = "SRC:DST[:ro|rw]")
-        )]
-        #[cfg(unix)]
+        #[arg(short = 'v', long = "volume", value_name = "SRC:DST[:ro|rw]")]
         volumes: Vec<String>,
         #[arg(short = 'p', long = "publish", value_name = "HOST:CONTAINER[/PROTO]")]
         ports: Vec<String>,
@@ -77,6 +71,7 @@ fn main() -> Result<()> {
     // Internal commands used by the Linux container runtime (fork/exec protocol)
     #[cfg(unix)]
     {
+        use anyhow::Context;
         use std::os::fd::FromRawFd;
         let mut args = std::env::args_os();
         let _ = args.next();
@@ -114,7 +109,6 @@ fn main() -> Result<()> {
                 None => platform::Target::host(),
             };
             let base_dir = hippobox_dir();
-            #[cfg(unix)]
             container::gc_stale_containers(&base_dir);
             let mut client = RegistryClient::new();
             let _ = client.pull(&image_ref, &base_dir, &target)?;
@@ -124,7 +118,6 @@ fn main() -> Result<()> {
             image,
             cmd,
             env,
-            #[cfg(unix)]
             volumes,
             ports,
             network,
@@ -141,7 +134,6 @@ fn main() -> Result<()> {
             #[cfg(not(unix))]
             let rootless = false;
 
-            #[cfg(unix)]
             container::gc_stale_containers(&base_dir);
 
             if !image_ref.image_metadata_path(&base_dir, &target).exists() {
@@ -152,7 +144,6 @@ fn main() -> Result<()> {
 
             let (manifest, config) = container::load_image(&image_ref, &base_dir, &target)?;
 
-            #[cfg(unix)]
             let volume_mounts = {
                 let mut vm: Vec<container::VolumeMount> = volumes
                     .iter()
@@ -172,8 +163,6 @@ fn main() -> Result<()> {
                 }
                 vm
             };
-            #[cfg(not(unix))]
-            let volume_mounts = Vec::new();
 
             let port_mappings: Vec<container::PortMapping> = ports
                 .iter()
@@ -243,7 +232,6 @@ fn list_images(base_dir: &Path) -> Result<()> {
 }
 
 fn clean_all(base_dir: &Path) -> Result<()> {
-    #[cfg(unix)]
     let skipped = container::gc_stale_containers(base_dir);
     let mut had_errors = false;
     for sub in ["layers", "images", "containers"] {
@@ -261,17 +249,19 @@ fn clean_all(base_dir: &Path) -> Result<()> {
     }
     ensure_storage_dirs()?;
     if had_errors {
-        #[cfg(unix)]
         if skipped > 0 {
             eprintln!(
                 "hint: {skipped} container(s) are owned by root (created with sudo).\n      \
                  Run `sudo hippobox clean` to remove them."
             );
         } else {
-            eprintln!("hint: some directories could not be removed. Try `sudo hippobox clean`.");
+            let suggestion = if cfg!(windows) {
+                "Try running as administrator."
+            } else {
+                "Try `sudo hippobox clean`."
+            };
+            eprintln!("hint: some directories could not be removed. {suggestion}");
         }
-        #[cfg(not(unix))]
-        eprintln!("hint: some directories could not be removed. Try running as administrator.");
         bail!("clean completed with errors");
     }
     println!("removed all cached images and containers");

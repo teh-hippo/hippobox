@@ -10,10 +10,17 @@ use crate::platform::{Os, Target};
 
 #[cfg(unix)]
 pub(crate) use linux::container_init;
-#[cfg(unix)]
-pub use linux::gc_stale_containers;
-#[cfg(unix)]
-pub use linux::parse_volume;
+
+pub fn gc_stale_containers(base_dir: &Path) -> usize {
+    #[cfg(unix)]
+    {
+        linux::gc_stale_containers(base_dir)
+    }
+    #[cfg(not(unix))]
+    {
+        windows::gc_stale_containers(base_dir)
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VolumeMount {
@@ -184,6 +191,71 @@ pub fn parse_network_mode(s: &str) -> Result<NetworkMode> {
         "none" => Ok(NetworkMode::None),
         _ => bail!("invalid network mode {s:?}, expected 'host' or 'none'"),
     }
+}
+
+pub fn parse_volume(spec: &str) -> Result<VolumeMount> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    let (source, target, read_only) = match parts.len() {
+        2 => (parts[0], parts[1], false),
+        3 => match parts[2] {
+            "ro" => (parts[0], parts[1], true),
+            "rw" => (parts[0], parts[1], false),
+            opt => bail!("invalid volume option {opt:?}, expected 'ro' or 'rw'"),
+        },
+        _ => bail!("invalid volume spec {spec:?}, expected SRC:DST[:ro|rw]"),
+    };
+    if source.is_empty() || target.is_empty() {
+        bail!("invalid volume spec {spec:?}, empty source or target");
+    }
+    if !Path::new(source).is_absolute() {
+        bail!("volume source must be absolute: {source:?}");
+    }
+    if !target.starts_with('/') {
+        bail!("volume target must be absolute: {target:?}");
+    }
+    if Path::new(target)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!("volume target must not contain '..': {target:?}");
+    }
+    if !Path::new(source).exists() {
+        bail!("volume source does not exist: {source:?}");
+    }
+    Ok(VolumeMount {
+        source: Path::new(source)
+            .canonicalize()
+            .with_context(|| format!("failed to resolve volume source {source:?}"))?
+            .to_string_lossy()
+            .to_string(),
+        target: target.to_string(),
+        read_only,
+    })
+}
+
+pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+    while let Some((s, d)) = stack.pop() {
+        for entry in std::fs::read_dir(&s).with_context(|| format!("read {}", s.display()))? {
+            let entry = entry?;
+            let (sp, dp) = (entry.path(), d.join(entry.file_name()));
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                let _ = std::fs::create_dir(&dp);
+                stack.push((sp, dp));
+            } else if ft.is_symlink() {
+                let tgt = std::fs::read_link(&sp)?;
+                let _ = std::fs::remove_file(&dp);
+                crate::registry::create_symlink(&tgt, &dp)?;
+            } else {
+                let _ = std::fs::remove_file(&dp);
+                if std::fs::hard_link(&sp, &dp).is_err() {
+                    std::fs::copy(&sp, &dp).with_context(|| format!("copy {}", sp.display()))?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -541,5 +613,33 @@ mod tests {
         let wvars = build_env_vars(Some(&cc), &[], &win).unwrap();
         assert!(!wvars.iter().any(|v| v.starts_with("PATH=")));
         assert!(!wvars.iter().any(|v| v.starts_with("HOME=")));
+    }
+
+    #[test]
+    fn parse_volume_valid() {
+        let v = parse_volume("/tmp:/data").unwrap();
+        assert_eq!(v.target, "/data");
+        assert!(!v.read_only && v.source.starts_with('/'));
+        assert!(parse_volume("/tmp:/data:ro").unwrap().read_only);
+        assert!(!parse_volume("/tmp:/data:rw").unwrap().read_only);
+        assert_eq!(parse_volume("/tmp/../tmp:/data").unwrap().source, "/tmp");
+    }
+
+    #[test]
+    fn parse_volume_rejects_invalid() {
+        for bad in [
+            "",
+            ":/data",
+            "/tmp:",
+            "relative:/data",
+            "/tmp:relative",
+            "/a:/b:ro:extra",
+            "/tmp:/data:xx",
+            "/nonexistent/path:/data",
+            "/tmp:/../escape",
+            "/tmp:/data/../../../etc",
+        ] {
+            assert!(parse_volume(bad).is_err(), "should reject {bad:?}");
+        }
     }
 }

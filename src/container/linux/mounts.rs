@@ -257,46 +257,6 @@ pub(super) fn unmount_overlay(merged: &Path) -> Result<()> {
     umount2(merged, MntFlags::MNT_DETACH).context("failed to unmount overlayfs")
 }
 
-pub fn parse_volume(spec: &str) -> Result<super::super::VolumeMount> {
-    let parts: Vec<&str> = spec.split(':').collect();
-    let (source, target, read_only) = match parts.len() {
-        2 => (parts[0], parts[1], false),
-        3 => match parts[2] {
-            "ro" => (parts[0], parts[1], true),
-            "rw" => (parts[0], parts[1], false),
-            opt => bail!("invalid volume option {opt:?}, expected 'ro' or 'rw'"),
-        },
-        _ => bail!("invalid volume spec {spec:?}, expected SRC:DST[:ro|rw]"),
-    };
-    if source.is_empty() || target.is_empty() {
-        bail!("invalid volume spec {spec:?}, empty source or target");
-    }
-    if !source.starts_with('/') {
-        bail!("volume source must be absolute: {source:?}");
-    }
-    if !target.starts_with('/') {
-        bail!("volume target must be absolute: {target:?}");
-    }
-    if Path::new(target)
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        bail!("volume target must not contain '..': {target:?}");
-    }
-    if !Path::new(source).exists() {
-        bail!("volume source does not exist: {source:?}");
-    }
-    Ok(super::super::VolumeMount {
-        source: Path::new(source)
-            .canonicalize()
-            .with_context(|| format!("failed to resolve volume source {source:?}"))?
-            .to_string_lossy()
-            .to_string(),
-        target: target.to_string(),
-        read_only,
-    })
-}
-
 pub(super) fn mount_volumes(merged: &Path, volumes: &[super::super::VolumeMount]) -> Result<()> {
     for vol in volumes {
         let target = merged.join(vol.target.trim_start_matches('/'));
@@ -363,35 +323,4 @@ pub(super) fn mount_volumes(merged: &Path, volumes: &[super::super::VolumeMount]
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn parse_volume_valid() {
-        let v = parse_volume("/tmp:/data").unwrap();
-        assert_eq!(v.target, "/data");
-        assert!(!v.read_only && v.source.starts_with('/'));
-        assert!(parse_volume("/tmp:/data:ro").unwrap().read_only);
-        assert!(!parse_volume("/tmp:/data:rw").unwrap().read_only);
-        assert_eq!(parse_volume("/tmp/../tmp:/data").unwrap().source, "/tmp");
-    }
-    #[test]
-    fn parse_volume_rejects_invalid() {
-        for bad in [
-            "",
-            ":/data",
-            "/tmp:",
-            "relative:/data",
-            "/tmp:relative",
-            "/a:/b:ro:extra",
-            "/tmp:/data:xx",
-            "/nonexistent/path:/data",
-            "/tmp:/../escape",
-            "/tmp:/data/../../../etc",
-        ] {
-            assert!(parse_volume(bad).is_err(), "should reject {bad:?}");
-        }
-    }
 }

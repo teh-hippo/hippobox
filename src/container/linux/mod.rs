@@ -8,7 +8,6 @@ use std::path::PathBuf;
 
 pub use cleanup::gc_stale_containers;
 pub(crate) use init::container_init;
-pub use mounts::parse_volume;
 
 pub fn run(spec: super::ContainerSpec) -> Result<i32> {
     if spec.rootless {

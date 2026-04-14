@@ -1,4 +1,3 @@
-use crate::registry::create_symlink;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
@@ -12,6 +11,7 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
         user_cmd,
         user_env,
         target,
+        volumes,
         ..
     } = spec;
     let cc = config.config.as_ref();
@@ -31,7 +31,27 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
                 layer_dir.display()
             );
         }
-        copy_dir_recursive(&layer_dir, &merged)?;
+        super::copy_dir_recursive(&layer_dir, &merged)?;
+    }
+
+    // Apply volumes: tmpfs → create dir, real source → copy into merged
+    for vol in &volumes {
+        let target_path = merged.join(vol.target.trim_start_matches('/'));
+        if vol.source == "tmpfs" {
+            std::fs::create_dir_all(&target_path)?;
+        } else {
+            let src = std::path::Path::new(&vol.source);
+            if src.is_dir() {
+                std::fs::create_dir_all(&target_path)?;
+                super::copy_dir_recursive(src, &target_path)?;
+            } else {
+                if let Some(p) = target_path.parent() {
+                    std::fs::create_dir_all(p)?;
+                }
+                std::fs::copy(src, &target_path)
+                    .with_context(|| format!("copy volume {}", vol.source))?;
+            }
+        }
     }
 
     eprintln!(
@@ -48,6 +68,14 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
 
     let mut cmd = std::process::Command::new(&resolved);
     cmd.args(&argv[1..]);
+
+    // Set working directory from image config
+    let workdir = cc
+        .and_then(|c| c.working_dir.as_deref())
+        .filter(|w| !w.is_empty());
+    if let Some(w) = workdir {
+        cmd.current_dir(resolve_win_path(w, &merged_str));
+    }
 
     let host_sep = if cfg!(windows) { ';' } else { ':' };
     for kv in &env_vars {
@@ -99,36 +127,24 @@ fn resolve_win_path(path: &str, merged: &str) -> String {
     }
 }
 
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
-    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
-    while let Some((s, d)) = stack.pop() {
-        for entry in std::fs::read_dir(&s).with_context(|| format!("read {}", s.display()))? {
-            let entry = entry?;
-            let (sp, dp) = (entry.path(), d.join(entry.file_name()));
-            let ft = entry.file_type()?;
-            if ft.is_dir() {
-                let _ = std::fs::create_dir(&dp);
-                stack.push((sp, dp));
-            } else if ft.is_symlink() {
-                let tgt = std::fs::read_link(&sp)?;
-                let _ = std::fs::remove_file(&dp);
-                create_symlink(&tgt, &dp)?;
-            } else {
-                let _ = std::fs::remove_file(&dp);
-                if std::fs::hard_link(&sp, &dp).is_err() {
-                    std::fs::copy(&sp, &dp).with_context(|| format!("copy {}", sp.display()))?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 struct CleanupGuard(PathBuf);
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn gc_stale_containers(base_dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(base_dir.join("containers")) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+    0
 }
 
 #[cfg(test)]
@@ -149,7 +165,7 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink("a.txt", src.join("link.txt")).unwrap();
         std::fs::create_dir_all(&dst).unwrap();
-        copy_dir_recursive(&src, &dst).unwrap();
+        crate::container::copy_dir_recursive(&src, &dst).unwrap();
         assert_eq!(read(&dst.join("a.txt")), "hello");
         assert_eq!(read(&dst.join("sub/b.txt")), "world");
         #[cfg(unix)]
@@ -166,7 +182,7 @@ mod tests {
 
         // Overwrite: second copy replaces shared file
         std::fs::write(src.join("a.txt"), "new").unwrap();
-        copy_dir_recursive(&src, &dst).unwrap();
+        crate::container::copy_dir_recursive(&src, &dst).unwrap();
         assert_eq!(read(&dst.join("a.txt")), "new");
 
         // CleanupGuard removes directory on drop
@@ -195,5 +211,26 @@ mod tests {
         ] {
             assert_eq!(resolve_win_path(input, &m), expected, "input={input:?}");
         }
+    }
+
+    #[test]
+    fn gc_stale_containers_removes_dirs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let containers = tmp.path().join("containers");
+        std::fs::create_dir_all(containers.join("stale1")).unwrap();
+        std::fs::create_dir_all(containers.join("stale2/sub")).unwrap();
+        // Files under containers/ are left alone
+        std::fs::write(containers.join("not_a_dir"), "x").unwrap();
+        crate::container::gc_stale_containers(tmp.path());
+        assert!(!containers.join("stale1").exists());
+        assert!(!containers.join("stale2").exists());
+        assert!(containers.join("not_a_dir").exists());
+    }
+
+    #[test]
+    fn gc_stale_containers_missing_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No containers/ directory — should not panic
+        assert_eq!(crate::container::gc_stale_containers(tmp.path()), 0);
     }
 }
