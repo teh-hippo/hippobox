@@ -24,18 +24,25 @@ pub fn gc_stale_containers(base_dir: &Path) -> usize {
 }
 
 /// Simple GC for non-Linux hosts: walk containers/, remove_dir_all each subdir.
+/// On Windows, checks for an exclusive lock file before deleting (skips active containers).
 /// Used by Windows (and future macOS) where there are no overlayfs mounts or flocks.
 #[allow(dead_code)] // called from #[cfg(not(target_os = "linux"))] branch + tests
 fn gc_simple(base_dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(base_dir.join("containers")) else {
         return 0;
     };
+    let mut removed = 0;
     for entry in entries.flatten() {
         if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            #[cfg(windows)]
+            if windows::is_container_locked(&entry.path()) {
+                continue;
+            }
             let _ = std::fs::remove_dir_all(entry.path());
+            removed += 1;
         }
     }
-    0
+    removed
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -531,8 +538,16 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn which_lookup_windows() {
+        // cmd.exe is always present on Windows
+        assert!(which("cmd.exe").unwrap().is_file());
+        assert!(which("hippobox_nonexistent_binary_xyz").is_none());
+    }
+
+    #[test]
     fn build_env_vars_all_cases() {
-        let linux = Target::host();
+        let linux = Target::parse("linux/amd64").unwrap();
         let win = Target::parse("windows/amd64").unwrap();
         let darwin = Target::parse("darwin/arm64").unwrap();
 
@@ -589,25 +604,41 @@ mod tests {
 
     #[test]
     fn parse_volume_valid_and_invalid() {
-        let v = parse_volume("/tmp:/data").unwrap();
-        assert_eq!(v.target, "/data");
-        assert!(!v.read_only && v.source.starts_with('/'));
-        assert!(parse_volume("/tmp:/data:ro").unwrap().read_only);
-        assert!(!parse_volume("/tmp:/data:rw").unwrap().read_only);
-        assert_eq!(parse_volume("/tmp/../tmp:/data").unwrap().source, "/tmp");
+        #[cfg(unix)]
+        {
+            let v = parse_volume("/tmp:/data").unwrap();
+            assert_eq!(v.target, "/data");
+            assert!(!v.read_only && v.source.starts_with('/'));
+            assert!(parse_volume("/tmp:/data:ro").unwrap().read_only);
+            assert!(!parse_volume("/tmp:/data:rw").unwrap().read_only);
+            assert_eq!(parse_volume("/tmp/../tmp:/data").unwrap().source, "/tmp");
 
-        for bad in [
-            "",
-            ":/data",
-            "/tmp:",
-            "relative:/data",
-            "/tmp:relative",
-            "/a:/b:ro:extra",
-            "/tmp:/data:xx",
-            "/nonexistent/path:/data",
-            "/tmp:/../escape",
-            "/tmp:/data/../../../etc",
-        ] {
+            for bad in [
+                "/tmp:",
+                "/nonexistent/path:/data",
+                "/tmp:/../escape",
+                "/tmp:/data/../../../etc",
+            ] {
+                assert!(parse_volume(bad).is_err(), "should reject {bad:?}");
+            }
+        }
+        #[cfg(windows)]
+        {
+            // Note: parse_volume uses splitn(4, ':') which conflicts with Windows
+            // drive letters (C:\path contains ':'). This is acceptable because
+            // volume specs are container-oriented (Linux/Windows container paths)
+            // and always parsed from CLI args which use the container's path format.
+            // Windows host paths would need special handling if volume mounts are
+            // ever supported natively on Windows (currently volumes are copied in).
+        }
+        // Platform-independent error cases
+        for bad in ["", ":/data", "relative:/data"] {
+            assert!(parse_volume(bad).is_err(), "should reject {bad:?}");
+        }
+        // These error cases use ':' which on Windows would split differently,
+        // so they are Unix-only
+        #[cfg(unix)]
+        for bad in ["/a:/b:ro:extra", "/tmp:/data:xx", "/tmp:relative"] {
             assert!(parse_volume(bad).is_err(), "should reject {bad:?}");
         }
     }

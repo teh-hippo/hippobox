@@ -77,7 +77,22 @@ pub fn extract_windows_layer(archive: &mut tar::Archive<impl Read>, target: &Pat
             if let Some(link_target) = entry.link_name()? {
                 let link_path = PathBuf::from(link_target.to_string_lossy().replace('\\', "/"));
                 let _ = fs::remove_file(&dest);
-                create_symlink(&link_path, &dest)?;
+                match create_symlink(&link_path, &dest) {
+                    Ok(()) => {}
+                    Err(_) if cfg!(windows) => {
+                        // On Windows, symlink creation requires either Developer Mode
+                        // or admin privileges.  Windows container layers contain OS
+                        // compatibility junctions (e.g. "Documents and Settings" →
+                        // "C:/Users") that are not needed for container execution.
+                        // Warn and continue rather than aborting the entire pull.
+                        eprintln!(
+                            "  warning: skipping symlink {} -> {} (insufficient privileges)",
+                            dest.display(),
+                            link_path.display()
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         } else if etype.is_file() || etype == tar::EntryType::Continuous {
             let _ = fs::remove_file(&dest);
