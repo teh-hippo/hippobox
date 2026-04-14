@@ -80,15 +80,15 @@ jobs:
           ARCH="${{ matrix.target }}"
           ARCH="${ARCH%%-unknown-*}"
           ARCH="${ARCH%%-pc-*}"
-          mkdir -p release
-          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} release/
+          mkdir -p release/bin
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} release/bin/
           if [ -f target/release/librename_shim.so ]; then
-            cp target/release/librename_shim.so release/
+            cp target/release/librename_shim.so release/bin/
           fi
           cd release
           ARCHIVE_NAME="hippobox-${TAG}-${ARCH}-${{ matrix.os_label }}"
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            zip "../${ARCHIVE_NAME}.zip" *
+            zip -r "../${ARCHIVE_NAME}.zip" *
           else
             tar czf "../${ARCHIVE_NAME}.tar.gz" *
           fi
