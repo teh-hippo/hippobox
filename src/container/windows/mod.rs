@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
     let super::ContainerSpec {
@@ -46,7 +47,7 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
                 layer_dir.display()
             );
         }
-        super::copy_dir_recursive(&layer_dir, &merged)?;
+        super::copy_dir_recursive(&layer_dir, &merged, false)?;
     }
 
     // Apply volumes: tmpfs → create dir, real source → copy into merged
@@ -58,7 +59,7 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
             let src = std::path::Path::new(&vol.source);
             if src.is_dir() {
                 std::fs::create_dir_all(&target_path)?;
-                super::copy_dir_recursive(src, &target_path)?;
+                super::copy_dir_recursive(src, &target_path, true)?;
             } else {
                 if let Some(p) = target_path.parent() {
                     std::fs::create_dir_all(p)?;
@@ -115,8 +116,15 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
         cmd.env("PATH", path_parts.join(";"));
     }
 
-    // Spawn child and wrap in a Job Object so it is killed if hippobox crashes.
+    // Spawn child in a new process group so we can target it with CTRL_BREAK_EVENT.
+    // CTRL_C_EVENT cannot be directed to a specific process group (it always goes
+    // to all processes sharing the console), but CTRL_BREAK_EVENT can.
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
+    }
     let mut child = cmd.spawn().context("failed to launch Windows process")?;
+    let child_pid = child.id();
 
     let _job = match JobObjectGuard::new() {
         Ok(job) => {
@@ -131,8 +139,12 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
         }
     };
 
-    let status = child.wait().context("failed to wait for Windows process")?;
-    Ok(status.code().unwrap_or(1))
+    // Install a console Ctrl handler to catch Ctrl+C / Ctrl+Break / close events.
+    let _ctrl_guard = CtrlHandlerGuard::install();
+
+    // Poll the child, forwarding Ctrl events as CTRL_BREAK_EVENT.
+    let exit_code = wait_with_signal_forwarding(&mut child, child_pid)?;
+    Ok(exit_code)
 }
 
 /// Acquire an exclusive lock file in the container directory.
@@ -180,6 +192,78 @@ fn resolve_win_path(path: &str, merged: &str) -> String {
         format!("{merged}{sep}Files{sep}{s}")
     } else {
         n
+    }
+}
+
+/// Atomic flag set by the console Ctrl handler when Ctrl+C, Ctrl+Break, or
+/// console close events are received.
+static PENDING_CTRL: AtomicBool = AtomicBool::new(false);
+
+/// Console Ctrl handler — sets `PENDING_CTRL` and returns TRUE (handled) so
+/// the default handler (which calls `ExitProcess`) is not invoked.
+unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> i32 {
+    PENDING_CTRL.store(true, Ordering::SeqCst);
+    1 // TRUE — we handled it
+}
+
+/// RAII guard that installs/uninstalls the console Ctrl handler.
+struct CtrlHandlerGuard;
+
+impl CtrlHandlerGuard {
+    fn install() -> Self {
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(ctrl_handler), 1);
+        }
+        Self
+    }
+}
+
+impl Drop for CtrlHandlerGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(ctrl_handler), 0);
+        }
+    }
+}
+
+/// Wait for the child process, forwarding console Ctrl events as CTRL_BREAK_EVENT.
+///
+/// When the user presses Ctrl+C (or the console is closed), we send
+/// CTRL_BREAK_EVENT to the child's process group and give it up to 10 seconds
+/// to exit gracefully.  After the timeout, we return and let the Job Object
+/// hard-kill any remaining processes.
+fn wait_with_signal_forwarding(child: &mut std::process::Child, child_pid: u32) -> Result<i32> {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+    const GRACEFUL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    loop {
+        match child.try_wait().context("failed to check child status")? {
+            Some(status) => return Ok(status.code().unwrap_or(1)),
+            None => {
+                if PENDING_CTRL.swap(false, Ordering::SeqCst) {
+                    // Forward as CTRL_BREAK_EVENT to the child's process group.
+                    unsafe {
+                        windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent(
+                            windows_sys::Win32::System::Console::CTRL_BREAK_EVENT,
+                            child_pid,
+                        );
+                    }
+                    // Give the child time to exit gracefully.
+                    let deadline = std::time::Instant::now() + GRACEFUL_TIMEOUT;
+                    while std::time::Instant::now() < deadline {
+                        if let Some(status) = child.try_wait()? {
+                            return Ok(status.code().unwrap_or(1));
+                        }
+                        std::thread::sleep(POLL_INTERVAL);
+                    }
+                    eprintln!("  container did not exit within 10s — terminating");
+                    let _ = child.kill();
+                    let status = child.wait()?;
+                    return Ok(status.code().unwrap_or(1));
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
     }
 }
 
@@ -306,5 +390,47 @@ mod tests {
         // Release lock → not locked
         drop(lock);
         assert!(!is_container_locked(&dir));
+    }
+
+    #[test]
+    fn ctrl_handler_guard_lifecycle() {
+        // Install and uninstall the Ctrl handler without panicking.
+        let guard = CtrlHandlerGuard::install();
+
+        // Verify the atomic flag is initially false
+        assert!(!PENDING_CTRL.load(Ordering::SeqCst));
+
+        // Simulate setting the flag (as the handler would)
+        PENDING_CTRL.store(true, Ordering::SeqCst);
+        assert!(PENDING_CTRL.swap(false, Ordering::SeqCst));
+
+        // Drop uninstalls the handler
+        drop(guard);
+    }
+
+    #[test]
+    fn signal_forwarding_exits_child() {
+        use std::os::windows::process::CommandExt;
+
+        // Spawn a long-running child in a new process group
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 60 127.0.0.1 >nul"])
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP)
+            .spawn()
+            .expect("failed to spawn cmd.exe");
+        let pid = child.id();
+
+        // Send CTRL_BREAK_EVENT to terminate it
+        unsafe {
+            windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent(
+                windows_sys::Win32::System::Console::CTRL_BREAK_EVENT,
+                pid,
+            );
+        }
+
+        // It should exit within a few seconds
+        let status = child.wait().expect("failed to wait for child");
+        // The exit code is non-zero (interrupted)
+        assert_ne!(status.code(), Some(0));
     }
 }

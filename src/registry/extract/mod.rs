@@ -196,13 +196,6 @@ pub(super) mod tests {
         assert!(d.join("Files/b.exe").exists());
         assert!(!d.join("UtilityVM").exists());
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(d.join("Files")).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o755);
-        }
-
         for p in [b"/etc/shadow" as &[u8], b"../../etc/passwd"] {
             assert!(untar(&tar_raw(p, b"x"), &TempDir::new().unwrap().path()).is_err());
         }

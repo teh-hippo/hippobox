@@ -259,8 +259,15 @@ pub fn parse_volume(spec: &str) -> Result<VolumeMount> {
     })
 }
 
+/// Recursively copy a directory tree from `src` to `dst`.
+///
+/// When `try_hardlink` is `true`, files are hard-linked when possible (same
+/// filesystem) and fall back to a full copy.  Use `true` for user-owned data
+/// such as volume mounts.  Use `false` when copying shared layer caches into a
+/// container's merged rootfs — hard-linking would let the container corrupt the
+/// layer cache.
 #[allow(dead_code)] // used by #[cfg(not(unix))] Windows module + tests
-pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path, try_hardlink: bool) -> Result<()> {
     let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
     while let Some((s, d)) = stack.pop() {
         for entry in std::fs::read_dir(&s).with_context(|| format!("read {}", s.display()))? {
@@ -276,7 +283,7 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
                 crate::registry::create_symlink(&tgt, &dp)?;
             } else {
                 let _ = std::fs::remove_file(&dp);
-                if std::fs::hard_link(&sp, &dp).is_err() {
+                if !try_hardlink || std::fs::hard_link(&sp, &dp).is_err() {
                     std::fs::copy(&sp, &dp).with_context(|| format!("copy {}", sp.display()))?;
                 }
             }
@@ -624,12 +631,15 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            // Note: parse_volume uses splitn(4, ':') which conflicts with Windows
-            // drive letters (C:\path contains ':'). This is acceptable because
-            // volume specs are container-oriented (Linux/Windows container paths)
-            // and always parsed from CLI args which use the container's path format.
-            // Windows host paths would need special handling if volume mounts are
-            // ever supported natively on Windows (currently volumes are copied in).
+            // parse_volume uses splitn(4, ':') which conflicts with Windows drive
+            // letters (C:\path contains ':').  Volume specs use container-oriented
+            // paths (Linux-style) and volumes on Windows are copied into the merged
+            // dir rather than bind-mounted, so drive-letter source paths are not
+            // expected.  The Unix happy-path tests (which use /tmp:/data) can't run
+            // here because Path::is_absolute() rejects Unix paths on Windows.
+
+            // Target must start with '/' (container path) — this works everywhere
+            assert!(parse_volume("relative:/data").is_err());
         }
         // Platform-independent error cases
         for bad in ["", ":/data", "relative:/data"] {
@@ -653,7 +663,7 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink("a.txt", src.join("link.txt")).unwrap();
         std::fs::create_dir_all(&dst).unwrap();
-        copy_dir_recursive(&src, &dst).unwrap();
+        copy_dir_recursive(&src, &dst, true).unwrap();
         assert_eq!(std::fs::read_to_string(dst.join("a.txt")).unwrap(), "hello");
         assert_eq!(
             std::fs::read_to_string(dst.join("sub/b.txt")).unwrap(),
@@ -670,10 +680,48 @@ mod tests {
                 "a.txt"
             );
         }
+        #[cfg(windows)]
+        {
+            // On Windows, symlink creation requires Developer Mode or admin.
+            // If the symlink was created successfully in src, verify the copy.
+            if std::os::windows::fs::symlink_file("a.txt", src.join("link.txt")).is_ok() {
+                let dst2 = tmp.path().join("dst2");
+                std::fs::create_dir_all(&dst2).unwrap();
+                copy_dir_recursive(&src, &dst2, true).unwrap();
+                assert!(dst2.join("link.txt").is_symlink());
+                assert_eq!(
+                    std::fs::read_link(dst2.join("link.txt"))
+                        .unwrap()
+                        .to_str()
+                        .unwrap(),
+                    "a.txt"
+                );
+            }
+            // If symlink creation fails (no Developer Mode), that's OK — the
+            // Windows extract path already handles this gracefully.
+        }
         // Overwrite: second copy replaces shared file
         std::fs::write(src.join("a.txt"), "new").unwrap();
-        copy_dir_recursive(&src, &dst).unwrap();
+        copy_dir_recursive(&src, &dst, true).unwrap();
         assert_eq!(std::fs::read_to_string(dst.join("a.txt")).unwrap(), "new");
+    }
+
+    #[test]
+    fn copy_dir_no_hardlink_isolates_source() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("data.txt"), "original").unwrap();
+
+        // Copy without hard links — modifying dst must not affect src
+        copy_dir_recursive(&src, &dst, false).unwrap();
+        std::fs::write(dst.join("data.txt"), "modified").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(src.join("data.txt")).unwrap(),
+            "original",
+            "source file was modified — copy_dir_recursive leaked a hard link"
+        );
     }
 
     #[test]
