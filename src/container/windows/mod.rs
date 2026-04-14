@@ -76,7 +76,6 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
         cmd.current_dir(resolve_win_path(w, &merged_str));
     }
 
-    let host_sep = if cfg!(windows) { ';' } else { ':' };
     for kv in &env_vars {
         if let Some((k, v)) = kv.split_once('=') {
             if !k.eq_ignore_ascii_case("PATH") {
@@ -94,14 +93,10 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
         .map(|p| resolve_win_path(p, &merged_str))
         .collect();
     if let Ok(p) = std::env::var("PATH") {
-        path_parts.extend(
-            p.split(host_sep)
-                .filter(|s| !s.is_empty())
-                .map(String::from),
-        );
+        path_parts.extend(p.split(';').filter(|s| !s.is_empty()).map(String::from));
     }
     if !path_parts.is_empty() {
-        cmd.env("PATH", path_parts.join(&host_sep.to_string()));
+        cmd.env("PATH", path_parts.join(";"));
     }
 
     let status = cmd.status().context("failed to launch Windows process")?;
