@@ -96,7 +96,7 @@ jobs:
           sha256sum "${ARCHIVE_NAME}."* >> checksums-sha256.txt
 
       - name: Upload Release Artifacts
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             hippobox-${{ env.TAG }}-*
