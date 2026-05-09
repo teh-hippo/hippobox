@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -121,6 +121,24 @@ pub struct StoredImage {
     pub config: ImageConfig,
     #[serde(default)]
     pub target: Target,
+}
+
+/// Read a stored image's manifest + config from the local cache.
+pub fn load_image(
+    image_ref: &ImageRef,
+    base_dir: &Path,
+    target: &Target,
+) -> Result<(Manifest, ImageConfig)> {
+    let path = image_ref.image_metadata_path(base_dir, target);
+    let data = std::fs::read(&path).with_context(|| {
+        format!(
+            "image not found locally: {}/{}/{}",
+            image_ref.registry, image_ref.repository, image_ref.tag
+        )
+    })?;
+    let stored: StoredImage = serde_json::from_slice(&data)
+        .with_context(|| format!("failed to parse stored image metadata: {}", path.display()))?;
+    Ok((stored.manifest, stored.config))
 }
 
 pub fn walk_stored_images(images_dir: &Path) -> Result<Vec<(String, String, PathBuf)>> {
@@ -263,5 +281,54 @@ mod tests {
             ("registry/repo", "latest")
         );
         assert_eq!(r[1].1, "v1");
+    }
+
+    #[test]
+    fn load_image_valid_missing_and_corrupt() {
+        fn desc(d: &str, s: u64) -> Descriptor {
+            Descriptor {
+                media_type: None,
+                digest: d.into(),
+                size: s,
+            }
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = Target::host();
+        let img = ImageRef::parse("nginx:1.25").unwrap();
+        let stored = StoredImage {
+            manifest: Manifest {
+                config: desc("sha256:cfg", 10),
+                layers: vec![desc("sha256:layer1", 100)],
+            },
+            config: ImageConfig {
+                config: None,
+                rootfs: None,
+            },
+            target: target.clone(),
+        };
+        let path = img.image_metadata_path(tmp.path(), &target);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+        let (m, _) = load_image(&img, tmp.path(), &target).unwrap();
+        assert_eq!(m.layers[0].digest, "sha256:layer1");
+        let missing = ImageRef::parse("nonexistent:latest").unwrap();
+        assert!(
+            format!(
+                "{:#}",
+                load_image(&missing, tmp.path(), &target).unwrap_err()
+            )
+            .contains("image not found locally")
+        );
+        let corrupt = ImageRef::parse("nginx:bad").unwrap();
+        let cp = corrupt.image_metadata_path(tmp.path(), &target);
+        std::fs::create_dir_all(cp.parent().unwrap()).unwrap();
+        std::fs::write(&cp, "not json").unwrap();
+        assert!(
+            format!(
+                "{:#}",
+                load_image(&corrupt, tmp.path(), &target).unwrap_err()
+            )
+            .contains("failed to parse")
+        );
     }
 }
