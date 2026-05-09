@@ -393,7 +393,7 @@ mod tests {
 
         // Acquire lock → locked
         let lock = acquire_container_lock(&dir);
-        assert!(lock.is_some());
+        assert!(lock.is_ok());
         assert!(is_container_locked(&dir));
 
         // Release lock → not locked
