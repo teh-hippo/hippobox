@@ -204,21 +204,41 @@ impl RegistryClient {
             resp
         };
         let tmp_dir = create_extract_temp_dir(target_dir)?;
+        // Write the layer to disk first while hashing on the fly. We verify the
+        // SHA before extracting so we never expand attacker-controlled bytes
+        // from a registry whose blob doesn't match the manifest digest.
+        let blob_path = tmp_dir.with_extension("blob");
         let result = (|| -> Result<()> {
-            let reader = HashingReader {
-                inner: resp.into_body().into_reader(),
-                ctx: ring::digest::Context::new(&ring::digest::SHA256),
+            let computed = {
+                let mut blob_file = fs::File::create(&blob_path)
+                    .with_context(|| format!("create {}", blob_path.display()))?;
+                let mut reader = HashingReader {
+                    inner: resp.into_body().into_reader(),
+                    ctx: ring::digest::Context::new(&ring::digest::SHA256),
+                };
+                io::copy(&mut reader, &mut blob_file)
+                    .with_context(|| format!("download blob {}", layer.digest))?;
+                format!("sha256:{}", hex(reader.ctx.finish().as_ref()))
             };
+            if computed != layer.digest {
+                bail!(
+                    "layer digest mismatch: expected {}, got {}",
+                    layer.digest,
+                    computed
+                );
+            }
+
+            let blob_file = fs::File::open(&blob_path)
+                .with_context(|| format!("open verified blob {}", blob_path.display()))?;
             let mt = layer.media_type.as_deref();
             let is_gzip = mt.is_none_or(|m| {
                 m.contains("tar+gzip")
                     || m.ends_with("diff.tar.gzip")
                     || m.contains("foreign.diff.tar.gzip")
             });
-            let reader = if is_gzip {
-                let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(reader));
+            if is_gzip {
+                let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(blob_file));
                 dispatch_extract(&mut ar, &tmp_dir, target)?;
-                ar.into_inner().into_inner()
             } else if matches!(
                 mt,
                 Some(
@@ -227,24 +247,15 @@ impl RegistryClient {
                         | "application/vnd.docker.image.rootfs.foreign.diff.tar"
                 )
             ) {
-                let mut ar = tar::Archive::new(reader);
+                let mut ar = tar::Archive::new(blob_file);
                 dispatch_extract(&mut ar, &tmp_dir, target)?;
-                ar.into_inner()
             } else {
                 bail!("unsupported layer media type: {mt:?}")
             };
-            let digest = reader.ctx.finish();
-            let computed = format!("sha256:{}", hex(digest.as_ref()));
-            if computed != layer.digest {
-                bail!(
-                    "layer digest mismatch: expected {}, got {}",
-                    layer.digest,
-                    computed
-                );
-            }
             fs::rename(&tmp_dir, target_dir)?;
             Ok(())
         })();
+        let _ = fs::remove_file(&blob_path);
         if result.is_err() {
             let _ = fs::remove_dir_all(&tmp_dir);
         }

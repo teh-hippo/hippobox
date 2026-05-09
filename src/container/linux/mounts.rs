@@ -259,6 +259,13 @@ pub(super) fn unmount_overlay(merged: &Path) -> Result<()> {
 
 pub(super) fn mount_volumes(merged: &Path, volumes: &[super::super::VolumeMount]) -> Result<()> {
     for vol in volumes {
+        // Defense in depth: re-validate target shape at mount time.
+        // `Path::join` is purely syntactic, and `Path::starts_with` doesn't
+        // normalise — so without this check, a `..` component in `vol.target`
+        // would syntactically pass an `is_within_merged` test and produce a
+        // mount path outside the container rootfs.
+        super::super::validate_volume_target(&vol.target)
+            .with_context(|| format!("rejecting volume mount {}", vol.target))?;
         let target = merged.join(vol.target.trim_start_matches('/'));
         if !target.starts_with(merged) {
             bail!("volume target escapes container rootfs: {}", vol.target);

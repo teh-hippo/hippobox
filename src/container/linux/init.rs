@@ -203,21 +203,153 @@ fn setup_namespaces_and_pivot(
     Ok(())
 }
 
+// Seccomp filter: per-arch tables of syscall numbers we deny via EPERM.
+//
+// The same *named* set of dangerous syscalls is denied on every supported arch.
+// Because syscall numbers differ per ABI, we resolve names to numbers via
+// `nix::libc::SYS_*` constants (which are themselves cfg-gated per target_arch),
+// then pick the matching `seccompiler::TargetArch`.
+//
+// Adding support for a new arch is a deliberate audit step — see the
+// `compile_error!` fallback at the end.
+
+#[cfg(target_arch = "x86_64")]
+#[allow(deprecated)] // Legacy syscalls still exist as kernel stubs; blocking is intentional.
 const BLOCKED: &[i64] = &[
-    101, 103, 134, 135, 136, 139, 155, 163, 164, 165, 166, 167, 168, 169, 172, 173, 174, 175, 176,
-    177, 178, 179, 180, 206, 212, 227, 237, 238, 239, 246, 248, 249, 250, 272, 279, 298, 304, 305,
-    308, 310, 311, 312, 313, 320, 321, 323, 425, 426, 427, 428, 429, 430, 431, 432, 434, 442,
+    nix::libc::SYS_ptrace,
+    nix::libc::SYS_syslog,
+    nix::libc::SYS_uselib,
+    nix::libc::SYS_personality,
+    nix::libc::SYS_ustat,
+    nix::libc::SYS_sysfs,
+    nix::libc::SYS_pivot_root,
+    nix::libc::SYS_acct,
+    nix::libc::SYS_settimeofday,
+    nix::libc::SYS_mount,
+    nix::libc::SYS_umount2,
+    nix::libc::SYS_swapon,
+    nix::libc::SYS_swapoff,
+    nix::libc::SYS_reboot,
+    nix::libc::SYS_iopl,
+    nix::libc::SYS_ioperm,
+    nix::libc::SYS_create_module,
+    nix::libc::SYS_init_module,
+    nix::libc::SYS_delete_module,
+    nix::libc::SYS_get_kernel_syms,
+    nix::libc::SYS_query_module,
+    nix::libc::SYS_quotactl,
+    nix::libc::SYS_nfsservctl,
+    nix::libc::SYS_io_setup,
+    nix::libc::SYS_lookup_dcookie,
+    nix::libc::SYS_clock_settime,
+    nix::libc::SYS_mbind,
+    nix::libc::SYS_set_mempolicy,
+    nix::libc::SYS_get_mempolicy,
+    nix::libc::SYS_kexec_load,
+    nix::libc::SYS_add_key,
+    nix::libc::SYS_request_key,
+    nix::libc::SYS_keyctl,
+    nix::libc::SYS_unshare,
+    nix::libc::SYS_move_pages,
+    nix::libc::SYS_perf_event_open,
+    nix::libc::SYS_open_by_handle_at,
+    nix::libc::SYS_clock_adjtime,
+    nix::libc::SYS_setns,
+    nix::libc::SYS_process_vm_readv,
+    nix::libc::SYS_process_vm_writev,
+    nix::libc::SYS_kcmp,
+    nix::libc::SYS_finit_module,
+    nix::libc::SYS_kexec_file_load,
+    nix::libc::SYS_bpf,
+    nix::libc::SYS_userfaultfd,
+    nix::libc::SYS_io_uring_setup,
+    nix::libc::SYS_io_uring_enter,
+    nix::libc::SYS_io_uring_register,
+    nix::libc::SYS_open_tree,
+    nix::libc::SYS_move_mount,
+    nix::libc::SYS_fsopen,
+    nix::libc::SYS_fsconfig,
+    nix::libc::SYS_fsmount,
+    nix::libc::SYS_pidfd_open,
+    nix::libc::SYS_mount_setattr,
 ];
 
+// aarch64 omits the legacy x86-only entries (uselib, ustat, sysfs, iopl,
+// ioperm, create_module, get_kernel_syms, query_module) — those syscalls
+// don't exist on this ABI, so there's nothing to block.
+#[cfg(target_arch = "aarch64")]
+#[allow(deprecated)] // Legacy syscalls still exist as kernel stubs; blocking is intentional.
+const BLOCKED: &[i64] = &[
+    nix::libc::SYS_ptrace,
+    nix::libc::SYS_syslog,
+    nix::libc::SYS_personality,
+    nix::libc::SYS_pivot_root,
+    nix::libc::SYS_acct,
+    nix::libc::SYS_settimeofday,
+    nix::libc::SYS_mount,
+    nix::libc::SYS_umount2,
+    nix::libc::SYS_swapon,
+    nix::libc::SYS_swapoff,
+    nix::libc::SYS_reboot,
+    nix::libc::SYS_init_module,
+    nix::libc::SYS_delete_module,
+    nix::libc::SYS_quotactl,
+    nix::libc::SYS_nfsservctl,
+    nix::libc::SYS_io_setup,
+    nix::libc::SYS_lookup_dcookie,
+    nix::libc::SYS_clock_settime,
+    nix::libc::SYS_mbind,
+    nix::libc::SYS_set_mempolicy,
+    nix::libc::SYS_get_mempolicy,
+    nix::libc::SYS_kexec_load,
+    nix::libc::SYS_add_key,
+    nix::libc::SYS_request_key,
+    nix::libc::SYS_keyctl,
+    nix::libc::SYS_unshare,
+    nix::libc::SYS_move_pages,
+    nix::libc::SYS_perf_event_open,
+    nix::libc::SYS_open_by_handle_at,
+    nix::libc::SYS_clock_adjtime,
+    nix::libc::SYS_setns,
+    nix::libc::SYS_process_vm_readv,
+    nix::libc::SYS_process_vm_writev,
+    nix::libc::SYS_kcmp,
+    nix::libc::SYS_finit_module,
+    nix::libc::SYS_kexec_file_load,
+    nix::libc::SYS_bpf,
+    nix::libc::SYS_userfaultfd,
+    nix::libc::SYS_io_uring_setup,
+    nix::libc::SYS_io_uring_enter,
+    nix::libc::SYS_io_uring_register,
+    nix::libc::SYS_open_tree,
+    nix::libc::SYS_move_mount,
+    nix::libc::SYS_fsopen,
+    nix::libc::SYS_fsconfig,
+    nix::libc::SYS_fsmount,
+    nix::libc::SYS_pidfd_open,
+    nix::libc::SYS_mount_setattr,
+];
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!(
+    "hippobox: seccomp filter not implemented for this architecture; \
+     audit and add a BLOCKED table + TargetArch in src/container/linux/init.rs"
+);
+
+#[cfg(target_arch = "x86_64")]
+const FILTER_TARGET_ARCH: seccompiler::TargetArch = seccompiler::TargetArch::x86_64;
+#[cfg(target_arch = "aarch64")]
+const FILTER_TARGET_ARCH: seccompiler::TargetArch = seccompiler::TargetArch::aarch64;
+
 fn apply_seccomp_filter() -> Result<()> {
-    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
+    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter};
     let rules: std::collections::BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
         BLOCKED.iter().map(|&nr| (nr, vec![])).collect();
     let filter = SeccompFilter::new(
         rules,
         SeccompAction::Allow,
         SeccompAction::Errno(1),
-        TargetArch::x86_64,
+        FILTER_TARGET_ARCH,
     )
     .context("failed to build seccomp filter")?;
     let prog: BpfProgram = filter.try_into().context("failed to compile BPF program")?;
@@ -270,18 +402,18 @@ mod tests {
     }
     #[test]
     fn seccomp_blocked_list_is_valid() {
-        use seccompiler::{SeccompAction, SeccompFilter, TargetArch};
+        use seccompiler::{SeccompAction, SeccompFilter};
         let mut sorted = BLOCKED.to_vec();
         sorted.sort();
         sorted.dedup();
-        assert_eq!(sorted, BLOCKED, "should be sorted with no duplicates");
+        assert_eq!(sorted.len(), BLOCKED.len(), "BLOCKED contains duplicates");
         let rules: std::collections::BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
             BLOCKED.iter().map(|&nr| (nr, vec![])).collect();
         let filter = SeccompFilter::new(
             rules,
             SeccompAction::Allow,
             SeccompAction::Errno(1),
-            TargetArch::x86_64,
+            FILTER_TARGET_ARCH,
         )
         .unwrap();
         let _: seccompiler::BpfProgram = filter.try_into().unwrap();

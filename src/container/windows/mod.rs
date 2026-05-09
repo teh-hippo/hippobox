@@ -37,7 +37,9 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
     let _guard = super::SimpleCleanupGuard(container_dir.clone());
 
     // Acquire an exclusive lock file so gc_simple knows this container is active.
-    let _lock = acquire_container_lock(&container_dir);
+    // Failure here is fatal — without the lock, a concurrent `hippobox` could GC
+    // this directory mid-run.
+    let _lock = acquire_container_lock(&container_dir)?;
 
     for layer in manifest.layers.iter().rev() {
         let layer_dir = layer.layer_dir(&base_dir);
@@ -149,16 +151,23 @@ pub(crate) fn run(spec: super::ContainerSpec) -> Result<i32> {
 
 /// Acquire an exclusive lock file in the container directory.
 /// The returned `File` handle holds the lock until dropped.
-/// Returns `None` if the lock cannot be acquired (non-fatal).
-fn acquire_container_lock(container_dir: &std::path::Path) -> Option<std::fs::File> {
+/// Returns an error if the lock cannot be acquired — without it, `gc_simple`
+/// could delete the container directory while it's still in use.
+fn acquire_container_lock(container_dir: &std::path::Path) -> Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
+    let lock_path = container_dir.join("hippobox.lock");
     std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .share_mode(0) // exclusive — no other process can open this file
-        .open(container_dir.join("hippobox.lock"))
-        .ok()
+        .open(&lock_path)
+        .with_context(|| {
+            format!(
+                "failed to acquire container lock at {}",
+                lock_path.display()
+            )
+        })
 }
 
 /// Check if a container directory has an active lock.

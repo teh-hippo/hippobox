@@ -3,7 +3,7 @@ mod image;
 mod platform;
 mod registry;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use image::ImageRef;
 use registry::RegistryClient;
@@ -148,7 +148,7 @@ fn main() -> Result<()> {
                 client.pull(&image_ref, &base_dir, &target)?;
             }
 
-            let (manifest, config) = container::load_image(&image_ref, &base_dir, &target)?;
+            let (manifest, config) = image::load_image(&image_ref, &base_dir, &target)?;
 
             let volume_mounts = {
                 let mut vm: Vec<container::VolumeMount> = volumes
@@ -159,6 +159,9 @@ fn main() -> Result<()> {
                 {
                     for vol_path in image_volumes.keys() {
                         if !vm.iter().any(|v| v.target == *vol_path) {
+                            container::validate_volume_target(vol_path).with_context(|| {
+                                format!("image declares invalid volume target: {vol_path:?}")
+                            })?;
                             vm.push(container::VolumeMount {
                                 source: "tmpfs".into(),
                                 target: vol_path.clone(),
