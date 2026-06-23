@@ -1,0 +1,15 @@
+name: Security Audit
+
+on:
+  push:
+    branches: [master]
+  schedule:
+    - cron: "0 7 * * 1"
+
+jobs:
+  audit:
+    uses: teh-hippo/common-repo-configs/.github/workflows/security-audit.yml@8109fd5b25e74393d29257f39487925569f27ae5 # v1
+    permissions:
+      contents: read
+      issues: write
+      checks: write
