@@ -5,6 +5,10 @@ on:
     tags:
       - 'v*'
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions: {}
 
 jobs:
@@ -30,8 +34,11 @@ jobs:
             use-cross: false
     name: build (${{ matrix.target }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     env:
       TAG: ${{ github.ref_name }}
     steps:
@@ -95,6 +102,11 @@ jobs:
           cd ..
           sha256sum "${ARCHIVE_NAME}."* >> checksums-sha256.txt
 
+      - name: Attest build provenance for the release archive
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: hippobox-${{ env.TAG }}-*.${{ matrix.archive }}
+
       - name: Upload Release Artifacts
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
@@ -105,6 +117,7 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     environment: crates-io
     permissions:
       id-token: write
