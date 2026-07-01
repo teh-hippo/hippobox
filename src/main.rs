@@ -142,13 +142,14 @@ fn main() -> Result<()> {
 
             container::gc_stale_containers(&base_dir);
 
-            if !image_ref.image_metadata_path(&base_dir, &target).exists() {
+            let metadata_path = image_ref.image_metadata_path(&base_dir, &target);
+            if !metadata_path.exists() {
                 eprintln!("image not found locally, pulling...");
                 let mut client = RegistryClient::new();
                 client.pull(&image_ref, &base_dir, &target)?;
             }
 
-            let (manifest, config) = image::load_image(&image_ref, &base_dir, &target)?;
+            let (manifest, config) = image::load_image(&metadata_path, &image_ref)?;
 
             let volume_mounts = {
                 let mut vm: Vec<container::VolumeMount> = volumes

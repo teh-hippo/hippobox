@@ -124,13 +124,13 @@ pub struct StoredImage {
 }
 
 /// Read a stored image's manifest + config from the local cache.
-pub fn load_image(
-    image_ref: &ImageRef,
-    base_dir: &Path,
-    target: &Target,
-) -> Result<(Manifest, ImageConfig)> {
-    let path = image_ref.image_metadata_path(base_dir, target);
-    let data = std::fs::read(&path).with_context(|| {
+///
+/// `path` is the already-resolved metadata path (see
+/// [`ImageRef::image_metadata_path`]); the caller passes it in so the run path
+/// resolves it once instead of re-deriving it here. `image_ref` is used only
+/// for the "not found" error message.
+pub fn load_image(path: &Path, image_ref: &ImageRef) -> Result<(Manifest, ImageConfig)> {
+    let data = std::fs::read(path).with_context(|| {
         format!(
             "image not found locally: {}/{}/{}",
             image_ref.registry, image_ref.repository, image_ref.tag
@@ -309,13 +309,14 @@ mod tests {
         let path = img.image_metadata_path(tmp.path(), &target);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
-        let (m, _) = load_image(&img, tmp.path(), &target).unwrap();
+        let (m, _) = load_image(&path, &img).unwrap();
         assert_eq!(m.layers[0].digest, "sha256:layer1");
         let missing = ImageRef::parse("nonexistent:latest").unwrap();
+        let missing_path = missing.image_metadata_path(tmp.path(), &target);
         assert!(
             format!(
                 "{:#}",
-                load_image(&missing, tmp.path(), &target).unwrap_err()
+                load_image(&missing_path, &missing).unwrap_err()
             )
             .contains("image not found locally")
         );
@@ -326,7 +327,7 @@ mod tests {
         assert!(
             format!(
                 "{:#}",
-                load_image(&corrupt, tmp.path(), &target).unwrap_err()
+                load_image(&cp, &corrupt).unwrap_err()
             )
             .contains("failed to parse")
         );
