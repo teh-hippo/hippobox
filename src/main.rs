@@ -29,8 +29,9 @@ fn hippobox_dir() -> PathBuf {
 }
 
 fn ensure_storage_dirs() -> Result<()> {
+    let base = hippobox_dir();
     for sub in ["layers/sha256", "images", "containers"] {
-        fs::create_dir_all(hippobox_dir().join(sub))?;
+        fs::create_dir_all(base.join(sub))?;
     }
     Ok(())
 }

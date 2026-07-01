@@ -49,7 +49,12 @@ impl<R: Read> Read for HashingReader<R> {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 const MAX_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
@@ -456,6 +461,19 @@ mod tests {
             assert_eq!(total, data);
             assert_eq!(hex(r.ctx.finish().as_ref()), expected);
         }
+    }
+
+    #[test]
+    fn hex_encodes_known_vectors() {
+        assert_eq!(hex(&[]), "");
+        assert_eq!(hex(&[0x00]), "00");
+        assert_eq!(hex(&[0x0f]), "0f");
+        assert_eq!(hex(&[0xff]), "ff");
+        assert_eq!(hex(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+        assert_eq!(
+            hex(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]),
+            "0123456789abcdef"
+        );
     }
 
     fn desc(d: &str) -> Descriptor {
