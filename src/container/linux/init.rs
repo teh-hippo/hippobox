@@ -274,6 +274,13 @@ const BLOCKED: &[i64] = &[
     nix::libc::SYS_mount_setattr,
 ];
 
+// libc's musl aarch64 bindings omit SYS_kexec_file_load; take it from libc on
+// gnu and fall back to the aarch64 asm-generic number (294) on musl.
+#[cfg(all(target_arch = "aarch64", not(target_env = "musl")))]
+const SYS_KEXEC_FILE_LOAD: i64 = nix::libc::SYS_kexec_file_load;
+#[cfg(all(target_arch = "aarch64", target_env = "musl"))]
+const SYS_KEXEC_FILE_LOAD: i64 = 294;
+
 // aarch64 omits the legacy x86-only entries (uselib, ustat, sysfs, iopl,
 // ioperm, create_module, get_kernel_syms, query_module) — those syscalls
 // don't exist on this ABI, so there's nothing to block.
@@ -315,7 +322,7 @@ const BLOCKED: &[i64] = &[
     nix::libc::SYS_process_vm_writev,
     nix::libc::SYS_kcmp,
     nix::libc::SYS_finit_module,
-    nix::libc::SYS_kexec_file_load,
+    SYS_KEXEC_FILE_LOAD,
     nix::libc::SYS_bpf,
     nix::libc::SYS_userfaultfd,
     nix::libc::SYS_io_uring_setup,
