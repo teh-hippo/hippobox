@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2](https://github.com/teh-hippo/hippobox/compare/v0.4.1...v0.4.2) (2026-07-19)
+
+
+### Bug Fixes
+
+* build on aarch64-musl by supplying SYS_kexec_file_load ([d94deed](https://github.com/teh-hippo/hippobox/commit/d94deedab322819ab163dc09ce894152c5a36465))
+
 ## [0.4.1](https://github.com/teh-hippo/hippobox/compare/v0.4.0...v0.4.1) (2026-07-19)
 
 
